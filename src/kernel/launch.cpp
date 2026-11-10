@@ -333,9 +333,9 @@ std::optional<LaunchDescriptor> ParseLaunchDescriptor(const std::string& json, s
         return std::nullopt;
     }
     {
-        // Max total = G + tail_reward * interval * 2 (geometric halvings).
-        const __int128 tail_total = static_cast<__int128>(d.tail_reward) * d.tail_halving_interval * 2;
-        if (static_cast<__int128>(d.graduation_tokens) + tail_total > MAX_MONEY) {
+        // Max total = G + tail_reward * interval * 2 (geometric halvings). 256-bit, no overflow, portable (no __int128 on MSVC).
+        const arith_uint256 tail_total = arith_uint256{static_cast<uint64_t>(d.tail_reward)} * arith_uint256{d.tail_halving_interval} * 2;
+        if (arith_uint256{static_cast<uint64_t>(d.graduation_tokens)} + tail_total > arith_uint256{static_cast<uint64_t>(MAX_MONEY)}) {
             error = "graduation_tokens + total tail emission exceeds MAX_MONEY";
             return std::nullopt;
         }
