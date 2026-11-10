@@ -170,7 +170,12 @@ static bool GenerateBlock(ChainstateManager& chainman, CBlock&& block, uint64_t&
     block_out.reset();
     block.hashMerkleRoot = BlockMerkleRoot(block);
 
-    auto& miningHeader = CAuxPow::initAuxPow(block);
+    // hashfun: launch chains mine plain PoW here. A merge-mined block is only
+    // valid after graduation, and real ones come from pools via
+    // createauxblock/submitauxblock; a self-made auxpow would be refused
+    // pre-graduation (auxpow-before-graduation).
+    CPureBlockHeader& miningHeader = chainman.GetConsensus().launch_enabled ? static_cast<CPureBlockHeader&>(block)
+                                                                            : CAuxPow::initAuxPow(block);
     while (max_tries > 0 && miningHeader.nNonce < std::numeric_limits<uint32_t>::max() && !CheckProofOfWork(miningHeader.GetHash(), block.nBits, chainman.GetConsensus()) && !chainman.m_interrupt) {
         ++miningHeader.nNonce;
         --max_tries;

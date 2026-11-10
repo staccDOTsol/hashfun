@@ -207,12 +207,14 @@ class E2E:
         self.n2 = Node(a.hashfund, os.path.join(self.dir, "n2"), [f"-launch={os.path.join(self.dir, 'PRE.json')}"],
                        free_port())
         self.nodes.append(self.n2)
+        if mock:
+            # Before the wallet exists: a wallet skips blocks stamped more than 2 h before its
+            # birth time, and phases 1-6 stamp GRAD blocks a day in the past.
+            self.n1.rpc.setmocktime(self.st["T"])
         self.wb, self.w1, self.w2 = (open_wallet(n.rpc) for n in (self.btc, self.n1, self.n2))
         self.addr1 = self.w1.getnewaddress("", "bech32")
         self.spk1 = address_to_script(self.addr1, self.d1.hrp)
         self.btc_addr = self.wb.getnewaddress("", "bech32")
-        if mock:
-            self.n1.rpc.setmocktime(self.st["T"])
 
     def stop(self):
         for n in self.nodes:
@@ -241,12 +243,20 @@ class E2E:
         return sum(work_from_bits(self.header(h)[1]) for h in range(1, height + 1))
 
     def mine_paced(self, node, w, n, addr, spacing):
-        """Mine n blocks spaced at the target, never behind the wall clock. A real-time burst
-        on a 10 s LWMA chain would ratchet difficulty ~1.4x per block until the CPU miner stalls."""
+        """Mine n launch blocks spaced at the target, never behind the wall clock. A real-time
+        burst on a 10 s LWMA chain ratchets difficulty ~1.4x per block (phase 7 leaves GRAD at
+        ~0.5-1M hashes/block), so while the next block costs >100k hashes the spacing is 6T,
+        LWMA's solvetime cap, which unwinds it in a few blocks. generatetoaddress returns []
+        when it runs out of tries, so every block is retried until it lands."""
         for _ in range(n):
-            tip = node.rpc.getblockheader(node.rpc.getbestblockhash())
-            node.rpc.setmocktime(max(int(time.time()), tip["time"] + spacing))
-            w.generatetoaddress(1, addr)
+            for _attempt in range(20):
+                tip = node.rpc.getblockheader(node.rpc.getbestblockhash())
+                heavy = int(node.rpc.getlaunchinfo()["next"]["work"], 16) > 100_000
+                node.rpc.setmocktime(max(int(time.time()), tip["time"] + (6 if heavy else 1) * spacing))
+                if w.generatetoaddress(1, addr, 50_000_000):
+                    break
+            else:
+                raise RuntimeError("paced mining made no progress")
 
     # ------------------------------------------------------------ phases
     def p1(self):
@@ -411,7 +421,13 @@ class E2E:
         # Coinbase maturity on both chains. BTC regtest never retargets; GRAD is paced.
         wb.generatetoaddress(101, self.btc_addr)
         self.mine_paced(n1, w1, max(2, 102 - n1.rpc.getblockcount()), self.addr1, d1.target_spacing)
-        print(f"   balances: BTC {wb.getbalance()}  GRAD {w1.getbalance()}", flush=True)
+        for _ in range(20):  # the maker needs mature launch coins before it can lock its leg
+            if w1.getbalance() >= 1000:
+                break
+            self.mine_paced(n1, w1, 1, self.addr1, d1.target_spacing)
+        print(f"   balances: BTC {wb.getbalance()}  GRAD {w1.getbalance()}  "
+              f"(GRAD clock {n1.rpc.getblockheader(n1.rpc.getbestblockhash())['time'] - int(time.time()):+d}s)",
+              flush=True)
         ep = {}
         for name, n in (("BTC", btc), ("GRAD", n1)):
             ep[name] = free_port()
