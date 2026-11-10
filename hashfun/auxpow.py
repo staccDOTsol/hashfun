@@ -1,7 +1,6 @@
 """Merged mining (AuxPoW): aux chain merkle tree, parent coinbase commitment,
 auxpow serialization for submitauxblock, and a Python port of CAuxPow::check
 (src/auxpow.cpp) used by the tests and by the coordinator as a pre-submit check."""
-import os
 import struct
 from typing import Dict, List, Tuple
 
@@ -24,9 +23,14 @@ def expected_index(nonce: int, chain_id: int, h: int) -> int:
 
 
 class AuxTree:
-    """Slots for a set of aux chains. leaves: chain_id -> aux block hash (internal byte order)."""
+    """Slots for a set of aux chains. leaves: chain_id -> aux block hash (internal byte order).
 
-    def __init__(self, leaves: Dict[int, bytes], nonce: int = None, max_height: int = 10):
+    getExpectedIndex is ((nonce*a + b + chain_id)*a + b) mod 2^h with a odd, so two chains
+    share a slot iff their ids are congruent mod 2^h, whatever the nonce. The nonce is
+    therefore fixed and the tree grows until the ids separate; hashfun chain ids are below
+    2^13, so h <= 13 always works (branch limit is 30)."""
+
+    def __init__(self, leaves: Dict[int, bytes], nonce: int = 0, max_height: int = 16):
         if not leaves:
             raise ValueError("no aux chains")
         ids = list(leaves)
@@ -35,16 +39,12 @@ class AuxTree:
         for h in range(0, max_height + 1):
             if (1 << h) < len(ids):
                 continue
-            for n in ([nonce] if nonce is not None else range(0, 4096)):
-                slots = {cid: expected_index(n, cid, h) for cid in ids}
-                if len(set(slots.values())) == len(ids):
-                    self.height, self.nonce, self.slots = h, n, slots
-                    break
-            else:
-                continue
-            break
+            slots = {cid: expected_index(nonce, cid, h) for cid in ids}
+            if len(set(slots.values())) == len(ids):
+                self.height, self.nonce, self.slots = h, nonce, slots
+                break
         else:
-            raise ValueError("could not place aux chains without slot collisions")
+            raise ValueError(f"chain ids collide mod 2^{max_height}; cannot share one merkle tree")
         size = 1 << self.height
         filler = sha256d(b"hashfun-aux-filler")
         self.layer0 = [filler] * size

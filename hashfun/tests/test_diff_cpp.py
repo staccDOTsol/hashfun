@@ -257,6 +257,97 @@ class DiffCpp(unittest.TestCase):
                 if gh > 0:
                     self.assertEqual(sum(r["subsidy"][:gh]), d.graduation_tokens)
 
+    def test_auxpow_against_node_validator(self):
+        """The pool's real AuxPoW builder (AuxTree, serialize_auxpow) and its pre-submit check
+        (check_auxpow) against the node's deserializer, CAuxPow::check and parent PoW check,
+        on honest and malformed merge-mined headers."""
+        from hashfun.auxpow import AuxTree, MM_MAGIC, check_auxpow, serialize_auxpow
+        from hashfun.crypto import sha256d
+        from hashfun.ser import Tx, TxIn, TxOut, header_bytes, merkle_branch_for_first, merkle_root, push, push_int
+        import struct
+
+        rng = random.Random(SEED + 5)
+        d = launch(rng, pow_limit_bits=0x207FFFFF)
+        cid, pow_limit = d.chain_id, bits_to_target(0x207FFFFF)
+
+        def solve(hdr80, target):
+            for n in range(1 << 32):
+                h = hdr80[:76] + struct.pack("<I", n)
+                if int.from_bytes(sha256d(h), "little") <= target:
+                    return h
+
+        mutations = [None] * 8 + ["parent_chain_id", "header_chain_id", "nonce", "size", "late_root", "two_headers",
+                                  "gap", "truncate", "cb_branch", "chain_branch", "parent_pow", "long_branch",
+                                  "no_flag", "early_root_no_magic"]
+        seen, disagreements = {}, []
+        for i in range(max(len(mutations) * 3, N)):
+            m = mutations[i % len(mutations)]
+            aux_bits = 0x1F00FFFF if m == "parent_pow" else rng.choice([0x207FFFFF, 0x2000FFFF])
+            hdr_cid = cid + 1 if m == "header_chain_id" else cid
+            aux_version = 4 | (hdr_cid << 16) | (0 if m == "no_flag" else 0x100)
+            aux_hdr = header_bytes(aux_version, os.urandom(32), os.urandom(32), 1_700_000_000 + i, aux_bits, 0)
+            aux_hash = sha256d(aux_hdr)
+            pool = [x for x in range(1, 0x2000) if x != cid]
+            tree = AuxTree({cid: aux_hash, **{c: os.urandom(32) for c in rng.sample(pool, rng.choice([0, 1, 4, 20]))}})
+            branch, idx = tree.branch(cid)
+            root_le = tree.root()[::-1]
+            size, nonce = tree.size, tree.nonce
+            if m == "nonce":
+                nonce ^= 0x5A5A
+            if m == "size":
+                size *= 2
+            commit = MM_MAGIC + root_le + struct.pack("<II", size, nonce)
+            if m == "late_root":
+                script = push_int(100 + i) + push(b"\xEE" * 24) + push(root_le + struct.pack("<II", size, nonce))
+            elif m == "early_root_no_magic":
+                script = push(root_le + struct.pack("<II", size, nonce)) + push(os.urandom(8))
+            elif m == "two_headers":
+                script = push_int(100 + i) + push(commit) + push(MM_MAGIC + os.urandom(4))
+            elif m == "gap":
+                script = push_int(100 + i) + push(MM_MAGIC + b"\x00" + root_le + struct.pack("<II", size, nonce))
+            elif m == "truncate":
+                script = push_int(100 + i) + push(MM_MAGIC + root_le + struct.pack("<I", size)[:3])
+            else:
+                script = push_int(100 + i) + push(commit) + push(os.urandom(8))
+            cb = Tx(version=1, vin=[TxIn(b"\0" * 32, 0xFFFFFFFF, script, 0xFFFFFFFF,
+                                         [b"\0" * 32] if rng.random() < 0.5 else [])],
+                    vout=[TxOut(50 * COIN, b"\x51"), TxOut(0, b"\x6a\x24\xaa\x21\xa9\xed" + os.urandom(32))])
+            others = [Tx(vin=[TxIn(os.urandom(32), 0)], vout=[TxOut(1000, b"\x51")])
+                      for _ in range(rng.choice([1, 3, 7]) if m == "cb_branch" else rng.choice([0, 1, 3, 7]))]
+            txids = [cb.txid()] + [t.txid() for t in others]
+            cb_branch = merkle_branch_for_first(txids)
+            if m == "cb_branch":
+                cb_branch[rng.randrange(len(cb_branch))] = os.urandom(32)
+            if m == "chain_branch":
+                branch = (branch or []) + [os.urandom(32)] if not branch else \
+                    [os.urandom(32) if j == 0 else b for j, b in enumerate(branch)]
+            if m == "long_branch":
+                branch = [os.urandom(32) for _ in range(31)]
+            parent_version = (4 | (cid << 16)) if m == "parent_chain_id" else 0x20000000
+            parent = header_bytes(parent_version, os.urandom(32), merkle_root(txids), 1_700_000_000, 0x207FFFFF, 0)
+            target = bits_to_target(aux_bits)
+            if m != "parent_pow":
+                parent = solve(parent, target)
+            apow = serialize_auxpow(cb, cb_branch, branch, idx, parent)
+
+            # Python verdict, in the node's order: header chain id, auxpow flag, parent PoW, CAuxPow::check.
+            version = struct.unpack("<i", aux_hdr[:4])[0]
+            py_ok = (version // 65536 == cid and version & 0x100 and 0 < target <= pow_limit
+                     and int.from_bytes(sha256d(parent), "little") <= target
+                     and check_auxpow(aux_hash, cid, apow)[0])
+            r = self.drv(op="auxpow", json=d.dumps(), header=(aux_hdr + apow).hex())
+            self.assertTrue(r["ok"], r)
+            seen.setdefault(m, set()).add(r["stage"])
+            if bool(py_ok) != r["valid"]:
+                disagreements.append((m, r["stage"], check_auxpow(aux_hash, cid, apow)[1]))
+        self.assertEqual(disagreements, [])
+        # Honest headers validate, including the legacy layout (root in the first 20 bytes, no magic).
+        self.assertEqual(seen[None] | seen["early_root_no_magic"], {"ok"})
+        for m, stages in seen.items():
+            if m in (None, "early_root_no_magic", "nonce"):
+                continue  # "nonce": a wrong nonce lands on the right slot whenever the tree has one leaf
+            self.assertNotIn("ok", stages, m)
+
     def test_tail_minted(self):
         rng = random.Random(SEED + 4)
         for ihl in (1, 7, 1000, 210_000, 2**31 - 1):

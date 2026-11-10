@@ -12,7 +12,7 @@ from hashfun.htlc import Contract, new_secret, redeem_tx, refund_tx, extract_sec
 from hashfun.interp import verify_input, ScriptError
 from hashfun.ser import (Tx, TxIn, TxOut, bip143_sighash, segwit_encode, segwit_decode, b58check_encode,
                          bits_to_target, target_to_bits, work_from_bits, p2wpkh_script, merkle_root,
-                         merkle_branch_for_first, root_from_branch, header_bytes, push, push_int)
+                         merkle_branch_for_first, header_bytes, push, push_int)
 from hashfun.wallet import mnemonic_to_seed, new_mnemonic, check_mnemonic
 
 COIN = 100_000_000
@@ -290,6 +290,21 @@ class AuxPow(unittest.TestCase):
                 ok, why = check_auxpow(h, cid, ap)
                 self.assertTrue(ok, why)
                 self.assertEqual(idx, expected_index(tree.nonce, cid, tree.height))
+
+    def test_slots_separate_congruent_chain_ids(self):
+        # Slots collide iff ids are congruent mod 2^h, independent of the nonce; ids 5 and
+        # 5+1024 need h=11 (the old nonce search stopped at h=10 and raised).
+        for n in (0, 1, 0xDEADBEEF):
+            for a, b in ((5, 5 + 1024), (3, 3 + 4096), (1, 0x1FFF)):
+                self.assertEqual(expected_index(n, a, 10) == expected_index(n, b, 10), (a - b) % 1024 == 0)
+        tree = AuxTree({5: sha256d(b"x"), 5 + 1024: sha256d(b"y"), 77: sha256d(b"z")})
+        self.assertEqual(tree.height, 11)
+        cb, br, hdr = self.build_parent(tree)
+        for cid, h in tree.leaves.items():
+            cbr, idx = tree.branch(cid)
+            self.assertTrue(check_auxpow(h, cid, serialize_auxpow(cb, br, cbr, idx, hdr))[0])
+        everyone = AuxTree({cid: sha256d(cid.to_bytes(2, "little")) for cid in range(1, 0x2000)})
+        self.assertEqual(everyone.height, 13)
 
     def test_rejections(self):
         leaves = {700: sha256d(b"a"), 900: sha256d(b"b")}

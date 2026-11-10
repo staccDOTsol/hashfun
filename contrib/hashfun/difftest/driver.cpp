@@ -7,6 +7,7 @@
 //   {"op":"desc","json":"<descriptor text>"}
 //   {"op":"chain","json":"<descriptor text>","headers":[[time,bits],...]}
 //   {"op":"tail","json":"<descriptor text>","ranges":[[from,to],...]}
+//   {"op":"auxpow","json":"<descriptor text>","header":"<hex: 80-byte header + CAuxPow>"}
 // stdout: one JSON object per request.
 
 #include <arith_uint256.h>
@@ -17,9 +18,12 @@
 #include <kernel/launch.h>
 #include <launchcurve.h>
 #include <pow.h>
+#include <auxpow.h>
 #include <primitives/block.h>
+#include <streams.h>
 #include <tinyformat.h>
 #include <univalue.h>
+#include <util/strencodings.h>
 
 #include <iostream>
 #include <memory>
@@ -143,6 +147,55 @@ UniValue Tail(const UniValue& req)
     return r;
 }
 
+/**
+ * Deserialize a merge-mined header exactly as the node does and run the
+ * header-level PoW check. The check below mirrors validation.cpp's
+ * CheckProofOfWork(const CBlockHeader&, params) (validation.cpp itself is not
+ * linkable here); CAuxPow::check, the parent PoW check and all serialization
+ * are the node's own code.
+ */
+UniValue AuxPow(const UniValue& req)
+{
+    UniValue r(UniValue::VOBJ);
+    auto d = Parse(req, r);
+    if (!d) return r;
+    const auto p = CChainParams::Launch(CChainParams::LaunchOptions{.desc = *d});
+    const Consensus::Params& c = p->GetConsensus();
+    r.pushKV("ok", true);
+    const auto bytes = TryParseHex<uint8_t>(req["header"].get_str());
+    if (!bytes) throw std::runtime_error("bad header hex");
+    DataStream ss{*bytes};
+    CBlockHeader h;
+    std::string stage = "ok";
+    try {
+        ss >> h;
+        if (!ss.empty()) stage = "trailing-bytes";
+    } catch (const std::exception& e) {
+        stage = "deserialize";
+    }
+    if (stage == "ok") {
+        if (!h.IsLegacy() && c.fStrictChainId && h.GetChainId() != c.nAuxpowChainId) {
+            stage = "chain-id";
+        } else if (!h.auxpow) {
+            if (h.IsAuxpow()) {
+                stage = "no-auxpow";
+            } else if (!CheckProofOfWork(h.GetHash(), h.nBits, c)) {
+                stage = "pow";
+            }
+        } else if (!h.IsAuxpow()) {
+            stage = "auxpow-flag";
+        } else if (!CheckProofOfWork(h.auxpow->getParentBlockHash(), h.nBits, c)) {
+            stage = "parent-pow";
+        } else if (!h.auxpow->check(h.GetHash(), h.GetChainId(), c)) {
+            stage = "auxpow-check";
+        }
+        r.pushKV("hash", h.GetHash().GetHex());
+    }
+    r.pushKV("valid", stage == "ok");
+    r.pushKV("stage", stage);
+    return r;
+}
+
 } // namespace
 
 int main()
@@ -153,7 +206,8 @@ int main()
         try {
             if (!req.read(line)) throw std::runtime_error("bad request json");
             const std::string& op = req["op"].get_str();
-            out = op == "desc" ? Desc(req) : op == "chain" ? Chain(req) : op == "tail" ? Tail(req) : UniValue{};
+            out = op == "desc" ? Desc(req) : op == "chain" ? Chain(req) : op == "tail" ? Tail(req) :
+                  op == "auxpow" ? AuxPow(req) : UniValue{};
             if (out.isNull()) throw std::runtime_error("unknown op " + op);
         } catch (const std::exception& e) {
             out = UniValue(UniValue::VOBJ);
