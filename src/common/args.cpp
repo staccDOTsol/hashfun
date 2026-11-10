@@ -33,7 +33,7 @@
 #include <utility>
 #include <variant>
 
-const char * const BITCOIN_CONF_FILENAME = "bitcoin.conf";
+const char * const BITCOIN_CONF_FILENAME = "hashfun.conf";
 const char * const BITCOIN_SETTINGS_FILENAME = "settings.json";
 
 ArgsManager gArgs;
@@ -159,6 +159,7 @@ std::list<SectionInfo> ArgsManager::GetUnrecognizedSections() const
         ChainTypeToString(ChainType::TESTNET),
         ChainTypeToString(ChainType::TESTNET4),
         ChainTypeToString(ChainType::MAIN),
+        ChainTypeToString(ChainType::LAUNCH),
     };
 
     LOCK(cs_args);
@@ -850,11 +851,11 @@ fs::path GetDefaultDataDir()
 #ifdef WIN32
     // Windows
     // Check for existence of datadir in old location and keep it there
-    fs::path legacy_path = GetSpecialFolderPath(CSIDL_APPDATA) / "Bitcoin";
+    fs::path legacy_path = GetSpecialFolderPath(CSIDL_APPDATA) / "hashfun";
     if (fs::exists(legacy_path)) return legacy_path;
 
     // Otherwise, fresh installs can start in the new, "proper" location
-    return GetSpecialFolderPath(CSIDL_LOCAL_APPDATA) / "Bitcoin";
+    return GetSpecialFolderPath(CSIDL_LOCAL_APPDATA) / "hashfun";
 #else
     fs::path pathRet;
     char* pszHome = getenv("HOME");
@@ -864,10 +865,10 @@ fs::path GetDefaultDataDir()
         pathRet = fs::path(pszHome);
 #ifdef __APPLE__
     // macOS
-    return pathRet / "Library/Application Support/Bitcoin";
+    return pathRet / "Library/Application Support/hashfun";
 #else
     // Unix-like
-    return pathRet / ".bitcoin";
+    return pathRet / ".hashfun";
 #endif
 #endif
 }
@@ -921,10 +922,12 @@ std::variant<ChainType, std::string> ArgsManager::GetChainArg() const
     const bool fTestNet = get_net("-testnet");
     const bool fTestNet4 = get_net("-testnet4");
     const auto chain_arg = GetArg("-chain");
+    const auto launch_arg = GetArg("-launch");
 
-    if ((int)chain_arg.has_value() + (int)fRegTest + (int)fSigNet + (int)fTestNet + (int)fTestNet4 > 1) {
-        throw std::runtime_error("Invalid combination of -regtest, -signet, -testnet, -testnet4 and -chain. Can use at most one.");
+    if ((int)chain_arg.has_value() + (int)fRegTest + (int)fSigNet + (int)fTestNet + (int)fTestNet4 + (int)launch_arg.has_value() > 1) {
+        throw std::runtime_error("Invalid combination of -regtest, -signet, -testnet, -testnet4, -launch and -chain. Can use at most one.");
     }
+    if (launch_arg) return ChainType::LAUNCH;
     if (chain_arg) {
         if (auto parsed = ChainTypeFromString(*chain_arg)) return *parsed;
         // Not a known string, so return original string

@@ -15,6 +15,7 @@ enum class ChainType {
     SIGNET,
     REGTEST,
     TESTNET4,
+    LAUNCH, //!< hashfun launch chain defined by a -launch descriptor
 };
 
 std::string ChainTypeToString(ChainType chain);

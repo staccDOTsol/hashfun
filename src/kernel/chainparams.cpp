@@ -6,6 +6,7 @@
 #include <kernel/chainparams.h>
 
 #include <chainparamsseeds.h>
+#include <arith_uint256.h>
 #include <consensus/amount.h>
 #include <consensus/merkle.h>
 #include <consensus/params.h>
@@ -17,6 +18,7 @@
 #include <script/interpreter.h>
 #include <script/script.h>
 #include <script/verify_flags.h>
+#include <tinyformat.h>
 #include <uint256.h>
 #include <util/chaintype.h>
 #include <util/log.h>
@@ -30,6 +32,7 @@
 #include <iterator>
 #include <map>
 #include <span>
+#include <stdexcept>
 #include <utility>
 
 using namespace util::hex_literals;
@@ -739,6 +742,173 @@ public:
         };
     }
 };
+
+/**
+ * hashfun launch genesis. The coinbase scriptSig pushes the 32-byte launch id,
+ * so the genesis hash commits to every consensus field of the descriptor. The
+ * single output is a zero-value OP_RETURN (the genesis output is never spendable
+ * anyway). genesis_nonce must make the header meet pow_limit_bits.
+ */
+static CBlock CreateLaunchGenesisBlock(const LaunchDescriptor& d)
+{
+    CMutableTransaction tx;
+    tx.version = 1;
+    tx.vin.resize(1);
+    tx.vout.resize(1);
+    tx.vin[0].scriptSig = CScript() << std::vector<unsigned char>(d.id.begin(), d.id.end());
+    tx.vout[0].nValue = 0;
+    tx.vout[0].scriptPubKey = CScript() << OP_RETURN;
+
+    CBlock genesis;
+    genesis.nTime = d.genesis_time;
+    genesis.nBits = d.pow_limit_bits;
+    genesis.nNonce = d.genesis_nonce;
+    genesis.nVersion = 1;
+    genesis.vtx.push_back(MakeTransactionRef(std::move(tx)));
+    genesis.hashPrevBlock.SetNull();
+    genesis.hashMerkleRoot = BlockMerkleRoot(genesis);
+    return genesis;
+}
+
+static arith_uint256 WorkForBits(uint32_t nBits)
+{
+    arith_uint256 target;
+    bool neg, ovf;
+    target.SetCompact(nBits, &neg, &ovf);
+    if (neg || ovf || target == 0) return 0;
+    return (~target / (target + 1)) + 1;
+}
+
+/**
+ * hashfun launch chain: every parameter comes from the descriptor.
+ */
+class CLaunchParams : public CChainParams
+{
+public:
+    explicit CLaunchParams(const LaunchOptions& opts)
+    {
+        const LaunchDescriptor& d = opts.desc;
+        m_chain_type = ChainType::LAUNCH;
+        m_launch = d;
+
+        consensus.signet_blocks = false;
+        consensus.signet_challenge.clear();
+        consensus.nSubsidyHalvingInterval = d.tail_halving_interval > 0 ? static_cast<int>(d.tail_halving_interval) : 210000;
+        consensus.BIP16Height = 0;
+        consensus.BIP34Height = 1;
+        consensus.BIP34Hash = uint256{};
+        consensus.BIP65Height = 1;
+        consensus.BIP66Height = 1;
+        consensus.CSVHeight = 1;
+        consensus.SegwitHeight = 0;
+        consensus.MinBIP9WarningHeight = 0;
+
+        arith_uint256 pow_limit;
+        pow_limit.SetCompact(d.pow_limit_bits);
+        consensus.powLimit = ArithToUint256(pow_limit);
+        consensus.nPowTargetSpacing = d.target_spacing;
+        consensus.nPowTargetTimespan = static_cast<int64_t>(d.target_spacing) * d.lwma_window;
+        consensus.fPowAllowMinDifficultyBlocks = false;
+        consensus.enforce_BIP94 = false;
+        consensus.fPowNoRetargeting = false;
+        consensus.lwma_window = d.lwma_window;
+        consensus.max_future_block_time = d.ftl;
+
+        consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].bit = 28;
+        consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].nStartTime = Consensus::BIP9Deployment::NEVER_ACTIVE;
+        consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
+        consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].min_activation_height = 0;
+        consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].threshold = 1815;
+        consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].period = 2016;
+
+        consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].bit = 2;
+        consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].nStartTime = Consensus::BIP9Deployment::ALWAYS_ACTIVE;
+        consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
+        consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].min_activation_height = 0;
+        consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].threshold = 1815;
+        consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].period = 2016;
+
+        consensus.nMinimumChainWork = uint256{};
+        consensus.defaultAssumeValid = uint256{};
+
+        // AuxPoW: unique chain ID per launch; merge-mining is gated on
+        // graduation in ContextualCheckBlockHeader, not on height.
+        consensus.nAuxpowStartHeight = 0;
+        consensus.nAuxpowChainId = LaunchChainId(d);
+        consensus.fStrictChainId = true;
+        consensus.nLegacyBlocksBefore = 1; // only the genesis block is legacy
+
+        // Curve.
+        consensus.launch_enabled = true;
+        consensus.launch_id = uint256{std::span<const unsigned char>{d.id.data(), d.id.size()}};
+        arith_uint256 v0{0};
+        for (unsigned char b : d.virtual_work_be) {
+            v0 <<= 8;
+            v0 += arith_uint256{b};
+        }
+        consensus.launch_virtual_work = ArithToUint256(v0);
+        consensus.launch_virtual_tokens = d.virtual_tokens;
+        consensus.launch_graduation_tokens = d.graduation_tokens;
+        {
+            // W_g = ceil(G*V0 / (T0-G)): smallest W with floor(T0*W/(V0+W)) >= G.
+            const arith_uint256 num = arith_uint256{static_cast<uint64_t>(d.graduation_tokens)} * v0;
+            const arith_uint256 den{static_cast<uint64_t>(d.virtual_tokens - d.graduation_tokens)};
+            arith_uint256 wg = num / den;
+            if (wg * den < num) wg += 1;
+            consensus.launch_graduation_work = ArithToUint256(wg);
+        }
+        consensus.launch_tail_reward = d.tail_reward;
+        consensus.launch_tail_halving_interval = static_cast<int>(d.tail_halving_interval);
+        consensus.launch_creator_script = d.creator_script;
+        consensus.launch_creator_fee_bps = d.creator_fee_bps;
+
+        const auto magic = LaunchMessageStart(d);
+        std::copy(magic.begin(), magic.end(), pchMessageStart.begin());
+        nDefaultPort = LaunchP2PPort(d);
+        nPruneAfterHeight = 1000;
+        m_assumed_blockchain_size = 0;
+        m_assumed_chain_state_size = 0;
+
+        genesis = CreateLaunchGenesisBlock(d);
+        consensus.hashGenesisBlock = genesis.GetHash();
+        consensus.launch_genesis_work = ArithToUint256(WorkForBits(genesis.nBits));
+        if (UintToArith256(consensus.hashGenesisBlock) > pow_limit) {
+            throw std::runtime_error(strprintf("launch %s: genesis_nonce %u does not satisfy pow_limit_bits (hash %s)",
+                                               LaunchIdHex(d), d.genesis_nonce, consensus.hashGenesisBlock.GetHex()));
+        }
+
+        vFixedSeeds.clear();
+        vSeeds = d.seeds;
+
+        fDefaultConsistencyChecks = false;
+        m_is_mockable_chain = d.test;
+        m_assumeutxo_data = {};
+        chainTxData = ChainTxData{.nTime = 0, .tx_count = 0, .dTxRate = 0.001};
+
+        base58Prefixes[PUBKEY_ADDRESS] = std::vector<unsigned char>(1, d.pubkey_prefix);
+        base58Prefixes[SCRIPT_ADDRESS] = std::vector<unsigned char>(1, d.script_prefix);
+        base58Prefixes[SECRET_KEY] = std::vector<unsigned char>(1, d.secret_prefix);
+        if (d.test) {
+            base58Prefixes[EXT_PUBLIC_KEY] = {0x04, 0x35, 0x87, 0xCF};
+            base58Prefixes[EXT_SECRET_KEY] = {0x04, 0x35, 0x83, 0x94};
+        } else {
+            base58Prefixes[EXT_PUBLIC_KEY] = {0x04, 0x88, 0xB2, 0x1E};
+            base58Prefixes[EXT_SECRET_KEY] = {0x04, 0x88, 0xAD, 0xE4};
+        }
+        bech32_hrp = d.hrp;
+        silent_payments_hrp = d.hrp + "sp";
+
+        m_headers_sync_params = HeadersSyncParams{
+            .commitment_period = 275,
+            .redownload_buffer_size = 7017,
+        };
+    }
+};
+
+std::unique_ptr<const CChainParams> CChainParams::Launch(const LaunchOptions& options)
+{
+    return std::make_unique<const CLaunchParams>(options);
+}
 
 std::unique_ptr<const CChainParams> CChainParams::SigNet(const SigNetOptions& options)
 {

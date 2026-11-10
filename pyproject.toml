@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hashfun"
+version = "0.1.0"
+description = "PoW launchpad tooling for hashfun launch chains: launch tool, pool, merged mining, strata proxy, swaps, Electrum server, wallet, board"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+hashfun-launch = "hashfun.launch:main"
+hashfun-pool = "hashfun.pool_cli:main"
+hashfun-proxy = "hashfun.proxy:main"
+hashfun-miner = "hashfun.miner:main"
+hashfun-swap = "hashfun.swap:main"
+hashfun-electrum = "hashfun.electrum:main"
+hashfun-wallet = "hashfun.wallet:main"
+hashfun-board = "hashfun.board:main"
+
+[tool.setuptools]
+packages = ["hashfun", "hashfun.tests"]
+
+[tool.setuptools.package-data]
+hashfun = ["bip39_english.txt", "board.html"]

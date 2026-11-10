@@ -19,6 +19,7 @@
 #include <node/mining_types.h>
 #include <policy/feerate.h>
 #include <policy/policy.h>
+#include <launchcurve.h>
 #include <pow.h>
 #include <primitives/block.h>
 #include <primitives/transaction.h>
@@ -179,13 +180,25 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     coinbaseTx.vin[0].nSequence = CTxIn::MAX_SEQUENCE_NONFINAL; // Make sure timelock is enforced.
     coinbase_tx.sequence = coinbaseTx.vin[0].nSequence;
 
-    // Add an output that spends the full coinbase reward.
+    // hashfun: difficulty is fixed by the ancestors (LWMA), so the work-weighted
+    // subsidy for this template is known before the header is final.
+    const uint32_t next_bits{GetNextWorkRequired(pindexPrev, pblock, chainparams.GetConsensus())};
+    const CAmount block_subsidy{GetBlockSubsidyForBlock(pindexPrev, next_bits, nHeight, chainparams.GetConsensus())};
+    const CAmount creator_fee{LaunchCreatorFee(block_subsidy, chainparams.GetConsensus())};
+
+    // Add an output that spends the full coinbase reward (minus the creator cut).
     coinbaseTx.vout.resize(1);
     coinbaseTx.vout[0].scriptPubKey = m_options.coinbase_output_script;
     // Block subsidy + fees
-    const CAmount block_reward{nFees + GetBlockSubsidy(nHeight, chainparams.GetConsensus())};
-    coinbaseTx.vout[0].nValue = block_reward;
-    coinbase_tx.block_reward_remaining = block_reward;
+    const CAmount block_reward{nFees + block_subsidy};
+    coinbaseTx.vout[0].nValue = block_reward - creator_fee;
+    coinbase_tx.block_reward_remaining = block_reward - creator_fee;
+    if (creator_fee > 0) {
+        const auto& cs = chainparams.GetConsensus().launch_creator_script;
+        CTxOut creator_out{creator_fee, CScript(cs.begin(), cs.end())};
+        coinbaseTx.vout.push_back(creator_out);
+        coinbase_tx.required_outputs.push_back(creator_out);
+    }
 
     // Start the coinbase scriptSig with the block height as required by BIP34.
     // Mining clients are expected to append extra data to this prefix, so

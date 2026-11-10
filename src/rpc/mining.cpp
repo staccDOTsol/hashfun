@@ -732,6 +732,11 @@ static RPCMethod getblocktemplate()
                 {RPCResult::Type::NUM, "height", "The height of the next block"},
                 {RPCResult::Type::STR_HEX, "signet_challenge", /*optional=*/true, "Only on signet"},
                 {RPCResult::Type::STR_HEX, "default_witness_commitment", /*optional=*/true, "a valid witness commitment for the unmodified block template"},
+                {RPCResult::Type::OBJ, "creatorfee", /*optional=*/true, "hashfun launch chains: mandatory coinbase output paying the launch creator (not included in coinbasevalue)",
+                {
+                    {RPCResult::Type::STR_HEX, "script", "creator scriptPubKey"},
+                    {RPCResult::Type::NUM, "amount", "minimum amount in satoshis"},
+                }},
             }},
         },
         RPCExamples{
@@ -803,7 +808,10 @@ static RPCMethod getblocktemplate()
             throw JSONRPCError(RPC_CLIENT_NOT_CONNECTED, CLIENT_NAME " is not connected!");
         }
 
-        if (chainman.IsInitialBlockDownload()) {
+        // hashfun: a fresh launch sits at genesis, which may be older than
+        // -maxtipage; someone has to mine block 1.
+        const bool at_launch_genesis{WITH_LOCK(cs_main, return chainman.GetParams().GetConsensus().launch_enabled && chainman.ActiveChain().Height() == 0)};
+        if (chainman.IsInitialBlockDownload() && !at_launch_genesis) {
             throw JSONRPCError(RPC_CLIENT_IN_INITIAL_DOWNLOAD, CLIENT_NAME " is in initial sync and waiting for blocks...");
         }
     }
@@ -1060,8 +1068,21 @@ static RPCMethod getblocktemplate()
     }
 
     if (const auto& coinbase{block_template->m_coinbase_tx}; coinbase.required_outputs.size() > 0) {
-        CHECK_NONFATAL(coinbase.required_outputs.size() == 1); // Only one output is currently expected
-        result.pushKV("default_witness_commitment", HexStr(coinbase.required_outputs[0].scriptPubKey));
+        // hashfun: required outputs are the witness commitment and, on launch
+        // chains, the creator's cut of the subsidy. Pools building their own
+        // coinbase must add the creator output; coinbasevalue excludes it.
+        const auto& creator_bytes{consensusParams.launch_creator_script};
+        const CScript creator_script(creator_bytes.begin(), creator_bytes.end());
+        for (const CTxOut& out : coinbase.required_outputs) {
+            if (consensusParams.launch_enabled && !creator_bytes.empty() && out.scriptPubKey == creator_script) {
+                UniValue cf(UniValue::VOBJ);
+                cf.pushKV("script", HexStr(out.scriptPubKey));
+                cf.pushKV("amount", out.nValue);
+                result.pushKV("creatorfee", std::move(cf));
+            } else {
+                result.pushKV("default_witness_commitment", HexStr(out.scriptPubKey));
+            }
+        }
     }
 
     return result;

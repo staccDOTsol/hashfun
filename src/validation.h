@@ -103,6 +103,11 @@ enum class SynchronizationState {
 extern const std::vector<std::string> CHECKLEVEL_DOC;
 
 CAmount GetBlockSubsidy(int nHeight, const Consensus::Params& consensusParams);
+/**
+ * Subsidy for a block whose parent is pindexPrev and whose difficulty is nBits.
+ * On launch chains this follows the work curve; otherwise GetBlockSubsidy.
+ */
+CAmount GetBlockSubsidyForBlock(const CBlockIndex* pindexPrev, uint32_t nBits, int nHeight, const Consensus::Params& consensusParams);
 
 bool FatalError(kernel::Notifications& notifications, BlockValidationState& state, const bilingual_str& message);
 

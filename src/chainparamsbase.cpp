@@ -7,6 +7,7 @@
 
 #include <common/args.h>
 #include <crypto/hex_base.h>
+#include <kernel/launch.h>
 #include <kernel/signet.h>
 #include <tinyformat.h>
 #include <util/chaintype.h>
@@ -25,6 +26,7 @@ void SetupChainParamsBaseOptions(ArgsManager& argsman)
     argsman.AddArg("-vbparams=deployment:start:end[:min_activation_height]", "Use given start/end times and min_activation_height for specified version bits deployment (test-only)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::CHAINPARAMS);
     argsman.AddArg("-signet", "Use the signet chain. Equivalent to -chain=signet. Note that the network is defined by the -signetchallenge parameter", ArgsManager::ALLOW_ANY, OptionsCategory::CHAINPARAMS);
     argsman.AddArg("-signetchallenge", "Blocks must satisfy the given script to be considered valid (only for signet networks; defaults to the global default signet test network challenge)", ArgsManager::ALLOW_ANY | ArgsManager::DISALLOW_NEGATION, OptionsCategory::CHAINPARAMS);
+    argsman.AddArg("-launch=<descriptor.json>", "Run the hashfun launch chain defined by this descriptor file. The descriptor fully defines the chain (curve, difficulty, genesis, network identity).", ArgsManager::ALLOW_ANY | ArgsManager::DISALLOW_NEGATION, OptionsCategory::CHAINPARAMS);
     argsman.AddArg("-signetseednode", "Specify a seed node for the signet network, in the hostname[:port] format, e.g. sig.net:1234 (may be used multiple times to specify multiple seed nodes; defaults to the global default signet test network seed node(s))", ArgsManager::ALLOW_ANY | ArgsManager::DISALLOW_NEGATION, OptionsCategory::CHAINPARAMS);
 }
 
@@ -71,6 +73,14 @@ std::unique_ptr<CBaseChainParams> CreateBaseChainParams(const ArgsManager& args,
         return std::make_unique<CBaseChainParams>(GetSignetDataDir(args), 38332);
     case ChainType::REGTEST:
         return std::make_unique<CBaseChainParams>("regtest", 18443);
+    case ChainType::LAUNCH: {
+        const auto path = args.GetArg("-launch");
+        if (!path || path->empty()) {
+            throw std::runtime_error("-launch=<descriptor.json> is required for the launch chain");
+        }
+        const LaunchDescriptor desc = ReadLaunchDescriptorFile(*path);
+        return std::make_unique<CBaseChainParams>(LaunchDataDirName(desc), LaunchRPCPort(desc));
+    }
     }
     assert(false);
 }

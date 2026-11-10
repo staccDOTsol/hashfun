@@ -9,6 +9,7 @@
 
 #include <arith_uint256.h>
 #include <auxpow.h>
+#include <launchcurve.h>
 #include <chain.h>
 #include <checkqueue.h>
 #include <clientversion.h>
@@ -1890,6 +1891,15 @@ CAmount GetBlockSubsidy(int nHeight, const Consensus::Params& consensusParams)
     return nSubsidy;
 }
 
+CAmount GetBlockSubsidyForBlock(const CBlockIndex* pindexPrev, uint32_t nBits, int nHeight, const Consensus::Params& consensusParams)
+{
+    if (consensusParams.launch_enabled) {
+        if (pindexPrev == nullptr) return 0; // genesis: no subsidy on launch chains
+        return LaunchSubsidy(pindexPrev, nBits, nHeight, consensusParams);
+    }
+    return GetBlockSubsidy(nHeight, consensusParams);
+}
+
 CoinsViews::CoinsViews(DBParams db_params, CoinsViewOptions options)
     : m_dbview{std::move(db_params), std::move(options)},
       m_catcherview(&m_dbview) {}
@@ -2739,10 +2749,26 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
              Ticks<SecondsDouble>(m_chainman.time_connect),
              Ticks<MillisecondsDouble>(m_chainman.time_connect) / m_chainman.num_blocks_total);
 
-    CAmount blockReward = nFees + GetBlockSubsidy(pindex->nHeight, params.GetConsensus());
+    const CAmount block_subsidy{GetBlockSubsidyForBlock(pindex->pprev, block.nBits, pindex->nHeight, params.GetConsensus())};
+    CAmount blockReward = nFees + block_subsidy;
     if (block.vtx[0]->GetValueOut() > blockReward && state.IsValid()) {
         state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-amount",
                       strprintf("coinbase pays too much (actual=%d vs limit=%d)", block.vtx[0]->GetValueOut(), blockReward));
+    }
+    // hashfun: the coinbase must pay the launch creator its cut of the subsidy.
+    if (params.GetConsensus().launch_enabled && state.IsValid()) {
+        const CAmount creator_fee{LaunchCreatorFee(block_subsidy, params.GetConsensus())};
+        if (creator_fee > 0) {
+            const CScript creator_script(params.GetConsensus().launch_creator_script.begin(), params.GetConsensus().launch_creator_script.end());
+            CAmount paid{0};
+            for (const CTxOut& out : block.vtx[0]->vout) {
+                if (out.scriptPubKey == creator_script) paid += out.nValue;
+            }
+            if (paid < creator_fee) {
+                state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-creator-fee",
+                              strprintf("coinbase pays creator %d, required %d", paid, creator_fee));
+            }
+        }
     }
     if (control) {
         auto parallel_result = control->Complete();
@@ -4231,6 +4257,14 @@ static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidatio
                              "late-legacy-block",
                              "legacy block after auxpow start");
 
+    // hashfun: merge-mining is only valid once the curve has graduated. Before
+    // graduation, issuance must be bought with standalone hash; letting parent
+    // pools in at zero marginal cost would hand them the whole presale.
+    if (consensusParams.launch_enabled && block.IsAuxpow() && !LaunchGraduatedAt(pindexPrev, consensusParams))
+        return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER,
+                             "auxpow-before-graduation",
+                             "merge-mined block before the launch curve graduated");
+
     // Check proof of work
     if (block.nBits != GetNextWorkRequired(pindexPrev, &block, consensusParams))
         return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "bad-diffbits", "incorrect proof of work");
@@ -4251,8 +4285,9 @@ static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidatio
         }
     }
 
-    // Check timestamp
-    if (block.Time() > NodeClock::now() + std::chrono::seconds{MAX_FUTURE_BLOCK_TIME}) {
+    // Check timestamp (launch chains use the descriptor's tighter FTL, sized to the LWMA window)
+    const int64_t max_future{consensusParams.max_future_block_time > 0 ? consensusParams.max_future_block_time : MAX_FUTURE_BLOCK_TIME};
+    if (block.Time() > NodeClock::now() + std::chrono::seconds{max_future}) {
         return state.Invalid(BlockValidationResult::BLOCK_TIME_FUTURE, "time-too-new", "block timestamp too far in the future");
     }
 

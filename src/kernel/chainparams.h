@@ -7,6 +7,7 @@
 #define BITCOIN_KERNEL_CHAINPARAMS_H
 
 #include <consensus/params.h>
+#include <kernel/launch.h>
 #include <kernel/messagestartchars.h>
 #include <primitives/block.h>
 #include <uint256.h>
@@ -95,7 +96,11 @@ public:
     /** Default value for -checkmempool and -checkblockindex argument */
     bool DefaultConsistencyChecks() const { return fDefaultConsistencyChecks; }
     /** If this chain is exclusively used for testing */
-    bool IsTestChain() const { return m_chain_type != ChainType::MAIN; }
+    bool IsTestChain() const
+    {
+        if (m_chain_type == ChainType::LAUNCH) return m_launch && m_launch->test;
+        return m_chain_type != ChainType::MAIN;
+    }
     /** If this chain allows time to be mocked */
     bool IsMockableChain() const { return m_is_mockable_chain; }
     uint64_t PruneAfterHeight() const { return nPruneAfterHeight; }
@@ -168,6 +173,16 @@ public:
         DeploymentOptions dep_opts{};
     };
 
+    /**
+     * LaunchOptions: a hashfun launch chain, fully defined by its descriptor.
+     */
+    struct LaunchOptions {
+        LaunchDescriptor desc;
+    };
+
+    static std::unique_ptr<const CChainParams> Launch(const LaunchOptions& options);
+    const std::optional<LaunchDescriptor>& GetLaunch() const { return m_launch; }
+
     static std::unique_ptr<const CChainParams> RegTest(const RegTestOptions& options);
     static std::unique_ptr<const CChainParams> RegTest() { const RegTestOptions opts{}; return RegTest(opts); }
     static std::unique_ptr<const CChainParams> SigNet(const SigNetOptions& options);
@@ -200,6 +215,7 @@ protected:
     std::vector<AssumeutxoData> m_assumeutxo_data;
     ChainTxData chainTxData;
     HeadersSyncParams m_headers_sync_params;
+    std::optional<LaunchDescriptor> m_launch;
 
     void ApplyDeploymentOptions(const DeploymentOptions& opts);
 };

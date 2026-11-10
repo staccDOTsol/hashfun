@@ -181,6 +181,28 @@ struct Params {
         return static_cast<int> (nHeight) < nLegacyBlocksBefore;
     }
 
+    /**
+     * hashfun launch parameters. When launch_enabled, issuance follows the
+     * work-denominated constant-product curve S(W) = T0*W/(V0+W) over
+     * chainwork relative to genesis, capped at the graduation supply, then
+     * a per-block tail with halvings. AuxPoW is only accepted once the
+     * parent's chainwork has reached launch_graduation_work.
+     */
+    bool launch_enabled{false};
+    uint256 launch_id;
+    uint256 launch_virtual_work;        //!< V0 (big-endian uint256, arith)
+    int64_t launch_virtual_tokens{0};   //!< T0 (satoshis)
+    int64_t launch_graduation_tokens{0}; //!< G (satoshis)
+    uint256 launch_graduation_work;     //!< W_g = ceil(G*V0/(T0-G)) (arith)
+    uint256 launch_genesis_work;        //!< chainwork of the genesis block
+    int64_t launch_tail_reward{0};      //!< satoshis per block after graduation
+    int launch_tail_halving_interval{0};
+    std::vector<unsigned char> launch_creator_script;
+    int launch_creator_fee_bps{0};
+    /** LWMA averaging window (0 = legacy Bitcoin retargeting). */
+    int lwma_window{0};
+    /** Max seconds a block timestamp may be ahead of local time (0 = default 2h). */
+    int64_t max_future_block_time{0};
 };
 
 } // namespace Consensus

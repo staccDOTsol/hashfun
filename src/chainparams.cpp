@@ -9,6 +9,7 @@
 #include <common/args.h>
 #include <consensus/params.h>
 #include <deploymentinfo.h>
+#include <kernel/launch.h>
 #include <tinyformat.h>
 #include <util/chaintype.h>
 #include <util/log.h>
@@ -123,6 +124,16 @@ void ReadRegTestArgs(const ArgsManager& args, CChainParams::RegTestOptions& opti
     HandleDeploymentArgs(args, options.dep_opts);
 }
 
+static void ReadLaunchArgs(const ArgsManager& args, CChainParams::LaunchOptions& options)
+{
+    const auto path = args.GetArg("-launch");
+    if (!path || path->empty()) {
+        throw std::runtime_error("-launch=<descriptor.json> is required for the launch chain");
+    }
+    options.desc = ReadLaunchDescriptorFile(*path);
+    SetGlobalLaunch(options.desc);
+}
+
 static std::unique_ptr<const CChainParams> globalChainParams;
 
 const CChainParams &Params() {
@@ -157,6 +168,11 @@ std::unique_ptr<const CChainParams> CreateChainParams(const ArgsManager& args, c
         auto opts = CChainParams::RegTestOptions{};
         ReadRegTestArgs(args, opts);
         return CChainParams::RegTest(opts);
+    }
+    case ChainType::LAUNCH: {
+        auto opts = CChainParams::LaunchOptions{};
+        ReadLaunchArgs(args, opts);
+        return CChainParams::Launch(opts);
     }
     }
     assert(false);

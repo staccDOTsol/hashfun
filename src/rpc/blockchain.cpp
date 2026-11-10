@@ -71,6 +71,9 @@
 #include <util/syserror.h>
 #include <util/time.h>
 #include <util/translation.h>
+#include <launchcurve.h>
+#include <kernel/launch.h>
+#include <pow.h>
 #include <validation.h>
 #include <validationinterface.h>
 #include <versionbits.h>
@@ -2323,7 +2326,7 @@ static RPCMethod getblockstats()
     ret_all.pushKV("minfeerate", (minfeerate == MAX_MONEY) ? 0 : minfeerate);
     ret_all.pushKV("mintxsize", mintxsize == MAX_BLOCK_SERIALIZED_SIZE ? 0 : mintxsize);
     ret_all.pushKV("outs", outputs);
-    ret_all.pushKV("subsidy", GetBlockSubsidy(pindex.nHeight, chainman.GetParams().GetConsensus()));
+    ret_all.pushKV("subsidy", GetBlockSubsidyForBlock(pindex.pprev, pindex.nBits, pindex.nHeight, chainman.GetParams().GetConsensus()));
     ret_all.pushKV("swtotal_size", swtotal_size);
     ret_all.pushKV("swtotal_weight", swtotal_weight);
     ret_all.pushKV("swtxs", swtxs);
@@ -3763,10 +3766,142 @@ return RPCMethod{
 }
 
 
+static RPCMethod getlaunchinfo()
+{
+    return RPCMethod{
+        "getlaunchinfo",
+        "Returns the hashfun launch state: descriptor, consensus curve position, graduation and next-block issuance.\n"
+        "All amounts are in satoshis. Work values are hex uint256 (expected hashes).\n",
+        {},
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::STR_HEX, "launch_id", "SHA256d of the canonical descriptor (committed in genesis)"},
+                {RPCResult::Type::STR, "name", "launch name"},
+                {RPCResult::Type::STR, "ticker", "ticker"},
+                {RPCResult::Type::STR, "hrp", "bech32 human readable part"},
+                {RPCResult::Type::STR_HEX, "genesis_hash", "genesis block hash"},
+                {RPCResult::Type::NUM, "chain_id", "auxpow chain id"},
+                {RPCResult::Type::NUM, "height", "tip height"},
+                {RPCResult::Type::STR_HEX, "work", "chainwork above genesis"},
+                {RPCResult::Type::NUM, "curve_supply", "coins minted by the curve so far"},
+                {RPCResult::Type::NUM, "tail_minted", "coins minted by the post-graduation tail"},
+                {RPCResult::Type::NUM, "supply", "curve_supply + tail_minted"},
+                {RPCResult::Type::NUM, "progress", "curve_supply / graduation_tokens"},
+                {RPCResult::Type::BOOL, "graduated", "whether merge-mining is open"},
+                {RPCResult::Type::NUM, "graduation_height", "height of the crossing block, -1 if not graduated"},
+                {RPCResult::Type::NUM, "hashes_per_coin", "current curve price in expected hashes per whole coin"},
+                {RPCResult::Type::OBJ, "curve", "",
+                {
+                    {RPCResult::Type::STR_HEX, "virtual_work", "V0"},
+                    {RPCResult::Type::NUM, "virtual_tokens", "T0"},
+                    {RPCResult::Type::NUM, "graduation_tokens", "G"},
+                    {RPCResult::Type::STR_HEX, "graduation_work", "W_g"},
+                    {RPCResult::Type::NUM, "tail_reward", "tail reward per block"},
+                    {RPCResult::Type::NUM, "tail_halving_interval", "tail halving interval (blocks)"},
+                }},
+                {RPCResult::Type::OBJ, "creator", "",
+                {
+                    {RPCResult::Type::STR_HEX, "script", "creator scriptPubKey"},
+                    {RPCResult::Type::NUM, "fee_bps", "creator cut of each subsidy (basis points)"},
+                }},
+                {RPCResult::Type::OBJ, "next", "the next block on top of the tip",
+                {
+                    {RPCResult::Type::STR_HEX, "bits", "compact difficulty"},
+                    {RPCResult::Type::STR_HEX, "work", "expected hashes"},
+                    {RPCResult::Type::NUM, "subsidy", "subsidy"},
+                    {RPCResult::Type::NUM, "creator_fee", "creator output amount"},
+                    {RPCResult::Type::BOOL, "auxpow_allowed", "whether a merge-mined block is valid"},
+                }},
+                {RPCResult::Type::OBJ_DYN, "descriptor", "the launch descriptor",
+                {
+                    {RPCResult::Type::ANY, "field", "descriptor field"},
+                }},
+            }},
+        RPCExamples{
+            HelpExampleCli("getlaunchinfo", "")
+            + HelpExampleRpc("getlaunchinfo", "")
+        },
+        [](const RPCMethod& self, const JSONRPCRequest& request) -> UniValue
+{
+    ChainstateManager& chainman = EnsureAnyChainman(request.context);
+    const CChainParams& chainparams = chainman.GetParams();
+    const Consensus::Params& consensus = chainparams.GetConsensus();
+    if (!consensus.launch_enabled || !chainparams.GetLaunch()) {
+        throw JSONRPCError(RPC_MISC_ERROR, "not a hashfun launch chain");
+    }
+    const LaunchDescriptor& d = *chainparams.GetLaunch();
+
+    LOCK(cs_main);
+    const CBlockIndex* tip = chainman.ActiveChain().Tip();
+    const arith_uint256 w = LaunchRelWork(tip, consensus);
+    const CAmount curve_supply = LaunchCurveSupply(w, consensus);
+    const bool graduated = LaunchGraduated(w, consensus);
+    const int grad_height = LaunchGraduationHeight(tip, consensus);
+    const CAmount tail_minted = grad_height >= 0 ? LaunchTailMinted(grad_height + 1, tip->nHeight, consensus) : 0;
+
+    CBlockHeader dummy;
+    dummy.nTime = static_cast<uint32_t>(GetTime());
+    const uint32_t next_bits = GetNextWorkRequired(tip, &dummy, consensus);
+    arith_uint256 next_target;
+    next_target.SetCompact(next_bits);
+    const arith_uint256 next_work = (~next_target / (next_target + 1)) + 1;
+    const CAmount next_subsidy = GetBlockSubsidyForBlock(tip, next_bits, tip->nHeight + 1, consensus);
+
+    UniValue ret(UniValue::VOBJ);
+    ret.pushKV("launch_id", HexStr(d.id));
+    ret.pushKV("name", d.name);
+    ret.pushKV("ticker", d.ticker);
+    ret.pushKV("hrp", d.hrp);
+    ret.pushKV("genesis_hash", consensus.hashGenesisBlock.GetHex());
+    ret.pushKV("chain_id", consensus.nAuxpowChainId);
+    ret.pushKV("height", tip->nHeight);
+    ret.pushKV("work", ArithToUint256(w).GetHex());
+    ret.pushKV("curve_supply", curve_supply);
+    ret.pushKV("tail_minted", tail_minted);
+    ret.pushKV("supply", curve_supply + tail_minted);
+    ret.pushKV("progress", static_cast<double>(curve_supply) / static_cast<double>(consensus.launch_graduation_tokens));
+    ret.pushKV("graduated", graduated);
+    ret.pushKV("graduation_height", grad_height);
+    ret.pushKV("hashes_per_coin", LaunchHashesPerCoin(w, consensus));
+
+    UniValue curve(UniValue::VOBJ);
+    curve.pushKV("virtual_work", consensus.launch_virtual_work.GetHex());
+    curve.pushKV("virtual_tokens", consensus.launch_virtual_tokens);
+    curve.pushKV("graduation_tokens", consensus.launch_graduation_tokens);
+    curve.pushKV("graduation_work", consensus.launch_graduation_work.GetHex());
+    curve.pushKV("tail_reward", consensus.launch_tail_reward);
+    curve.pushKV("tail_halving_interval", consensus.launch_tail_halving_interval);
+    ret.pushKV("curve", std::move(curve));
+
+    UniValue creator(UniValue::VOBJ);
+    creator.pushKV("script", HexStr(consensus.launch_creator_script));
+    creator.pushKV("fee_bps", consensus.launch_creator_fee_bps);
+    ret.pushKV("creator", std::move(creator));
+
+    UniValue next(UniValue::VOBJ);
+    next.pushKV("bits", strprintf("%08x", next_bits));
+    next.pushKV("work", ArithToUint256(next_work).GetHex());
+    next.pushKV("subsidy", next_subsidy);
+    next.pushKV("creator_fee", LaunchCreatorFee(next_subsidy, consensus));
+    next.pushKV("auxpow_allowed", graduated);
+    ret.pushKV("next", std::move(next));
+
+    UniValue desc;
+    if (!desc.read(LaunchDescriptorToJSON(d))) {
+        throw JSONRPCError(RPC_INTERNAL_ERROR, "failed to serialize launch descriptor");
+    }
+    ret.pushKV("descriptor", std::move(desc));
+    return ret;
+},
+    };
+}
+
 void RegisterBlockchainRPCCommands(CRPCTable& t)
 {
     static const CRPCCommand commands[]{
         {"blockchain", &getblockchaininfo},
+        {"blockchain", &getlaunchinfo},
         {"blockchain", &getchaintxstats},
         {"blockchain", &getblockstats},
         {"blockchain", &getbestblockhash},

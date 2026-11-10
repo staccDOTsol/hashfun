@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>hashfun board</title>
+<style>
+:root{--bg:#0d0f0e;--panel:#141716;--line:#262b29;--ink:#e7ece9;--mute:#8a948f;--acc:#f2a33a;--good:#5fd38d;--warn:#e5604d;--grid:#1e2321;
+--mono:ui-monospace,"SF Mono","JetBrains Mono",Menlo,Consolas,monospace;--sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
+@media (prefers-color-scheme:light){:root{--bg:#f6f5f1;--panel:#fff;--line:#e2e0d8;--ink:#171a19;--mute:#6b706d;--acc:#c46f00;--good:#1f8a4c;--warn:#b8382a;--grid:#eeece6}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 var(--sans)}
+header{display:flex;align-items:baseline;gap:16px;padding:18px 20px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+h1{font:700 20px var(--mono);margin:0;letter-spacing:-.02em}h1 b{color:var(--acc)}
+.tag{color:var(--mute);font-size:13px}.grow{flex:1}
+label{color:var(--mute);font-size:12px}input{background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:6px;padding:4px 8px;width:90px;font:13px var(--mono)}
+main{display:grid;grid-template-columns:minmax(260px,340px) 1fr;gap:0;min-height:calc(100vh - 64px)}
+@media (max-width:820px){main{grid-template-columns:1fr}}
+#list{border-right:1px solid var(--line);padding:12px;display:flex;flex-direction:column;gap:8px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px;cursor:pointer}
+.card.sel{border-color:var(--acc)}
+.row{display:flex;justify-content:space-between;gap:8px;align-items:baseline}
+.tk{font:700 15px var(--mono)}.nm{color:var(--mute);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.bar{height:6px;background:var(--grid);border-radius:3px;margin:9px 0 6px;overflow:hidden}.bar i{display:block;height:100%;background:var(--acc)}
+.grad .bar i{background:var(--good)}
+.kv{font:12px var(--mono);color:var(--mute)}.kv b{color:var(--ink);font-weight:600}
+.badge{font:600 10px var(--mono);padding:2px 6px;border-radius:999px;border:1px solid currentColor;text-transform:uppercase;letter-spacing:.04em}
+.b-pre{color:var(--acc)}.b-grad{color:var(--good)}
+#detail{padding:16px 20px;min-width:0}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:12px 0 18px}
+.stat{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
+.stat .l{color:var(--mute);font-size:11px;text-transform:uppercase;letter-spacing:.06em}.stat .v{font:600 18px var(--mono);margin-top:2px;overflow-wrap:anywhere}
+.stat .s{color:var(--mute);font:11px var(--mono)}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px;margin-bottom:14px}
+.panel h3{margin:0 0 8px;font:600 12px var(--sans);color:var(--mute);text-transform:uppercase;letter-spacing:.06em}
+svg text{fill:var(--mute);font:10px var(--mono)}
+table{width:100%;border-collapse:collapse;font:12px var(--mono)}th{color:var(--mute);font-weight:500;text-align:left;padding:4px 6px;border-bottom:1px solid var(--line)}
+td{padding:4px 6px;border-bottom:1px solid var(--grid);white-space:nowrap}td.r,th.r{text-align:right}
+.tbl{overflow-x:auto}.mut{color:var(--mute)}.err{color:var(--warn);font:12px var(--mono)}
+.empty{color:var(--mute);padding:40px;text-align:center}
+</style>
+</head>
+<body>
+<header>
+  <h1>hash<b>fun</b></h1><span class="tag">mined, not minted. PoW launches on a consensus curve.</span>
+  <span class="grow"></span>
+  <label>hashprice <input id="hp" type="number" step="any" min="0"> sats/TH</label>
+</header>
+<main>
+  <section id="list"><div class="empty">connecting to nodes&hellip;</div></section>
+  <section id="detail"><div class="empty">select a launch</div></section>
+</main>
+<script>
+const COIN=1e8;let sel=null,state=null,hpInput=document.getElementById('hp');
+try{const v=localStorage.getItem('hf_hp');if(v)hpInput.value=v}catch(e){}
+hpInput.addEventListener('input',()=>{try{localStorage.setItem('hf_hp',hpInput.value)}catch(e){};render()});
+const hx=h=>Number(BigInt('0x'+h));
+function fh(x){const u=[['EH',1e18],['PH',1e15],['TH',1e12],['GH',1e9],['MH',1e6],['kH',1e3]];for(const[n,v]of u)if(x>=v)return(x/v).toPrecision(3)+' '+n;return x.toPrecision(3)+' H'}
+function fc(s){return(s/COIN).toLocaleString(undefined,{maximumFractionDigits:2})}
+function hp(){const v=parseFloat(hpInput.value);return isFinite(v)&&v>0?v:(state&&state.hashprice_sats_per_th)||null}
+function btc(hashes){const p=hp();if(!p)return null;return hashes/1e12*p}
+function fsats(s){if(s==null)return'—';if(s>=1e6)return(s/1e8).toPrecision(4)+' BTC';return s.toPrecision(3)+' sats'}
+function ago(t){const d=Date.now()/1e3-t;return d<60?Math.round(d)+'s':d<3600?Math.round(d/60)+'m':Math.round(d/3600)+'h'}
+async function j(u){const r=await fetch(u);return r.json()}
+async function tick(){try{state=await j('/api/launches');if(!sel&&state.launches.length&&state.launches[0].launch_id)sel=state.launches[0].launch_id;render();if(sel){const d=await j('/api/launch/'+sel.slice(0,16));renderDetail(d)}}catch(e){}setTimeout(tick,3000)}
+function render(){const L=document.getElementById('list');if(!state)return;
+L.innerHTML=state.launches.map(l=>{if(!l.launch_id)return`<div class="card"><span class="err">${l.error||'unreachable'}</span></div>`;
+const g=l.graduated,pc=Math.min(100,l.progress*100);const pb=btc(l.hashes_per_coin);
+return`<div class="card ${g?'grad':''} ${l.launch_id===sel?'sel':''}" data-id="${l.launch_id}">
+<div class="row"><span class="tk">${l.ticker}</span><span class="badge ${g?'b-grad':'b-pre'}">${g?'merge-mined':'presale'}</span></div>
+<div class="nm">${esc(l.name)}</div><div class="bar"><i style="width:${pc}%"></i></div>
+<div class="row kv"><span><b>${pc.toFixed(1)}%</b> curve</span><span>${fh(l.hashes_per_coin)}/coin</span></div>
+<div class="row kv"><span>h ${l.height}</span><span>${l.hashrate?fh(l.hashrate)+'/s':'—'}</span><span>${pb!=null?fsats(pb)+'/coin':''}</span></div></div>`}).join('');
+L.querySelectorAll('.card[data-id]').forEach(c=>c.onclick=()=>{sel=c.dataset.id;render();tick0()})}
+function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+async function tick0(){if(sel){const d=await j('/api/launch/'+sel.slice(0,16));renderDetail(d)}}
+function curveSVG(i){const V0=hx(i.curve.virtual_work),T0=i.curve.virtual_tokens,G=i.curve.graduation_tokens;
+const W=640,H=220,P=36;const price=S=>V0*T0/((T0-S)*(T0-S))*COIN;const pmax=price(G),pmin=price(0);
+const lx=S=>P+(S/G)*(W-P-10),ly=p=>H-24-((Math.log(p)-Math.log(pmin))/(Math.log(pmax)-Math.log(pmin)||1))*(H-40);
+let d='';for(let k=0;k<=80;k++){const S=G*k/80;d+=(k?'L':'M')+lx(S).toFixed(1)+','+ly(price(S)).toFixed(1)}
+const s=Math.min(i.curve_supply,G),cx=lx(s),cy=ly(price(s));
+const fill=d+`L${lx(s)},${H-24}L${P},${H-24}Z`;
+let ticks='';for(let k=0;k<=4;k++){const p=Math.exp(Math.log(pmin)+(Math.log(pmax)-Math.log(pmin))*k/4);ticks+=`<text x="2" y="${ly(p)+3}">${fh(p)}</text><line x1="${P}" x2="${W-10}" y1="${ly(p)}" y2="${ly(p)}" stroke="var(--grid)"/>`}
+const partial=[];for(let k=0;k<=80;k++){const S=G*k/80;if(S>s)break;partial.push((partial.length?'L':'M')+lx(S).toFixed(1)+','+ly(price(S)).toFixed(1))}
+return`<svg viewBox="0 0 ${W} ${H}" width="100%" role="img" aria-label="consensus curve">${ticks}
+<path d="${d}" fill="none" stroke="var(--line)" stroke-width="2"/><path d="${partial.join('')}" fill="none" stroke="var(--acc)" stroke-width="2.5"/>
+<line x1="${lx(G)}" x2="${lx(G)}" y1="10" y2="${H-24}" stroke="var(--good)" stroke-dasharray="3 3"/>
+<text x="${lx(G)-4}" y="18" text-anchor="end">graduation</text>
+<circle cx="${cx}" cy="${cy}" r="5" fill="var(--acc)"/>
+<text x="${P}" y="${H-8}">0</text><text x="${W-10}" y="${H-8}" text-anchor="end">${fc(G)} ${esc(i.ticker)}</text></svg>`}
+function sparkSVG(vals,color){if(vals.length<2)return'<div class="mut">not enough blocks</div>';const W=640,H=70;const mx=Math.max(...vals),mn=Math.min(...vals);
+const p=vals.map((v,k)=>`${(k/(vals.length-1)*W).toFixed(1)},${(H-4-(mx>mn?(v-mn)/(mx-mn):.5)*(H-8)).toFixed(1)}`).join(' ');
+return`<svg viewBox="0 0 ${W} ${H}" width="100%" preserveAspectRatio="none"><polyline points="${p}" fill="none" stroke="${color}" stroke-width="1.5" vector-effect="non-scaling-stroke"/></svg>`}
+function renderDetail(d){const D=document.getElementById('detail');if(!d||!d.info||!d.info.launch_id){D.innerHTML='<div class="empty">no data</div>';return}
+const i=d.info,b=d.blocks,pb=btc(i.hashes_per_coin);
+D.innerHTML=`<div class="row"><div><span class="tk" style="font-size:22px">${esc(i.ticker)}</span> <span class="mut">${esc(i.name)}</span></div>
+<span class="badge ${i.graduated?'b-grad':'b-pre'}">${i.graduated?'graduated @ '+i.graduation_height:'presale'}</span></div>
+<div class="kv" style="margin-top:4px">id ${i.launch_id.slice(0,16)}… · genesis ${i.genesis_hash.slice(0,16)}… · chain id ${i.chain_id} · creator fee ${i.creator.fee_bps/100}%</div>
+<div class="stats">
+<div class="stat"><div class="l">curve price</div><div class="v">${fh(i.hashes_per_coin)}</div><div class="s">per coin${pb!=null?' · '+fsats(pb):''}</div></div>
+<div class="stat"><div class="l">curve supply</div><div class="v">${fc(i.curve_supply)}</div><div class="s">${(i.progress*100).toFixed(2)}% of ${fc(i.curve.graduation_tokens)}</div></div>
+<div class="stat"><div class="l">total supply</div><div class="v">${fc(i.supply)}</div><div class="s">tail ${fc(i.tail_minted)}</div></div>
+<div class="stat"><div class="l">hashrate</div><div class="v">${i.hashrate?fh(i.hashrate)+'/s':'—'}</div><div class="s">${i.block_interval?i.block_interval.toFixed(1)+'s blocks':''}</div></div>
+<div class="stat"><div class="l">next block</div><div class="v">${fc(i.next.subsidy)}</div><div class="s">${fh(hx(i.next.work))} work · ${i.next.auxpow_allowed?'aux ok':'standalone only'}</div></div>
+<div class="stat"><div class="l">to graduation</div><div class="v">${i.graduated?'done':fh(Math.max(0,hx(i.curve.graduation_work)-hx(i.work)))}</div><div class="s">${i.graduated?'merge-mining open':(()=>{const r=btc(Math.max(0,hx(i.curve.graduation_work)-hx(i.work)));return r!=null?'≈ '+fsats(r)+' of hash':'hash remaining'})()}</div></div>
+</div>
+<div class="panel"><h3>consensus curve · price vs supply (log)</h3>${curveSVG(i)}</div>
+<div class="panel"><h3>subsidy per block</h3>${sparkSVG(b.map(x=>x.coinbase_value),'var(--acc)')}</div>
+<div class="panel"><h3>work per block (difficulty)</h3>${sparkSVG(b.map(x=>x.work),'var(--good)')}</div>
+<div class="panel tbl"><h3>blocks</h3><table><tr><th>height</th><th>age</th><th class="r">work</th><th class="r">coinbase</th><th>miner</th><th></th></tr>
+${b.slice(-40).reverse().map(x=>`<tr><td>${x.height}</td><td class="mut">${ago(x.time)}</td><td class="r">${fh(x.work)}</td><td class="r">${fc(x.coinbase_value)}</td><td class="mut">${x.payouts[0]?esc(x.payouts[0].address||'?').slice(0,22)+'…':''}</td><td>${x.auxpow?'<span class="badge b-grad">aux</span>':''}</td></tr>`).join('')}</table></div>`}
+tick();
+</script>
+</body>
+</html>

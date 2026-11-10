@@ -438,6 +438,8 @@ private:
             return " signet";
         case ChainType::REGTEST:
             return " regtest";
+        case ChainType::LAUNCH:
+            return " launch";
         case ChainType::MAIN:
             return "";
         }

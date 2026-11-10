@@ -8,6 +8,7 @@
 #include <auxpow.h>
 #include <chainparams.h>
 #include <consensus/merkle.h>
+#include <launchcurve.h>
 #include <net.h>
 #include <node/block_template_manager.h>
 #include <node/context.h>
@@ -30,14 +31,24 @@ void auxMiningCheck(const node::NodeContext& node)
   const auto& connman = EnsureConnman (node);
   const auto& chainman = EnsureChainman (node);
 
-  if (connman.GetNodeCount (ConnectionDirection::Both) == 0
-        && !Params ().MineBlocksOnDemand ())
+  const bool relaxed = Params ().MineBlocksOnDemand () || Params ().IsTestChain ();
+  if (connman.GetNodeCount (ConnectionDirection::Both) == 0 && !relaxed)
     throw JSONRPCError (RPC_CLIENT_NOT_CONNECTED,
-                        "Namecoin is not connected!");
+                        "hashfun node is not connected!");
 
-  if (chainman.IsInitialBlockDownload () && !Params ().MineBlocksOnDemand ())
+  if (chainman.IsInitialBlockDownload () && !relaxed)
     throw JSONRPCError (RPC_CLIENT_IN_INITIAL_DOWNLOAD,
-                        "Namecoin is downloading blocks...");
+                        "hashfun node is downloading blocks...");
+
+  /* hashfun: merge-mining opens at graduation.  */
+  {
+    LOCK (cs_main);
+    const auto& consensus = Params ().GetConsensus ();
+    if (consensus.launch_enabled
+        && !LaunchGraduatedAt (chainman.ActiveChain ().Tip (), consensus))
+      throw JSONRPCError (RPC_MISC_ERROR,
+                          "merge-mining is not available before the launch graduates");
+  }
 
   /* This should never fail, since the chain is already
      past the point of merge-mining start.  Check nevertheless.  */

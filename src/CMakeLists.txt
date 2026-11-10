@@ -124,7 +124,9 @@ add_library(bitcoin_common STATIC EXCLUDE_FROM_ALL
   init/common.cpp
   ipc/listen.cpp
   kernel/chainparams.cpp
+  kernel/launch.cpp
   key.cpp
+  launchcurve.cpp
   key_io.cpp
   merkleblock.cpp
   musig.cpp
@@ -332,6 +334,7 @@ if(BUILD_DAEMON)
     bitcoin_node
     $<TARGET_NAME_IF_EXISTS:bitcoin_wallet>
   )
+  set_target_properties(bitcoind PROPERTIES OUTPUT_NAME hashfund)
   install_binary_component(bitcoind HAS_MANPAGE)
 endif()
 if(ENABLE_IPC AND BUILD_DAEMON)
@@ -375,6 +378,7 @@ if(BUILD_CLI)
     bitcoin_ipc
     bitcoin_util
   )
+  set_target_properties(bitcoin-cli PROPERTIES OUTPUT_NAME hashfun-cli)
   install_binary_component(bitcoin-cli HAS_MANPAGE)
 endif()
 
