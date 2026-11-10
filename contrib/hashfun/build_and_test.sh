@@ -61,6 +61,10 @@ fi
 log "python unit + simulator tests"
 python3 -W ignore -m unittest hashfun.tests.test_core hashfun.tests.test_stack 2>&1 | tail -n 4
 
+log "consensus differential: node C++ vs Python model"
+bash contrib/hashfun/difftest/build.sh build/hfdiff >/dev/null
+HFDIFF=build/hfdiff python3 -m unittest hashfun.tests.test_diff_cpp 2>&1 | tail -n 3
+
 log "e2e: hashfund vs Python model, merged mining vs stock bitcoind, swap on real nodes"
 python3 -m hashfun.tests.e2e_regtest --hashfund build/bin/hashfund --bitcoind "$WORK/bitcoin-$BTC_VER/bin/bitcoind" \
   2>&1 | tee "$WORK/e2e.log"

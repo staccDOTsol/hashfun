@@ -2,6 +2,7 @@
 the consensus rules (curve, graduation, tail, LWMA). Mirrors src/kernel/launch.cpp,
 src/launchcurve.cpp, src/pow.cpp and CLaunchParams byte for byte."""
 import json
+import re
 import struct
 import time
 from dataclasses import dataclass, field
@@ -218,55 +219,105 @@ class Launch:
         return json.dumps(self.to_json(), indent=2) + "\n"
 
 
-def _int(v, key, maxv):
-    if isinstance(v, bool):
-        raise DescriptorError(f"{key}: expected integer")
+_DEC = re.compile(r"-?[0-9]+")
+_HEX = re.compile(r"0x[0-9a-fA-F]+")
+_V0 = re.compile(r"0[xX][0-9a-fA-F]{1,64}|[0-9]+")
+
+
+def _int(o: dict, key: str, maxv: int, default: int = 0, required: bool = False) -> int:
+    """launch.cpp GetUInt: a JSON integer, or a string of decimal digits (std::from_chars,
+    so an optional '-' and nothing else) or lowercase-0x hex. null/missing keeps the default."""
+    v = o.get(key)
+    if v is None:
+        if required:
+            raise DescriptorError(f"{key}: required")
+        return default
     if isinstance(v, str):
-        v = int(v, 16) if v.startswith("0x") else int(v)
-    if not isinstance(v, int) or v < 0 or v > maxv:
+        if _HEX.fullmatch(v):
+            v = int(v, 16)
+        elif _DEC.fullmatch(v):
+            v = int(v)
+        else:
+            raise DescriptorError(f"{key}: not an integer")
+    if isinstance(v, bool) or not isinstance(v, int):
+        raise DescriptorError(f"{key}: expected integer")
+    if v < 0 or v > maxv:
         raise DescriptorError(f"{key}: out of range")
     return v
 
 
+def _str(o: dict, key: str, default: Optional[str] = None) -> str:
+    """launch.cpp GetStr: null/missing is an error unless there is a default."""
+    v = o.get(key)
+    if v is None:
+        if default is None:
+            raise DescriptorError(f"{key}: required")
+        return default
+    if not isinstance(v, str):
+        raise DescriptorError(f"{key}: expected string")
+    return v
+
+
 def parse(text_or_obj) -> Launch:
-    o = json.loads(text_or_obj) if isinstance(text_or_obj, str) else dict(text_or_obj)
-    for k in ("name", "ticker", "genesis_time", "virtual_work", "virtual_tokens", "graduation_tokens"):
-        if k not in o:
-            raise DescriptorError(f"{k}: required")
-    vw = o["virtual_work"]
-    if not isinstance(vw, str):
+    """Accepts exactly what ParseLaunchDescriptor accepts (test_diff_cpp checks this)."""
+    try:
+        o = json.loads(text_or_obj) if isinstance(text_or_obj, str) else dict(text_or_obj)
+    except ValueError as e:
+        raise DescriptorError(f"descriptor is not a JSON object: {e}")
+    if not isinstance(o, dict):
+        raise DescriptorError("descriptor is not a JSON object")
+    version = _int(o, "version", 2**32 - 1, default=1)
+    if version != 1:
+        raise DescriptorError("unsupported descriptor version")
+    name, ticker = _str(o, "name"), _str(o, "ticker")
+    hrp = _str(o, "hrp", default=ticker.lower())
+    vw = _str(o, "virtual_work")
+    if not _V0.fullmatch(vw):
         raise DescriptorError("virtual_work: expected decimal or 0x-hex integer string")
-    vwi = int(vw, 16) if vw.lower().startswith("0x") else int(vw)
+    try:
+        creator_script = bytes.fromhex(_str(o, "creator_script", default=""))
+    except ValueError:
+        raise DescriptorError("creator_script: invalid hex")
+    test = o.get("test")
+    if test is not None and not isinstance(test, bool):
+        raise DescriptorError("test: expected bool")
+    seeds = o.get("seeds")
+    if seeds is not None and (not isinstance(seeds, list) or not all(isinstance(x, str) for x in seeds)):
+        raise DescriptorError("seeds: expected array of strings")
     d = Launch(
-        name=o["name"], ticker=o["ticker"], genesis_time=_int(o["genesis_time"], "genesis_time", 2**32 - 1),
-        virtual_work=vwi, virtual_tokens=_int(o["virtual_tokens"], "virtual_tokens", MAX_MONEY),
-        graduation_tokens=_int(o["graduation_tokens"], "graduation_tokens", MAX_MONEY),
-        version=_int(o.get("version", 1), "version", 2**32 - 1), hrp=o.get("hrp", o["ticker"].lower()),
-        pubkey_prefix=_int(o.get("pubkey_prefix", 40), "pubkey_prefix", 255),
-        script_prefix=_int(o.get("script_prefix", 100), "script_prefix", 255),
-        secret_prefix=_int(o.get("secret_prefix", 168), "secret_prefix", 255),
-        genesis_nonce=_int(o.get("genesis_nonce", 0), "genesis_nonce", 2**32 - 1),
-        pow_limit_bits=_int(o.get("pow_limit_bits", 0x1D00FFFF), "pow_limit_bits", 2**32 - 1),
-        target_spacing=_int(o.get("target_spacing", 60), "target_spacing", 3600),
-        lwma_window=_int(o.get("lwma_window", 45), "lwma_window", 1000),
-        ftl=_int(o.get("ftl", 300), "ftl", 7200),
-        tail_reward=_int(o.get("tail_reward", 0), "tail_reward", MAX_MONEY),
-        tail_halving_interval=_int(o.get("tail_halving_interval", 0), "tail_halving_interval", 2**32 - 1),
-        creator_script=bytes.fromhex(o.get("creator_script", "")),
-        creator_fee_bps=_int(o.get("creator_fee_bps", 0), "creator_fee_bps", 1000),
-        test=bool(o.get("test", False)), p2p_port=_int(o.get("p2p_port", 0), "p2p_port", 65535),
-        rpc_port=_int(o.get("rpc_port", 0), "rpc_port", 65535), seeds=list(o.get("seeds", [])),
+        name=name, ticker=ticker, hrp=hrp, version=version,
+        genesis_time=_int(o, "genesis_time", 2**32 - 1, required=True),
+        virtual_work=int(vw, 16) if vw[:2] in ("0x", "0X") else int(vw),
+        virtual_tokens=_int(o, "virtual_tokens", MAX_MONEY),
+        graduation_tokens=_int(o, "graduation_tokens", MAX_MONEY),
+        pubkey_prefix=_int(o, "pubkey_prefix", 255, 40),
+        script_prefix=_int(o, "script_prefix", 255, 100),
+        secret_prefix=_int(o, "secret_prefix", 255, 168),
+        genesis_nonce=_int(o, "genesis_nonce", 2**32 - 1),
+        pow_limit_bits=_int(o, "pow_limit_bits", 2**32 - 1, 0x1D00FFFF),
+        target_spacing=_int(o, "target_spacing", 3600, 60),
+        lwma_window=_int(o, "lwma_window", 1000, 45),
+        ftl=_int(o, "ftl", 7200, 300),
+        tail_reward=_int(o, "tail_reward", MAX_MONEY),
+        tail_halving_interval=_int(o, "tail_halving_interval", 2**32 - 1),
+        creator_script=creator_script,
+        creator_fee_bps=_int(o, "creator_fee_bps", 1000),
+        test=bool(test), p2p_port=_int(o, "p2p_port", 65535), rpc_port=_int(o, "rpc_port", 65535),
+        seeds=list(seeds or []),
     )
     validate(d)
     return d
 
 
 def validate(d: Launch):
-    import re
     if d.version != 1:
         raise DescriptorError("unsupported descriptor version")
-    if not (1 <= len(d.name) <= 64):
-        raise DescriptorError("name: 1..64 chars")
+    try:
+        name_bytes = len(d.name.encode("utf-8"))
+    except UnicodeEncodeError:
+        raise DescriptorError("name: invalid UTF-8")
+    if not (1 <= name_bytes <= 64):
+        raise DescriptorError("name: 1..64 bytes")
     if not re.fullmatch(r"[A-Z0-9]{2,10}", d.ticker):
         raise DescriptorError("ticker: 2..10 chars [A-Z0-9]")
     if not re.fullmatch(r"[a-z0-9]{1,20}", d.hrp) or d.hrp in RESERVED_HRPS:

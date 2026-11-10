@@ -99,11 +99,21 @@ bool GetUInt(const UniValue& o, const std::string& key, T& out, std::string& err
     if (v.isNull()) return true; // keep default
     int64_t x;
     if (v.isNum()) {
-        x = v.getInt<int64_t>();
+        // Fractions, exponents and values beyond int64 make getInt throw.
+        try {
+            x = v.getInt<int64_t>();
+        } catch (const std::exception&) {
+            error = strprintf("%s: expected integer", key);
+            return false;
+        }
     } else if (v.isStr()) {
         const std::string& s = v.get_str();
         auto parsed = (s.starts_with("0x") ? std::optional<int64_t>{} : ToIntegral<int64_t>(s));
         if (!parsed && s.starts_with("0x")) {
+            if (s.size() == 2) {
+                error = strprintf("%s: invalid hex", key);
+                return false;
+            }
             uint64_t acc = 0;
             for (size_t i = 2; i < s.size(); ++i) {
                 const int d = HexDigit(s[i]);
