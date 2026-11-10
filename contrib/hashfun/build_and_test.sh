@@ -20,12 +20,17 @@ mkdir -p "$WORK"
 cd "$WORK"
 
 log "deps"
+SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO=sudo
 need=()
 for p in build-essential cmake pkgconf python3 libevent-dev libboost-dev libsqlite3-dev git curl; do
   dpkg -s "$p" >/dev/null 2>&1 || need+=("$p")
 done
+# Core master needs GCC >= 12 (Ubuntu 22.04 / WSL default is 11).
+if [ "$(g++ -dumpversion 2>/dev/null | cut -d. -f1 || echo 0)" -lt 12 ]; then
+  dpkg -s g++-12 >/dev/null 2>&1 || need+=(g++-12)
+  export CC=gcc-12 CXX=g++-12
+fi
 if ((${#need[@]})); then
-  SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO=sudo
   $SUDO apt-get update -qq && DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y -qq "${need[@]}"
 fi
 
@@ -57,4 +62,5 @@ log "python unit + simulator tests"
 python3 -W ignore -m unittest hashfun.tests.test_core hashfun.tests.test_stack 2>&1 | tail -n 4
 
 log "e2e: hashfund vs Python model, merged mining vs stock bitcoind, swap on real nodes"
-python3 -m hashfun.tests.e2e_regtest --hashfund build/bin/hashfund --bitcoind "$WORK/bitcoin-$BTC_VER/bin/bitcoind"
+python3 -m hashfun.tests.e2e_regtest --hashfund build/bin/hashfund --bitcoind "$WORK/bitcoin-$BTC_VER/bin/bitcoind" \
+  2>&1 | tee "$WORK/e2e.log"
