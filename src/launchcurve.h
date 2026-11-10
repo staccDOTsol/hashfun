@@ -49,7 +49,5 @@ int LaunchGraduationHeight(const CBlockIndex* tip, const Consensus::Params& para
 CAmount LaunchTailMinted(int from_height, int to_height, const Consensus::Params& params);
 /** Hashes per whole coin at relative work w (double, for display). */
 double LaunchHashesPerCoin(const arith_uint256& w, const Consensus::Params& params);
-/** Parse a decimal or 0x-hex string into a uint256 (big-endian bytes). */
-bool ParseUint256Decimal(const std::string& s, arith_uint256& out);
 
 #endif // BITCOIN_LAUNCHCURVE_H

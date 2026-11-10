@@ -5,7 +5,6 @@
 #include <launchcurve.h>
 
 #include <chain.h>
-#include <util/strencodings.h>
 
 #include <algorithm>
 
@@ -113,29 +112,4 @@ double LaunchHashesPerCoin(const arith_uint256& w, const Consensus::Params& para
     const double wd = (w < wg ? w : wg).getdouble();
     const double t0 = static_cast<double>(params.launch_virtual_tokens);
     return (v0 + wd) * (v0 + wd) / (t0 * v0) * static_cast<double>(COIN);
-}
-
-bool ParseUint256Decimal(const std::string& s, arith_uint256& out)
-{
-    out = 0;
-    if (s.empty()) return false;
-    if (s.size() > 2 && (s.starts_with("0x") || s.starts_with("0X"))) {
-        if (s.size() - 2 > 64) return false;
-        for (size_t i = 2; i < s.size(); ++i) {
-            const int d = HexDigit(s[i]);
-            if (d < 0) return false;
-            out <<= 4;
-            out += arith_uint256{static_cast<uint64_t>(d)};
-        }
-        return true;
-    }
-    const arith_uint256 maxv = ~arith_uint256{0};
-    for (char c : s) {
-        if (c < '0' || c > '9') return false;
-        const uint64_t d = c - '0';
-        if (out > (maxv - arith_uint256{d}) / 10) return false;
-        out *= 10;
-        out += arith_uint256{d};
-    }
-    return true;
 }
