@@ -3216,7 +3216,14 @@ bool CWallet::IsTxImmatureCoinBase(const CWalletTx& wtx) const
     AssertLockHeld(cs_wallet);
 
     // note GetBlocksToMaturity is 0 for non-coinbase tx
-    return GetTxBlocksToMaturity(wtx) > 0;
+    if (GetTxBlocksToMaturity(wtx) > 0) return true;
+    // hashfun: a curve coinbase whose Bitcoin payment is not proven yet (or never was, within its
+    // deadline) is not spendable either. Treating it as immature keeps it out of the balance and
+    // out of coin selection, where it would make sends fail with bad-txns-unsettled-coinbase.
+    if (wtx.IsCoinBase() && HaveChain()) {
+        if (const auto* conf{wtx.state<TxStateConfirmed>()}) return !chain().launchCoinbaseSpendable(conf->confirmed_block_height);
+    }
+    return false;
 }
 
 bool CWallet::IsLocked() const

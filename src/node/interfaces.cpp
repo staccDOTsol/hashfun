@@ -68,6 +68,7 @@
 #include <util/string.h>
 #include <util/time.h>
 #include <util/translation.h>
+#include <launchyieldstate.h>
 #include <validation.h>
 #include <validationinterface.h>
 
@@ -777,6 +778,15 @@ public:
     bool isInitialBlockDownload() override
     {
         return chainman().IsInitialBlockDownload();
+    }
+    bool launchCoinbaseSpendable(int height) override
+    {
+        const Consensus::Params& consensus{chainman().GetConsensus()};
+        if (!LaunchYieldState::Enabled(consensus)) return true;
+        LOCK(::cs_main);
+        LaunchYieldState& ys{GetLaunchYieldState()};
+        ys.Sync(chainman().ActiveChain().Tip(), consensus, chainman().m_blockman);
+        return ys.Spendable(height);
     }
     bool shutdownRequested() override { return ShutdownRequested(m_node); }
     void initMessage(const std::string& message) override { ::uiInterface.InitMessage(message); }

@@ -319,7 +319,7 @@ class Fleet:
             lap[0] = time.time()
 
         # ---- Bitcoin: one stock regtest node, two wallets (one per pool)
-        btc = FNode(a.bitcoind, os.path.join(self.dir, "btc"), ["-regtest"], free_port(), "btc")
+        btc = FNode(a.bitcoind, os.path.join(self.dir, "btc"), ["-regtest", "-listen=0"], free_port(), "btc")
         self.nodes.append(btc)
         wb = open_wallet(btc.rpc)
         w2 = open_wallet(btc.rpc, "w2")
@@ -573,6 +573,12 @@ class Fleet:
         tip = A.rpc.getblockcount()
         good = [h for h in range(1, tip - 100) if coinbase(h)[1]["scriptPubKey"]["hex"] == spkA.hex()
                 and A.rpc.getmintobligation(h)["settled"]]
+        offered = {u["txid"] for u in wA.listunspent(1)}
+        check("F6 the node wallet offers settled coinbases and keeps unsettled ones out of coin selection",
+              bool(locked) and not offered & {coinbase(h)[0] for h in locked}
+              and bool(offered & {coinbase(h)[0] for h in good}), f"{len(offered)} offered")
+        check("F6 so a plain wallet send works next to unsettled coinbases",
+              rpc_err(lambda: wA.sendtoaddress(addrC, "0.01")) is None)
         if check("F6 (setup) a matured coinbase settled by a Bitcoin payment exists", bool(good), f"tip {tip}"):
             txid, out = coinbase(good[0])
             sent = C.rpc.sendrawtransaction(spend(wA, txid, out["value"], addrB))

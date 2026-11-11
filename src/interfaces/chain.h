@@ -287,6 +287,10 @@ public:
     //! Check if in IBD.
     virtual bool isInitialBlockDownload() = 0;
 
+    //! hashfun: whether the sats leg lets the coinbase of the active-chain block at this height
+    //! be spent (settled on Bitcoin, or nothing owed). Always true on chains without a sats leg.
+    virtual bool launchCoinbaseSpendable(int height) = 0;
+
     //! Check if shutdown requested.
     virtual bool shutdownRequested() = 0;
 
