@@ -2,6 +2,7 @@
 tail, LWMA), descriptor identity + genesis, HTLC scripts, AuxPoW construction.
 Run: python -m unittest discover -s hashfun/tests -v"""
 import random
+import os
 import unittest
 
 from hashfun import descriptor as D
@@ -352,6 +353,51 @@ class AuxPow(unittest.TestCase):
         cb2, br2, hdr2 = self.build_parent(tree, parent_version=(700 << 16) | 4)
         self.assertEqual(check_auxpow(leaves[700], 700, serialize_auxpow(cb2, br2, cbr, idx, hdr2))[1],
                          "Aux POW parent has our chain ID")
+
+
+class WalletVaultTest(unittest.TestCase):
+    def test_chacha20_poly1305_rfc8439(self):
+        from hashfun.crypto import aead_encrypt, aead_decrypt
+        key, nonce = bytes(range(0x80, 0xA0)), bytes.fromhex("070000004041424344454647")
+        aad = bytes.fromhex("50515253c0c1c2c3c4c5c6c7")
+        pt = (b"Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, "
+              b"sunscreen would be it.")
+        sealed = aead_encrypt(key, nonce, pt, aad)
+        self.assertEqual(sealed[:16].hex(), "d31a8d34648e60db7b86afbc53ef7ec2")
+        self.assertEqual(sealed[-16:].hex(), "1ae10b594f09e26a7e902ecbd0600691")
+        self.assertEqual(aead_decrypt(key, nonce, sealed, aad), pt)
+        for bad in (sealed[:-1] + bytes([sealed[-1] ^ 1]), bytes([sealed[0] ^ 1]) + sealed[1:]):
+            with self.assertRaises(ValueError):
+                aead_decrypt(key, nonce, bad, aad)
+        with self.assertRaises(ValueError):
+            aead_decrypt(key, nonce, sealed, b"other")
+
+    def test_wallet_file_holds_no_secrets_once_encrypted(self):
+        import tempfile
+        from hashfun.wallet import Wallet, WalletLocked
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "w.json")
+            w = Wallet.create(path, password="correct horse battery")
+            words = w.data["mnemonic"]
+            w.data["swaps"]["x"] = {"secret": "aa" * 32}
+            w.add_chain("BTC", "127.0.0.1:1", "bcrt", 1, "btc")
+            raw = open(path).read()
+            self.assertNotIn(words.split()[0] + " " + words.split()[1], raw)
+            self.assertNotIn("aa" * 32, raw)
+            self.assertIn('"chains"', raw)
+            with self.assertRaises(WalletLocked):
+                Wallet(path)
+            with self.assertRaises(WalletLocked):
+                Wallet(path, "wrong password")
+            again = Wallet(path, "correct horse battery")
+            self.assertEqual(again.data["mnemonic"], words)
+            self.assertEqual(again.data["swaps"]["x"]["secret"], "aa" * 32)
+            self.assertEqual(again.root.key, w.root.key)
+            again.set_password("another one, longer")
+            self.assertEqual(Wallet(path, "another one, longer").data["mnemonic"], words)
+            with self.assertRaises(WalletLocked):
+                Wallet(path, "correct horse battery")
+
 
 
 if __name__ == "__main__":

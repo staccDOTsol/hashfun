@@ -10,12 +10,13 @@ import hashlib
 import json
 import os
 import socket
+import sys
 import threading
 import time
 import unicodedata
 from typing import Dict, List, Optional
 
-from .crypto import XPriv, ecdsa_sign, der_sig, sha256
+from .crypto import XPriv, ecdsa_sign, der_sig, sha256, aead_encrypt, aead_decrypt
 from .htlc import Contract, new_secret, redeem_tx, refund_tx
 from .ser import (Tx, TxIn, TxOut, segwit_encode, address_to_script, p2wpkh_script, p2wpkh_script_code,
                   bip143_sighash, script_to_address, hash160)
@@ -249,16 +250,47 @@ class ChainAccount:
         return p2wpkh_script(self.key(0, r).pub())
 
 
+SECRET_KEYS = ("mnemonic", "passphrase", "swaps")  # what the vault holds (swaps carry HTLC secrets)
+SCRYPT = {"n": 2 ** 15, "r": 8, "p": 1}
+
+
+class WalletLocked(Exception):
+    pass
+
+
+def _vault_key(password: str, salt: bytes) -> bytes:
+    import hashlib
+    return hashlib.scrypt(password.encode(), salt=salt, dklen=32, maxmem=2 ** 27, **SCRYPT)
+
+
 class Wallet:
-    def __init__(self, path="~/.hashfun/wallet.json"):
+    """HD wallet file. With a password the seed phrase, BIP39 passphrase and swap secrets are kept
+    in a vault: ChaCha20-Poly1305 under a key from scrypt(password). Chain settings stay readable."""
+
+    def __init__(self, path="~/.hashfun/wallet.json", password: Optional[str] = None):
         self.path = os.path.expanduser(path)
         with open(self.path) as f:
             self.data = json.load(f)
+        self.password, self._key, self._salt = None, None, None
+        vault = self.data.pop("vault", None)
+        if vault is not None:
+            if password is None:
+                raise WalletLocked("this wallet is encrypted: a password is needed")
+            self._salt = bytes.fromhex(vault["salt"])
+            self._key = _vault_key(password, self._salt)
+            try:
+                secrets = json.loads(aead_decrypt(self._key, bytes.fromhex(vault["nonce"]), bytes.fromhex(vault["ct"]),
+                                                  b"hashfun-wallet-v2"))
+            except ValueError:
+                raise WalletLocked("wrong password")
+            self.data.update(secrets)
+            self.password = password
         self.root = XPriv.from_seed(mnemonic_to_seed(self.data["mnemonic"], self.data.get("passphrase", "")))
         self.chains: Dict[str, ChainAccount] = {n: ChainAccount(self, n, c) for n, c in self.data["chains"].items()}
 
     @staticmethod
-    def create(path="~/.hashfun/wallet.json", mnemonic=None, passphrase=""):
+    def create(path="~/.hashfun/wallet.json", mnemonic=None, passphrase="", password: Optional[str] = None):
+        """password=None writes the seed in the clear (tests, throwaway wallets)."""
         path = os.path.expanduser(path)
         if os.path.exists(path):
             raise FileExistsError(path)
@@ -269,12 +301,28 @@ class Wallet:
         with open(path, "w") as f:
             json.dump({"mnemonic": mnemonic, "passphrase": passphrase, "chains": {}, "swaps": {}, "htlc_next": {}}, f, indent=1)
         os.chmod(path, 0o600)
-        return Wallet(path)
+        w = Wallet(path)
+        if password is not None:
+            w.set_password(password)
+        return w
+
+    def set_password(self, password: Optional[str]):
+        """Encrypt the secrets under a new password (None: back to an unencrypted file)."""
+        self.password = password
+        self._salt = os.urandom(16) if password is not None else None
+        self._key = _vault_key(password, self._salt) if password is not None else None
+        self.save()
 
     def save(self):
+        out = dict(self.data)
+        if self._key is not None:
+            secrets = {k: out.pop(k) for k in SECRET_KEYS if k in out}
+            nonce = os.urandom(12)
+            out["vault"] = {"cipher": "chacha20-poly1305", "kdf": "scrypt", **SCRYPT, "salt": self._salt.hex(), "nonce": nonce.hex(),
+                            "ct": aead_encrypt(self._key, nonce, json.dumps(secrets).encode(), b"hashfun-wallet-v2").hex()}
         tmp = self.path + ".tmp"
         with open(tmp, "w") as f:
-            json.dump(self.data, f, indent=1)
+            json.dump(out, f, indent=1)
         os.chmod(tmp, 0o600)
         os.replace(tmp, self.path)
 
@@ -437,8 +485,10 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="hashfun wallet: BTC + every launch, one seed")
     ap.add_argument("--wallet", default="~/.hashfun/wallet.json")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    p = sub.add_parser("init")
+    p = sub.add_parser("init", help="new wallet; asks for a password (or $HASHFUN_WALLET_PASSWORD)")
     p.add_argument("--mnemonic")
+    p.add_argument("--no-encrypt", action="store_true", help="store the seed phrase in the clear")
+    sub.add_parser("encrypt", help="set or change the password of an existing wallet")
     p = sub.add_parser("add-chain")
     p.add_argument("name")
     p.add_argument("--electrum", required=True)
@@ -461,11 +511,32 @@ def main(argv=None):
     sub.add_parser("yield", help="BTC earned by holding launch coins (paid at your launch keys on Bitcoin)")
     sub.add_parser("claim-yield", help="sweep earned BTC into the wallet's Bitcoin account")
     a = ap.parse_args(argv)
+    def ask(prompt, confirm=False):
+        pw = os.environ.get("HASHFUN_WALLET_PASSWORD")
+        if pw is None:
+            import getpass
+            pw = getpass.getpass(prompt)
+            if confirm and getpass.getpass("again: ") != pw:
+                sys.exit("passwords differ")
+        if confirm and len(pw) < 8:
+            sys.exit("use at least 8 characters")
+        return pw
     if a.cmd == "init":
-        w = Wallet.create(a.wallet, a.mnemonic)
-        print(json.dumps({"mnemonic": w.data["mnemonic"], "path": w.path}, indent=2))
+        w = Wallet.create(a.wallet, a.mnemonic, password=None if a.no_encrypt else ask("wallet password: ", True))
+        print(json.dumps({"mnemonic": w.data["mnemonic"], "path": w.path, "encrypted": w.password is not None,
+                          "note": "write the words down; the password only protects this file"}, indent=2))
         return
-    w = Wallet(a.wallet)
+    try:
+        w = Wallet(a.wallet)
+    except WalletLocked:
+        try:
+            w = Wallet(a.wallet, ask("wallet password: "))
+        except WalletLocked as e:
+            sys.exit(str(e))
+    if a.cmd == "encrypt":
+        w.set_password(ask("new wallet password: ", True))
+        print(json.dumps({"path": w.path, "encrypted": True}))
+        return
     if a.cmd == "add-chain":
         if a.descriptor:
             from .descriptor import load

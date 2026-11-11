@@ -281,3 +281,70 @@ class XPriv:
 
     def serialize_pub(self, version=bytes.fromhex("0488b21e")) -> bytes:
         return (version + bytes([self.depth]) + self.fpr + self.child.to_bytes(4, "big") + self.chain + self.pub())
+
+
+# ---------------------------------------------------------------- ChaCha20-Poly1305 (RFC 8439)
+# Pure Python, for encrypting small secrets at rest (the wallet seed). Not constant time.
+def _chacha20_block(key: bytes, counter: int, nonce: bytes) -> bytes:
+    import struct
+    init = list(struct.unpack("<4I", b"expand 32-byte k")) + list(struct.unpack("<8I", key)) + [counter & 0xFFFFFFFF] + \
+        list(struct.unpack("<3I", nonce))
+    w = init[:]
+
+    def qr(a, b, c, d):
+        w[a] = (w[a] + w[b]) & 0xFFFFFFFF
+        w[d] ^= w[a]
+        w[d] = ((w[d] << 16) | (w[d] >> 16)) & 0xFFFFFFFF
+        w[c] = (w[c] + w[d]) & 0xFFFFFFFF
+        w[b] ^= w[c]
+        w[b] = ((w[b] << 12) | (w[b] >> 20)) & 0xFFFFFFFF
+        w[a] = (w[a] + w[b]) & 0xFFFFFFFF
+        w[d] ^= w[a]
+        w[d] = ((w[d] << 8) | (w[d] >> 24)) & 0xFFFFFFFF
+        w[c] = (w[c] + w[d]) & 0xFFFFFFFF
+        w[b] ^= w[c]
+        w[b] = ((w[b] << 7) | (w[b] >> 25)) & 0xFFFFFFFF
+    for _ in range(10):
+        qr(0, 4, 8, 12), qr(1, 5, 9, 13), qr(2, 6, 10, 14), qr(3, 7, 11, 15)
+        qr(0, 5, 10, 15), qr(1, 6, 11, 12), qr(2, 7, 8, 13), qr(3, 4, 9, 14)
+    return struct.pack("<16I", *[(w[i] + init[i]) & 0xFFFFFFFF for i in range(16)])
+
+
+def chacha20_xor(key: bytes, counter: int, nonce: bytes, data: bytes) -> bytes:
+    out = bytearray()
+    for i in range(0, len(data), 64):
+        ks = _chacha20_block(key, counter + i // 64, nonce)
+        out += bytes(a ^ b for a, b in zip(data[i:i + 64], ks))
+    return bytes(out)
+
+
+def poly1305(key: bytes, msg: bytes) -> bytes:
+    r = int.from_bytes(key[:16], "little") & 0x0FFFFFFC0FFFFFFC0FFFFFFC0FFFFFFF
+    s, p, acc = int.from_bytes(key[16:32], "little"), (1 << 130) - 5, 0
+    for i in range(0, len(msg), 16):
+        acc = (acc + int.from_bytes(msg[i:i + 16] + b"\x01", "little")) * r % p
+    return ((acc + s) & ((1 << 128) - 1)).to_bytes(16, "little")
+
+
+def _aead_tag(key: bytes, nonce: bytes, ct: bytes, aad: bytes) -> bytes:
+    import struct
+    pad = lambda x: b"\x00" * (-len(x) % 16)  # noqa: E731
+    return poly1305(_chacha20_block(key, 0, nonce)[:32], aad + pad(aad) + ct + pad(ct) + struct.pack("<QQ", len(aad), len(ct)))
+
+
+def aead_encrypt(key: bytes, nonce: bytes, plaintext: bytes, aad: bytes = b"") -> bytes:
+    """ChaCha20-Poly1305: ciphertext || 16-byte tag. key 32 bytes, nonce 12 bytes (never reuse a pair)."""
+    if len(key) != 32 or len(nonce) != 12:
+        raise ValueError("key must be 32 bytes and nonce 12")
+    ct = chacha20_xor(key, 1, nonce, plaintext)
+    return ct + _aead_tag(key, nonce, ct, aad)
+
+
+def aead_decrypt(key: bytes, nonce: bytes, sealed: bytes, aad: bytes = b"") -> bytes:
+    import hmac as _hmac
+    if len(key) != 32 or len(nonce) != 12 or len(sealed) < 16:
+        raise ValueError("malformed ciphertext")
+    ct, tag = sealed[:-16], sealed[-16:]
+    if not _hmac.compare_digest(tag, _aead_tag(key, nonce, ct, aad)):
+        raise ValueError("authentication failed")
+    return chacha20_xor(key, 1, nonce, ct)
