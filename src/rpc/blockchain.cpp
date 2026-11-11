@@ -72,6 +72,7 @@
 #include <util/time.h>
 #include <util/translation.h>
 #include <launchcurve.h>
+#include <launchyieldstate.h>
 #include <kernel/launch.h>
 #include <pow.h>
 #include <validation.h>
@@ -3897,11 +3898,111 @@ static RPCMethod getlaunchinfo()
     };
 }
 
+static LaunchYieldState& SyncedYieldState(ChainstateManager& chainman) EXCLUSIVE_LOCKS_REQUIRED(cs_main)
+{
+    const Consensus::Params& consensus = chainman.GetConsensus();
+    if (!LaunchYieldState::Enabled(consensus)) throw JSONRPCError(RPC_MISC_ERROR, "this chain has no sats leg");
+    LaunchYieldState& ys = GetLaunchYieldState();
+    ys.Sync(chainman.ActiveChain().Tip(), consensus, chainman.m_blockman);
+    return ys;
+}
+
+static RPCMethod getbtcrelay()
+{
+    return RPCMethod{
+        "getbtcrelay",
+        "Returns the Bitcoin header chain this launch has been told about (HFH1 transactions), from the descriptor's anchor.\n",
+        {},
+        RPCResult{RPCResult::Type::ANY, "", ""},
+        RPCExamples{HelpExampleCli("getbtcrelay", "")},
+        [](const RPCMethod& self, const JSONRPCRequest& request) -> UniValue
+{
+    ChainstateManager& chainman = EnsureAnyChainman(request.context);
+    LOCK(cs_main);
+    const LaunchYieldState& ys = SyncedYieldState(chainman);
+    UniValue r(UniValue::VOBJ);
+    r.pushKV("best", ys.Btc().Best().GetHex());
+    r.pushKV("height", ys.Btc().BestHeight());
+    r.pushKV("headers", static_cast<int64_t>(ys.Btc().Size()));
+    r.pushKV("anchor_height", chainman.GetConsensus().launch_btc_anchor_height);
+    r.pushKV("confirmations_required", chainman.GetConsensus().launch_btc_confs);
+    return r;
+},
+    };
+}
+
+static RPCMethod getmintobligation()
+{
+    return RPCMethod{
+        "getmintobligation",
+        "Returns what the curve block at a height owes on Bitcoin (the sats leg): amount, drawn payee, the tag the\n"
+        "payment must carry, and whether it has been settled.\n",
+        {{"height", RPCArg::Type::NUM, RPCArg::Optional::NO, "block height"}},
+        RPCResult{RPCResult::Type::ANY, "", ""},
+        RPCExamples{HelpExampleCli("getmintobligation", "12")},
+        [](const RPCMethod& self, const JSONRPCRequest& request) -> UniValue
+{
+    ChainstateManager& chainman = EnsureAnyChainman(request.context);
+    const Consensus::Params& consensus = chainman.GetConsensus();
+    LOCK(cs_main);
+    const LaunchYieldState& ys = SyncedYieldState(chainman);
+    const int height = request.params[0].getInt<int>();
+    const LaunchYieldState::Info* info = ys.At(height);
+    if (!info) throw JSONRPCError(RPC_INVALID_PARAMETER, "height out of range");
+    const CCoinsViewCache& view = chainman.ActiveChainstate().CoinsTip();
+    UniValue r(UniValue::VOBJ);
+    r.pushKV("height", height);
+    r.pushKV("hash", info->hash.GetHex());
+    r.pushKV("curve", info->curve);
+    r.pushKV("owed", info->owed);
+    r.pushKV("draw_known", info->draw_known);
+    r.pushKV("draw_height", height + launchyield::DRAW_DELAY);
+    r.pushKV("settled", info->settled);
+    r.pushKV("spendable", ys.Spendable(height));
+    r.pushKV("deadline_height", height + consensus.launch_settle_deadline);
+    r.pushKV("tag", HexStr(launchyield::PayTag(consensus.launch_id, info->hash)));
+    if (info->draw_known) {
+        r.pushKV("pay", info->pay);
+        r.pushKV("payee", info->payee == launchyield::Payee::HOLDER ? "holder" : info->payee == launchyield::Payee::CREATOR ? "creator" : "dev");
+        // The candidate a payment made now must name, and the script it must pay.
+        int choice = 0;
+        UniValue cands(UniValue::VARR);
+        if (info->payee == launchyield::Payee::HOLDER) {
+            choice = launchyield::MAX_CANDIDATES;
+            for (int i = 0; i < launchyield::MAX_CANDIDATES; ++i) {
+                const auto c = ys.Candidate(height, i);
+                if (!c) break;
+                const bool unspent = view.HaveCoin(c->out);
+                UniValue e(UniValue::VOBJ);
+                e.pushKV("index", i);
+                e.pushKV("txid", c->out.hash.GetHex());
+                e.pushKV("vout", static_cast<int64_t>(c->out.n));
+                e.pushKV("value", c->value);
+                e.pushKV("btc_script", HexStr(c->script));
+                e.pushKV("unspent", unspent);
+                cands.push_back(std::move(e));
+                if (unspent && choice == launchyield::MAX_CANDIDATES) choice = i;
+            }
+        }
+        std::vector<unsigned char> script;
+        if (ys.Recipient(height, choice, &view, consensus, script)) {
+            r.pushKV("candidate", choice);
+            r.pushKV("pay_script", HexStr(script));
+        }
+        r.pushKV("candidates", std::move(cands));
+    }
+    return r;
+},
+    };
+}
+
 void RegisterBlockchainRPCCommands(CRPCTable& t)
 {
     static const CRPCCommand commands[]{
         {"blockchain", &getblockchaininfo},
         {"blockchain", &getlaunchinfo},
+        {"blockchain", &getbtcrelay},
+        {"blockchain", &getmintobligation},
         {"blockchain", &getchaintxstats},
         {"blockchain", &getblockstats},
         {"blockchain", &getbestblockhash},

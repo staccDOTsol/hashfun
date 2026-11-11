@@ -199,6 +199,18 @@ struct Params {
     int launch_tail_halving_interval{0};
     std::vector<unsigned char> launch_creator_script;
     int launch_creator_fee_bps{0};
+    // Sats leg (see launchyield.h). launch_sats_num == 0 disables it.
+    uint64_t launch_sats_num{0};
+    uint32_t launch_sats_shift{0};
+    int64_t launch_sats_min_payment{0};
+    int launch_settle_deadline{0};
+    int launch_btc_confs{1};
+    std::vector<unsigned char> launch_creator_btc_script;
+    std::vector<unsigned char> launch_dev_btc_script;
+    std::vector<unsigned char> launch_btc_anchor_header; //!< 80 bytes
+    int launch_btc_anchor_height{0};
+    uint32_t launch_btc_anchor_period_time{0};
+    bool launch_btc_regtest{false};
     /** LWMA averaging window (0 = legacy Bitcoin retargeting). */
     int lwma_window{0};
     /** Max seconds a block timestamp may be ahead of local time (0 = default 2h). */

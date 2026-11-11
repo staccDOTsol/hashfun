@@ -10,6 +10,7 @@
 #include <arith_uint256.h>
 #include <auxpow.h>
 #include <launchcurve.h>
+#include <launchyieldstate.h>
 #include <chain.h>
 #include <checkqueue.h>
 #include <clientversion.h>
@@ -878,6 +879,19 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
     const std::optional<LockPoints> lock_points{CalculateLockPointsAtTip(m_active_chainstate.m_chain.Tip(), m_view, tx)};
     if (!lock_points.has_value() || !CheckSequenceLocksAtTip(m_active_chainstate.m_chain.Tip(), *lock_points)) {
         return state.Invalid(TxValidationResult::TX_PREMATURE_SPEND, "non-BIP68-final");
+    }
+
+    // hashfun: a curve coinbase stays locked until its sats were paid on Bitcoin.
+    if (const auto& consensus = m_active_chainstate.m_chainman.GetConsensus(); LaunchYieldState::Enabled(consensus)) {
+        LaunchYieldState& ys = GetLaunchYieldState();
+        ys.Sync(m_active_chainstate.m_chain.Tip(), consensus, m_active_chainstate.m_blockman);
+        for (const CTxIn& in : tx.vin) {
+            const Coin& coin = m_view.AccessCoin(in.prevout);
+            if (coin.IsCoinBase() && !ys.Spendable(coin.nHeight)) {
+                return state.Invalid(TxValidationResult::TX_PREMATURE_SPEND, "bad-txns-unsettled-coinbase",
+                                     strprintf("coinbase of block %d has not settled its sats", coin.nHeight));
+            }
+        }
     }
 
     // The mempool holds txs for the next block, so pass height+1 to CheckTxInputs
@@ -2298,6 +2312,8 @@ DisconnectResult Chainstate::DisconnectBlock(const CBlock& block, const CBlockIn
     // move best block pointer to prevout block
     view.SetBestBlock(pindex->pprev->GetBlockHash());
 
+    if (LaunchYieldState::Enabled(m_chainman.GetConsensus())) GetLaunchYieldState().Disconnect(pindex);
+
     return fClean ? DISCONNECT_OK : DISCONNECT_UNCLEAN;
 }
 
@@ -2663,6 +2679,8 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
     int nInputs = 0;
     int64_t nSigOpsCost = 0;
     blockundo.vtxundo.reserve(block.vtx.size() - 1);
+    const bool sats_leg{LaunchYieldState::Enabled(params.GetConsensus())};
+    if (sats_leg) GetLaunchYieldState().Sync(pindex->pprev, params.GetConsensus(), m_blockman);
     for (unsigned int i = 0; i < block.vtx.size(); i++)
     {
         if (!state.IsValid()) break;
@@ -2674,6 +2692,20 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
         {
             CAmount txfee = 0;
             TxValidationState tx_state;
+            if (sats_leg) {
+                // hashfun: a curve coinbase stays locked until its sats were paid on Bitcoin
+                // and proven in an earlier block.
+                bool locked{false};
+                for (const CTxIn& in : tx.vin) {
+                    const Coin& coin = view.AccessCoin(in.prevout);
+                    if (coin.IsCoinBase() && !GetLaunchYieldState().Spendable(coin.nHeight)) locked = true;
+                }
+                if (locked) {
+                    state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-txns-unsettled-coinbase",
+                                  "spends a coinbase whose sats are unsettled, in transaction " + tx.GetHash().ToString());
+                    break;
+                }
+            }
             if (!Consensus::CheckTxInputs(tx, tx_state, view, pindex->nHeight, txfee)) {
                 // Any transaction validation failure in ConnectBlock is a block consensus failure
                 state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
@@ -2826,6 +2858,13 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
         nSigOpsCost,
         Ticks<std::chrono::nanoseconds>(time_5 - time_start)
     );
+
+    // hashfun: record this block's Bitcoin headers, payment proofs, registrations and draw.
+    if (sats_leg) {
+        LaunchYieldState& ys = GetLaunchYieldState();
+        ys.Sync(pindex->pprev, params.GetConsensus(), m_blockman);
+        ys.Connect(block, pindex, params.GetConsensus(), &view);
+    }
 
     return true;
 }

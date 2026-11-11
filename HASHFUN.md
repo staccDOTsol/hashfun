@@ -26,6 +26,22 @@ Sniping does nothing: a low-difficulty block pays exactly its work at the curve 
 
 All arithmetic is 256-bit integer. Validation bounds (`V0 <= 2^160`, `G <= 99.9% T0`, `T0 <= MAX_MONEY`) keep every product below 2^256.
 
+## Sats leg (optional per launch)
+
+With `sats_num > 0` a curve block owes real BTC on top of its hash: `owed = (work * sats_num) >> sats_shift`. No bridge and no reserve: the miner pays a drawn payee directly on Bitcoin and proves it on the launch chain.
+
+| Step | Rule |
+|---|---|
+| Draw | the hash of block `h+6` seeds block `h`'s draw. Debts under `sats_min_payment` pay the minimum with probability owed/min. Payee class: 80% holder, 10% creator (`creator_btc_script`), 10% dev (compiled-in script, currently a placeholder nobody can spend) |
+| Holder | 16 candidate points into the value of all yield-registered outputs created before block `h`; the payee is the first candidate still unspent (coin-weighted over holders who have not moved). All spent or none registered: creator |
+| Register | a tx with `OP_RETURN "HFY1"<btc scriptPubKey>` registers its other outputs (coinbase: vout 0 only) |
+| Pay | a Bitcoin tx whose output `i` pays the payee and whose `OP_RETURN "HF"<20-byte tags>` has `SHA256("hashfun-pay"||launch_id||block_hash)[:20]` at position `i` |
+| Bitcoin view | `OP_RETURN "HFH1"<80-byte headers>` relays Bitcoin headers; the node keeps a validating header tree from `btc_anchor_header` (PoW, retarget, median time), so its view of Bitcoin is a function of launch blocks only |
+| Prove | `OP_RETURN "HFP1"<proof>`: merkle proof of the payment in a relayed Bitcoin block with `btc_confs` confirmations. Invalid proofs and headers are ignored, never block-invalidating |
+| Lock | a curve coinbase cannot be spent until settled (`bad-txns-unsettled-coinbase`, mempool and consensus); unsettled `settle_deadline` blocks after minting, it never can |
+
+HFH1/HFP1/HFY1 outputs are honoured in coinbases too, so a miner with no spendable coins can relay headers and settle from its own next block. RPCs: `getmintobligation <height>` (owed, payee, tag, candidates, script to pay), `getbtcrelay`. State lives in memory (`src/launchyieldstate.cpp`) and is rebuilt from blocks; pruned nodes are not supported with a sats leg.
+
 ## Descriptor
 
 JSON. The launch id is `SHA256d` of a canonical binary serialization of every consensus field (everything except `genesis_nonce`, ports and seeds):
@@ -96,4 +112,4 @@ python -m hashfun.tests.e2e_regtest --hashfund build/bin/hashfund --bitcoind /pa
 
 ## Files changed in the node
 
-`src/kernel/launch.{h,cpp}` (descriptor), `src/launchcurve.{h,cpp}` (curve), `src/kernel/chainparams.cpp` (`CLaunchParams`, genesis), `src/pow.cpp` (LWMA), `src/validation.cpp` (subsidy, creator fee, auxpow gate, FTL), `src/node/miner.cpp` (template subsidy + creator output), `src/rpc/mining.cpp` (GBT `creatorfee`, genesis IBD exception), `src/rpc/blockchain.cpp` (`getlaunchinfo`, `getblockstats`), `src/rpc/auxpow_miner.cpp` (graduation gate), `src/index/coinstatsindex.cpp`, chain-type plumbing (`-launch`), `src/init.cpp` (BTC-chain guard), branding (datadir, conf, binary names).
+`src/kernel/launch.{h,cpp}` (descriptor), `src/launchcurve.{h,cpp}` (curve), `src/launchyield.{h,cpp}` + `src/launchyieldstate.{h,cpp}` (sats leg), `src/kernel/chainparams.cpp` (`CLaunchParams`, genesis), `src/pow.cpp` (LWMA), `src/validation.cpp` (subsidy, creator fee, auxpow gate, FTL), `src/node/miner.cpp` (template subsidy + creator output), `src/rpc/mining.cpp` (GBT `creatorfee`, genesis IBD exception), `src/rpc/blockchain.cpp` (`getlaunchinfo`, `getblockstats`), `src/rpc/auxpow_miner.cpp` (graduation gate), `src/index/coinstatsindex.cpp`, chain-type plumbing (`-launch`), `src/init.cpp` (BTC-chain guard), branding (datadir, conf, binary names).

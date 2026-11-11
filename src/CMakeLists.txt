@@ -128,6 +128,7 @@ add_library(bitcoin_common STATIC EXCLUDE_FROM_ALL
   key.cpp
   launchcurve.cpp
   launchyield.cpp
+  launchyieldstate.cpp
   key_io.cpp
   merkleblock.cpp
   musig.cpp

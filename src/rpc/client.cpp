@@ -309,6 +309,7 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "listdescriptors", 0, "private" },
     { "verifychain", 0, "checklevel" },
     { "verifychain", 1, "nblocks" },
+    { "getmintobligation", 0, "height" },
     { "getblockstats", 0, "hash_or_height", ParamFormat::JSON_OR_STRING },
     { "getblockstats", 1, "stats" },
     { "pruneblockchain", 0, "height" },

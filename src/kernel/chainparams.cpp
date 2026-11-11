@@ -779,6 +779,10 @@ static arith_uint256 WorkForBits(uint32_t nBits)
     return (~target / (target + 1)) + 1;
 }
 
+/** Bitcoin scriptPubKey for the dev share of the sats leg. PLACEHOLDER: P2WPKH of
+ *  SHA256("hashfun-dev-placeholder")[:20], a key nobody holds. */
+static const std::vector<unsigned char> HASHFUN_DEV_BTC_SCRIPT{ParseHex("00143c389aeef4eec79f9c7eec3afe71de98805e7e3f")};
+
 /**
  * hashfun launch chain: every parameter comes from the descriptor.
  */
@@ -861,6 +865,19 @@ public:
         consensus.launch_tail_halving_interval = static_cast<int>(d.tail_halving_interval);
         consensus.launch_creator_script = d.creator_script;
         consensus.launch_creator_fee_bps = d.creator_fee_bps;
+        consensus.launch_sats_num = d.sats_num;
+        consensus.launch_sats_shift = d.sats_shift;
+        consensus.launch_sats_min_payment = d.sats_min_payment;
+        consensus.launch_settle_deadline = d.settle_deadline;
+        consensus.launch_btc_confs = d.btc_confs;
+        consensus.launch_creator_btc_script = d.creator_btc_script;
+        // The dev's 10% of the sats leg. PLACEHOLDER: provably nobody's key (hash of a tag);
+        // replace with the real payout script before any non-test launch.
+        consensus.launch_dev_btc_script = HASHFUN_DEV_BTC_SCRIPT;
+        consensus.launch_btc_anchor_header.assign(d.btc_anchor_header.begin(), d.btc_anchor_header.end());
+        consensus.launch_btc_anchor_height = d.btc_anchor_height;
+        consensus.launch_btc_anchor_period_time = d.btc_anchor_period_time;
+        consensus.launch_btc_regtest = d.test; // test launches follow a regtest Bitcoin
 
         const auto magic = LaunchMessageStart(d);
         std::copy(magic.begin(), magic.end(), pchMessageStart.begin());

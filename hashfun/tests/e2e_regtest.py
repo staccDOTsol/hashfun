@@ -13,10 +13,12 @@ Phases, in order (each check prints PASS/FAIL):
   7  merged mining through the pool against stock bitcoind (real CAuxPow::check)
   8  standalone pool mining on the second (presale) launch
   9  Electrum servers + HD wallet + maker: atomic swap BTC -> launch coins
+  10 sats leg on a third launch: curve blocks owe real BTC to a drawn payee; Bitcoin headers
+     and SPV payment proofs ride in coinbases; unsettled coinbases cannot be spent
 
 --workdir keeps chains, wallets and results between invocations, so the phases
 can be split across processes on hosts that cap a command's runtime:
-  --workdir W --phases 1-6;  --workdir W --phases 7-8;  --workdir W --phases 9
+  --workdir W --phases 1-6;  --workdir W --phases 7-8;  --workdir W --phases 9;  ... --phases 10
 Genesis is dated a day back and phases 1-6 run on mocktime, so the real-time
 phases (7-9) start with every chain clock behind the wall clock.
 """
@@ -46,6 +48,8 @@ from hashfun.ser import (Tx, TxIn, TxOut, header_bytes, merkle_root, bits_to_tar
 from hashfun.stratum import LaunchSource, MergedSource, StratumServer
 from hashfun.swap import KeyStore, Maker, NodeChain, relay_handler
 from hashfun.wallet import Wallet, LAUNCH_COIN_BASE
+from hashfun import yieldmodel as Y
+from hashfun.ser import segwit_encode
 
 COIN = 100_000_000
 DAY = 86400
@@ -137,14 +141,21 @@ def solve(header76: bytes, target: int) -> bytes:
         n += 1
 
 
-def block_from_gbt(t, payout_spk, *, extra_value=0, drop_creator=False, bits=None, version=None, auxpow=b""):
+def block_from_gbt(t, payout_spk, *, extra_value=0, drop_creator=False, bits=None, version=None, auxpow=b"",
+                   extra_outs=(), extra_txs=()):
     outs = [TxOut(t["coinbasevalue"] + extra_value, payout_spk)]
     if "creatorfee" in t and not drop_creator:
         outs.append(TxOut(t["creatorfee"]["amount"], bytes.fromhex(t["creatorfee"]["script"])))
-    outs.append(TxOut(0, bytes.fromhex(t["default_witness_commitment"])))
+    outs += list(extra_outs)
+    commitment = bytes.fromhex(t["default_witness_commitment"])
+    if extra_txs:  # the commitment covers every wtxid, so it has to be redone
+        body = [Tx.parse(bytes.fromhex(x["data"])) for x in t["transactions"]] + list(extra_txs)
+        wroot = merkle_root([b"\0" * 32] + [sha256d(x.serialize(witness=True)) for x in body])
+        commitment = bytes.fromhex("6a24aa21a9ed") + sha256d(wroot + b"\0" * 32)
+    outs.append(TxOut(0, commitment))
     cb = Tx(version=2, vin=[TxIn(b"\0" * 32, 0xFFFFFFFF, push_int(t["height"]) + push(os.urandom(4)), 0xFFFFFFFF,
                                  [b"\0" * 32])], vout=outs)
-    txs = [cb] + [Tx.parse(bytes.fromhex(x["data"])) for x in t["transactions"]]
+    txs = [cb] + [Tx.parse(bytes.fromhex(x["data"])) for x in t["transactions"]] + list(extra_txs)
     b = bits if bits is not None else int(t["bits"], 16)
     v = version if version is not None else t["version"]
     hdr = header_bytes(v, bytes.fromhex(t["previousblockhash"])[::-1], merkle_root([x.txid() for x in txs]),
@@ -523,6 +534,201 @@ class E2E:
         check("9 maker redeemed BTC with revealed secret", o is not None and o.state == "done",
               o and f"{o.state}: {o.note}")
 
+    # ------------------------------------------------------------ phase 10: sats leg
+    def p10(self):
+        a, btc, wb = self.a, self.btc, self.wb
+        btc.rpc.setmocktime(0)
+        if wb.getbalance() < 10:
+            wb.generatetoaddress(101, self.btc_addr)
+        btc_script = lambda addr: bytes.fromhex(wb.getaddressinfo(addr)["scriptPubKey"])  # noqa: E731
+        creator_btc, holder_btc = wb.getnewaddress("", "bech32"), wb.getnewaddress("", "bech32")
+        NUM, SHIFT = 10_000, 0  # 2 hashes/block at the pow limit -> 20,000 sats per block, always due
+        path = os.path.join(self.dir, "SATS.json")
+        if os.path.exists(path):
+            d = D.load(path)
+        else:
+            d = D.make("SATS e2e", "SATS", self.creator_spk, 10**6, test=True, pow_limit_bits=0x207FFFFF,
+                       target_spacing=10, lwma_window=10, genesis_time=int(time.time()) - DAY)
+            d.ftl = 7200
+            d.btc_anchor_header = bytes.fromhex(btc.rpc.getblockheader(btc.rpc.getblockhash(0), False))
+            d.sats_num, d.sats_shift, d.creator_btc_script = NUM, SHIFT, btc_script(creator_btc)
+            D.validate(d)
+            d.grind_genesis()
+            with open(path, "w") as f:
+                f.write(d.dumps())
+        creator_btc_spk = d.creator_btc_script
+        dev_spk = bytes.fromhex("00143c389aeef4eec79f9c7eec3afe71de98805e7e3f")
+        args = [f"-launch={path}", "-datacarriersize=1000000"]
+        n3 = Node(a.hashfund, os.path.join(self.dir, "n3"), args, free_port())
+        self.nodes.append(n3)
+        T = [d.genesis_time + 100 + 10 * n3.rpc.getblockcount()]
+        n3.rpc.setmocktime(T[0])
+        w3 = open_wallet(n3.rpc)
+        pay_addr = w3.getnewaddress("", "legacy")  # non-witness spends keep hand-built blocks simple
+        pay_spk = bytes.fromhex(w3.getaddressinfo(pay_addr)["scriptPubKey"])
+        reg = TxOut(0, Y.yield_tag_script(btc_script(holder_btc)))
+        raw = lambda hexhash: bytes.fromhex(hexhash)[::-1]  # noqa: E731
+
+        def mine(extra_outs=(), extra_txs=(), register=True, expect=None):
+            T[0] += d.target_spacing
+            n3.rpc.setmocktime(T[0])
+            t = n3.rpc.getblocktemplate({"rules": ["segwit"]})
+            hdr, txs = block_from_gbt(t, pay_spk, extra_outs=([reg] if register else []) + list(extra_outs),
+                                      extra_txs=extra_txs)
+            r = n3.rpc.submitblock(ser_block(hdr, txs))
+            if r != expect:
+                raise RuntimeError(f"submitblock: {r}")
+            return txs[0]
+
+        def relay_out():
+            """HFH1 output carrying every Bitcoin header the launch has not seen yet."""
+            have, tip = n3.rpc.getbtcrelay()["height"], btc.rpc.getblockcount()
+            hdrs = b"".join(bytes.fromhex(btc.rpc.getblockheader(btc.rpc.getblockhash(h), False))
+                            for h in range(have + 1, tip + 1))
+            return [TxOut(0, Y.op_return(b"HFH1" + hdrs))] if hdrs else []
+
+        def pay(height, *, to=None, amount=None, tag=None):
+            """Pay block `height`'s obligation on Bitcoin; returns (HFP1 output, obligation)."""
+            ob = n3.rpc.getmintobligation(height)
+            script = to or bytes.fromhex(ob["pay_script"])
+            ver, prog = (script[0] - 0x50 if script[0] else 0), script[2:]
+            addr = segwit_encode("bcrt", ver, prog)
+            rawtx = wb.createrawtransaction([], [{addr: (amount or ob["pay"]) / COIN},
+                                                 {"data": (b"HF" + bytes.fromhex(tag or ob["tag"])).hex()}])
+            funded = wb.fundrawtransaction(rawtx, {"changePosition": 2})
+            txid = wb.sendrawtransaction(wb.signrawtransactionwithwallet(funded["hex"])["hex"])
+            bh = wb.generatetoaddress(1, self.btc_addr)[0]
+            txids = btc.rpc.getblock(bh, 1)["tx"]
+            pos = txids.index(txid)
+            level, idx, branch = [raw(x) for x in txids], pos, []
+            while len(level) > 1:
+                if len(level) % 2:
+                    level.append(level[-1])
+                branch.append(level[idx ^ 1])
+                level = [sha256d(level[j] + level[j + 1]) for j in range(0, len(level), 2)]
+                idx >>= 1
+            nowit = Tx.parse(bytes.fromhex(btc.rpc.getrawtransaction(txid))).serialize(witness=False)
+            proof = Y.PaymentProof(height, raw(bh), pos, branch, 0, ob.get("candidate", 0), nowit)
+            return TxOut(0, Y.op_return(proof.payload())), ob
+
+        base = n3.rpc.getblockcount()
+        if base:
+            raise RuntimeError("phase 10 needs a fresh SATS chain (new --workdir)")
+        cbs = {}
+
+        def mine_h(*a_, **kw):
+            cb = mine(*a_, **kw)
+            cbs[n3.rpc.getblockcount()] = cb
+            return cb
+
+        for _ in range(12):  # draws for blocks 1..6 are now known
+            mine_h()
+        works = work_from_bits(0x207FFFFF)
+        ok, detail = True, ""
+        for h in (1, 2):
+            ob = n3.rpc.getmintobligation(h)
+            seed = Y.draw_seed(d.id, raw(n3.rpc.getblockhash(h + Y.DRAW_DELAY)))
+            pay_amt, payee = Y.compute_draw(Y.owed(works, NUM, SHIFT), d.sats_min_payment, seed)
+            want = (True, Y.owed(works, NUM, SHIFT), True, pay_amt, ("holder", "creator", "dev")[payee],
+                    Y.pay_tag(d.id, raw(ob["hash"])).hex(), False, False)
+            got = (ob["curve"], ob["owed"], ob["draw_known"], ob["pay"], ob["payee"], ob["tag"], ob["settled"],
+                   ob["spendable"])
+            if got != want:
+                ok, detail = False, f"h{h}: {got} vs {want}"
+        check("10 obligation, draw and tag C++ == Python", ok, detail)
+        check("10 no draw yet for a block younger than 6",
+              n3.rpc.getmintobligation(n3.rpc.getblockcount() - 2)["draw_known"] is False)
+        ob1, ob2 = n3.rpc.getmintobligation(1), n3.rpc.getmintobligation(2)
+        want1 = dev_spk if ob1["payee"] == "dev" else creator_btc_spk  # nothing was registered before block 1
+        check("10 first block pays the creator (or dev): no holders yet", bytes.fromhex(ob1["pay_script"]) == want1,
+              f"{ob1['payee']} {ob1['pay_script']}")
+        obh = next((o for o in (n3.rpc.getmintobligation(h) for h in range(2, 7)) if o["payee"] == "holder"), None)
+        if obh:  # 1 - 0.2^5 of runs
+            c0 = obh["candidates"][0]
+            early = {cbs[h].txid()[::-1].hex() for h in range(1, obh["height"])}
+            check("10 holder candidates are earlier registered coinbases, paid at their Bitcoin script",
+                  len(obh["candidates"]) == Y.MAX_CANDIDATES and all(c["txid"] in early and c["vout"] == 0
+                                                                     for c in obh["candidates"])
+                  and c0["unspent"] and bytes.fromhex(obh["pay_script"]) == btc_script(holder_btc), json.dumps(c0))
+
+        mine_h(relay_out())
+        check("10 Bitcoin headers relayed in a coinbase are tracked",
+              n3.rpc.getbtcrelay()["height"] == btc.rpc.getblockcount()
+              and n3.rpc.getbtcrelay()["best"] == btc.rpc.getbestblockhash(), json.dumps(n3.rpc.getbtcrelay()))
+
+        # Payments that must NOT settle: wrong payee, one sat short, a tag for another block.
+        stranger = bytes.fromhex(wb.getaddressinfo(wb.getnewaddress("", "bech32"))["scriptPubKey"])
+        bad = [pay(1, to=stranger)[0], pay(1, amount=ob1["pay"] - 1)[0], pay(1, tag=ob2["tag"])[0]]
+        mine_h(relay_out() + bad)
+        check("10 wrong payee / underpayment / foreign tag do not settle", n3.rpc.getmintobligation(1)["settled"] is False)
+        good1, _ = pay(1)
+        mine_h(relay_out() + [good1])
+        o = n3.rpc.getmintobligation(1)
+        check("10 SPV-proven Bitcoin payment settles the block", o["settled"] and o["spendable"], json.dumps(o))
+        settle_block = n3.rpc.getbestblockhash()
+        n3.rpc.invalidateblock(settle_block)
+        undone = n3.rpc.getmintobligation(1)["settled"] is False and \
+            n3.rpc.getbtcrelay()["height"] < btc.rpc.getblockcount()
+        n3.rpc.reconsiderblock(settle_block)
+        check("10 reorg undoes and redoes settlement and header relay",
+              undone and n3.rpc.getmintobligation(1)["settled"]
+              and n3.rpc.getbtcrelay()["height"] == btc.rpc.getblockcount())
+        good2, _ = pay(2)
+        mine_h(relay_out() + [good2])
+        check("10 second block settled (holder payee paid on Bitcoin)", n3.rpc.getmintobligation(2)["settled"])
+        check("10 a payment proof cannot be replayed for another block",
+              n3.rpc.getmintobligation(3)["settled"] is False)
+
+        while n3.rpc.getblockcount() < 104:
+            mine_h()
+
+        def spend(h, fee=10_000):
+            cb = cbs[h]
+            rawtx = w3.createrawtransaction([{"txid": cb.txid()[::-1].hex(), "vout": 0}],
+                                            {pay_addr: (cb.vout[0].value - fee) / COIN})
+            return w3.signrawtransactionwithwallet(rawtx)["hex"]
+
+        r = n3.rpc.testmempoolaccept([spend(3)])[0]
+        check("10 mempool refuses to spend an unsettled coinbase",
+              not r["allowed"] and r.get("reject-reason") == "bad-txns-unsettled-coinbase", json.dumps(r))
+        try:
+            mine(extra_txs=[Tx.parse(bytes.fromhex(spend(3)))], expect="bad-txns-unsettled-coinbase")
+            check("10 a block spending an unsettled coinbase is invalid", True)
+        except RuntimeError as e:
+            check("10 a block spending an unsettled coinbase is invalid", False, str(e))
+        # A holder draw names an earlier registered coinbase. Once its owner moves those coins, the
+        # next candidate (or the creator) becomes the payee of any still-unsettled block.
+        while n3.rpc.getblockcount() < 130:
+            mine_h()
+        target = next(h for h in range(5, 60) if (lambda o: o["payee"] == "holder" and not o["settled"])(
+            n3.rpc.getmintobligation(h)))
+        before = n3.rpc.getmintobligation(target)
+        hc = next(h for h, cb in cbs.items() if cb.txid()[::-1].hex() == before["candidates"][0]["txid"])
+        if not n3.rpc.getmintobligation(hc)["spendable"]:
+            good, _ = pay(hc)
+            mine_h(relay_out() + [good])
+        txid = n3.rpc.sendrawtransaction(spend(hc))
+        mine_h()
+        check("10 a settled coinbase is spendable after maturity",
+              n3.rpc.getrawtransaction(txid, True).get("confirmations", 0) >= 1)
+        after = n3.rpc.getmintobligation(target)
+        check("10 moving coins forfeits the draw: payee passes to the next candidate",
+              before["candidate"] == 0 and after["candidate"] != 0 and after["candidates"][0]["unspent"] is False,
+              f"{before['candidate']} -> {after['candidate']}")
+        good, _ = pay(target)
+        mine_h(relay_out() + [good])
+        check("10 payment to the next candidate settles", n3.rpc.getmintobligation(target)["settled"],
+              json.dumps(n3.rpc.getmintobligation(target)))
+        snap = [n3.rpc.getmintobligation(h) for h in (1, 2, 3, target)]
+        relay = n3.rpc.getbtcrelay()
+        n3.stop()
+        self.nodes.remove(n3)
+        n3 = Node(a.hashfund, os.path.join(self.dir, "n3"), args, free_port())
+        self.nodes.append(n3)
+        n3.rpc.setmocktime(T[0])
+        check("10 state rebuilt from blocks after restart",
+              [n3.rpc.getmintobligation(h) for h in (1, 2, 3, target)] == snap and n3.rpc.getbtcrelay() == relay)
+
 
 def parse_phases(s):
     out = []
@@ -537,7 +743,7 @@ def main():
     ap.add_argument("--hashfund", required=True)
     ap.add_argument("--bitcoind", required=True, help="stock Bitcoin Core bitcoind")
     ap.add_argument("--workdir", help="persist chains, wallets and results here (lets --phases span runs)")
-    ap.add_argument("--phases", default="1-9", help="e.g. 1-6 or 7,8 (in order, each once)")
+    ap.add_argument("--phases", default="1-10", help="e.g. 1-6 or 7,8 (in order, each once)")
     ap.add_argument("--keep", action="store_true", help="keep the temporary datadirs")
     a = ap.parse_args()
     phases = parse_phases(a.phases)
