@@ -34,16 +34,22 @@ export async function findOutput(api, chain, txid, scriptHex) {
 const CLAIM_VB = 180, REFUND_VB = 170;
 const MIN_OUTPUT = 2000; // a lock smaller than this is not worth its own claim fee
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const now = () => Math.floor(Date.now() / 1000);
 
 // env: { api(path, body), W: { key, pub, addr }, cfg(): site config, store: localStorage-like,
-//        unisat(): the wallet or null, onChange(rec) }
+//        unisat(): the wallet or null, onChange(rec), now(): milliseconds (optional) }
+// The same engine runs in the page (app.js) and headless under node (maker.mjs).
 export function createBook(env) {
   const { api, W, cfg } = env;
-  const load = (k) => { try { return JSON.parse(env.store.getItem(k) || '{}'); } catch (e) { return {}; } };
-  const save = (k, v) => env.store.setItem(k, JSON.stringify(v));
+  // The clock is the host's: the browser's, or a test's.
+  const ms = () => (env.now ? env.now() : Date.now());
+  const now = () => Math.floor(ms() / 1000);
+  // Offers, swap records and spent outputs belong to the key that made them (a browser can hold
+  // several wallet accounts): each key has its own.
+  const mineOnly = (k) => `${k}_${B.hex(W.pub).slice(0, 16)}`;
+  const load = (k) => { try { return W.pub ? JSON.parse(env.store.getItem(mineOnly(k)) || '{}') : {}; } catch (e) { return {}; } };
+  const save = (k, v) => env.store.setItem(mineOnly(k), JSON.stringify(v));
   const recs = () => load('hf_p2p');
-  const put = (rec) => { rec.updated = Date.now(); const all = recs(); all[rec.id] = rec; save('hf_p2p', all); if (env.onChange) env.onChange(rec); return rec; };
+  const put = (rec) => { rec.updated = ms(); const all = recs(); all[rec.id] = rec; save('hf_p2p', all); if (env.onChange) env.onChange(rec); return rec; };
   const pubHex = () => B.hex(W.pub);
   const sign = (text) => B.signText(W.key, text);
 
@@ -66,14 +72,14 @@ export function createBook(env) {
   const utxos = async (name) => {
     let list;
     if (name === 'btc') { // a UTXO-set scan on the site's node: about a minute on mainnet, so keep the answer a while
-      if (!btcCache || Date.now() - btcCache.t > (cfg().btc.chain === 'main' ? 120000 : 3000)) btcCache = { t: Date.now(), list: (await api(`/chain/btc/address/${addrOn('btc')}`)).utxos.filter((u) => u.confirmations > 0) };
+      if (!btcCache || ms() - btcCache.t > (cfg().btc.chain === 'main' ? 120000 : 3000)) btcCache = { t: ms(), list: (await api(`/chain/btc/address/${addrOn('btc')}`)).utxos.filter((u) => u.confirmations > 0) };
       list = btcCache.list;
     } else list = (await api(`/coin/${name}/address/${addrOn(name)}`)).utxos.filter((u) => u.spendable);
     const spent = load('hf_spent'); // outputs our own unconfirmed transactions already spend
     return list.filter((u) => !spent[`${name}:${u.txid}:${u.vout}`]);
   };
   const balance = async (name) => (await utxos(name)).reduce((a, u) => a + u.value, 0);
-  const markSpent = (keys) => { const s = load('hf_spent'), t = Date.now(); for (const k of Object.keys(s)) if (t - s[k] > 6 * 3600e3) delete s[k]; keys.forEach((k) => { s[k] = t; }); save('hf_spent', s); };
+  const markSpent = (keys) => { const s = load('hf_spent'), t = ms(); for (const k of Object.keys(s)) if (t - s[k] > 6 * 3600e3) delete s[k]; keys.forEach((k) => { s[k] = t; }); save('hf_spent', s); };
   const buildLock = async (name, spk, amount) => {
     const t = await api(`/chain/${name}/time`);
     const pool = (await utxos(name)).sort((a, b) => b.value - a.value), sel = [];
@@ -153,7 +159,7 @@ export function createBook(env) {
     if (!(await worth(give, f.give_amount)) || !(await worth(get, f.get_amount))) return refuse('too small for the network fee');
     if ((await balance(give)) < f.give_amount + committed(give)) return refuse('maker is out of coins');
     const rec = { id: f.id, role: 'maker', order: { ...o, id: f.order }, give, get, give_amount: f.give_amount, get_amount: f.get_amount, secret_hash: f.secret_hash,
-      locktime: f.locktime, taker: f.taker, state: 'accepted', until: t + (get === 'btc' ? 300 : 120), created: Date.now(), my: {}, their: {} };
+      locktime: f.locktime, taker: f.taker, state: 'accepted', until: t + (get === 'btc' ? 300 : 120), created: ms(), my: {}, their: {} };
     put(rec); // the reservation is ours before the board hears of it
     await note(f.id, 'accept', { until: rec.until });
   }
@@ -164,7 +170,7 @@ export function createBook(env) {
     for (const [id, o] of Object.entries(orders)) if (o.expiry <= t) delete orders[id];
     save('hf_orders', orders);
     if (!Object.keys(orders).length && !Object.values(recs()).some((r) => r.role === 'maker' && !FINAL.includes(r.state))) return;
-    const signed = () => ({ maker: pubHex(), ts: now(), sig: sign(aliveText(pubHex(), now())) });
+    const signed = () => { const ts = now(); return { maker: pubHex(), ts, sig: sign(aliveText(pubHex(), ts)) }; };
     let r;
     try { r = await api('/book/alive', session ? { maker: pubHex(), session } : signed()); } catch (e) { r = await api('/book/alive', signed()); }
     session = r.session;
@@ -186,7 +192,7 @@ export function createBook(env) {
     const locktime = Math.max(now(), t.mediantime) + 2 * order.lock + Math.min(600, Math.floor(order.lock / 2));
     const tk = { order: order.id, taker: pubHex(), get_amount: getAmount, secret_hash: B.hex(hash), locktime, ts: now() };
     const rec = { id: textId(takeText(tk)), role: 'taker', order, give, get, give_amount: giveAmount, get_amount: getAmount, secret: B.hex(secret), secret_hash: B.hex(hash),
-      locktime, taker: pubHex(), state: 'requested', created: Date.now(), my: {}, their: {} };
+      locktime, taker: pubHex(), state: 'requested', created: ms(), my: {}, their: {} };
     put(rec); // the secret is on disk before anyone hears its hash
     ui('ask', rec);
     const fail = (why) => { rec.state = 'failed'; rec.note = why; put(rec); note(rec.id, 'abort').catch(() => {}); throw new Error(why); };
@@ -264,7 +270,7 @@ export function createBook(env) {
       if (rec.my.hex && now() > rec.locktime && !(await txout(rec.get, rec.my).catch(() => 1))) { rec.state = 'failed'; rec.note = 'the lock was never accepted by the network'; return void put(rec); }
       if (!rec.my.txid) { // the wallet may or may not have paid: look at the contract's address
         const seen = rec.my.address ? await api(`/chain/btc/address/${rec.my.address}`).catch(() => null) : null;
-        if (seen && seen.utxos.length) { rec.my.txid = seen.utxos[0].txid; rec.my.vout = seen.utxos[0].vout; put(rec); } else if (Date.now() - rec.updated > 180000) { rec.state = 'failed'; rec.note = 'the payment was not made'; return void put(rec); } else return;
+        if (seen && seen.utxos.length) { rec.my.txid = seen.utxos[0].txid; rec.my.vout = seen.utxos[0].vout; put(rec); } else if (ms() - rec.updated > 180000) { rec.state = 'failed'; rec.note = 'the payment was not made'; return void put(rec); } else return;
       }
       return void (await lockMine(rec));
     }
@@ -356,14 +362,14 @@ export function createBook(env) {
   // hidden tab's timers to as little as one a minute, which would take a maker with the site in a
   // background tab off the board, so the beat comes from a worker (worker timers are not slowed).
   // Holding the lock for the tab's life also keeps the browser from freezing the tab.
-  function start(ms = 2500) {
+  function start(every = 2500) {
     const beat = () => {
       tick();
       try {
-        const w = new Worker(URL.createObjectURL(new Blob([`setInterval(() => postMessage(0), ${ms})`], { type: 'text/javascript' })));
+        const w = new Worker(URL.createObjectURL(new Blob([`setInterval(() => postMessage(0), ${every})`], { type: 'text/javascript' })));
         w.onmessage = () => tick();
-        w.onerror = () => { w.terminate(); setInterval(tick, ms); };
-      } catch (e) { setInterval(tick, ms); }
+        w.onerror = () => { w.terminate(); setInterval(tick, every); };
+      } catch (e) { setInterval(tick, every); }
     };
     const hold = () => new Promise(() => beat()); // never settles: the lock is ours until the tab closes
     if (typeof navigator !== 'undefined' && navigator.locks) navigator.locks.request('hashfun-book', hold); else hold();

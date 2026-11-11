@@ -103,8 +103,10 @@ class BookTest(unittest.TestCase):
     def setUp(self):
         self.clock = Clock()
         self.balances = {(self.A, pub(self.MAKER)): 1000 * D.COIN, (self.B, pub(self.TAKER)): 500 * D.COIN}
+        # sats behind a key are known only once the site has scanned for them: None until then
+        self.sats = {}
         self.book = K.Book(lambda: {self.BTC: "BTC", self.A: "CAT", self.B: "DOG"},
-                           lambda chain, maker: None if chain == self.BTC else self.balances.get((chain, maker), 0),
+                           lambda chain, maker: self.sats.get(maker) if chain == self.BTC else self.balances.get((chain, maker), 0),
                            now=self.clock)
 
     def order(self, priv=None, **kw):
@@ -153,9 +155,21 @@ class BookTest(unittest.TestCase):
                         (dict(give_amount=True), "give_amount"), (dict(nonce="xyz"), "nonce"), (dict(confs=101), "confs")):
             with self.assertRaisesRegex(K.BookError, msg, msg=str(kw)):
                 self.book.post(self.order(**kw))
-        # Bitcoin behind an order cannot be checked cheaply: it is listed, and the taker's page checks the lock
-        self.book.post(self.order(priv=self.OTHER, give=self.BTC, get=self.A, give_amount=50_000, get_amount=100 * D.COIN,
-                                  min_get=D.COIN))
+        # sats behind a bid take a scan: the bid is accepted, and listed only once the sats have been seen
+        bid = self.book.post(self.order(priv=self.OTHER, give=self.BTC, get=self.A, give_amount=50_000, get_amount=100 * D.COIN,
+                                        min_get=D.COIN))
+        listed = lambda: [x["id"] for x in self.book.view(give=self.BTC)]  # noqa: E731
+        self.assertEqual((bid["backed"], listed()), (False, []))
+        self.assertEqual([x["id"] for x in self.book.view(maker=pub(self.OTHER))], [bid["id"]])  # its maker sees it waiting
+        with self.assertRaisesRegex(K.BookError, "offline|gone"):
+            self.book.take(self.take(bid, D.COIN))  # and nobody can take what is not listed
+        self.sats[pub(self.OTHER)] = 49_999
+        self.assertEqual(listed(), [])
+        self.sats[pub(self.OTHER)] = 50_000
+        self.assertEqual(listed(), [bid["id"]])
+        with self.assertRaisesRegex(K.BookError, "not enough spendable BTC"):   # the same sats twice
+            self.book.post(self.order(priv=self.OTHER, give=self.BTC, get=self.A, give_amount=1, get_amount=D.COIN,
+                                      min_get=D.COIN, nonce="00000000000000cc"))
 
     def test_only_live_backed_open_orders_are_listed(self):
         o = self.book.post(self.order())

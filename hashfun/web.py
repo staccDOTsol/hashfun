@@ -196,7 +196,50 @@ class Site:
         self.coins: Dict[str, CoinIndex] = {}
         self.scan_lock = threading.Lock()
         self.lock = threading.RLock()
+        # Sats behind bids: confirmed sats at each bidder's key, from one UTXO-set scan for all of
+        # them at once (instant on regtest, about a minute on mainnet, so at most every 5 minutes there).
+        self.bid_sats: Dict[str, int] = {}
+        self.bid_wanted: set = set()
+        self.bid_scanned, self.bid_every = 0.0, (2.0 if self.btc_chain == "regtest" else 300.0)
+        self.bid_pause = 0.5 if self.btc_chain == "regtest" else 60.0  # between two scans, whoever asks
         self.book = Book(self.book_chains, self.book_backing, book_path, min_lock=book_min_lock)
+
+    def scan_bids(self):
+        """Refresh the sats behind every open bid. A key seen for the first time is scanned soon
+        (its offer is not listed until then), the rest on the schedule; and there is always a pause
+        between two scans, so a stream of bids from fresh keys cannot keep the node scanning."""
+        now = time.time()
+        with self.book.lock:
+            scripts = {"0014" + hash160(bytes.fromhex(o["maker"])).hex() for o in self.book.orders.values()
+                       if o["give"] == self.btc_id and self.book.open(o)}
+        new = (self.bid_wanted | scripts) - set(self.bid_sats)
+        if not scripts and not new:
+            self.bid_sats.clear()
+            return
+        if now - self.bid_scanned < (self.bid_pause if new else self.bid_every):
+            return
+        scripts |= new
+        try:
+            with self.scan_lock:
+                r = self.btc.scantxoutset("start", [f"raw({x})" for x in sorted(scripts)])
+        finally:
+            self.bid_scanned = time.time()  # the pause counts from the end of a scan, failed ones too
+        found: Dict[str, int] = {x: 0 for x in scripts}
+        for u in r.get("unspents", []):
+            if u.get("height"):  # confirmed only, like the page's own view of its sats
+                found[u["scriptPubKey"]] = found.get(u["scriptPubKey"], 0) + sats(u["amount"])
+        self.bid_sats = found
+        self.bid_wanted -= scripts
+
+    def run_bids(self, interval=0.5):
+        """The bid scan on its own thread: a scan of the whole UTXO set takes about a minute on
+        mainnet, and the board, the indexes and the house maker must not wait for it."""
+        while True:
+            try:
+                self.scan_bids()
+            except Exception:
+                log.exception("bid scan")
+            time.sleep(interval)
 
     # ---- the peer-to-peer book: which chains it covers and what stands behind an order
     @property
@@ -207,8 +250,11 @@ class Site:
         return {self.btc_id: "BTC", **{c.d.id_hex: t for t, c in list(self.coins.items()) if c.info}}
 
     def book_backing(self, chain: str, maker: str) -> Optional[int]:
-        if chain == self.btc_id:
-            return None  # would take a UTXO-set scan per order; the taker's page checks the lock itself
+        if chain == self.btc_id:  # sats: from the background scan (scan_bids); None until it has run for this key
+            script = "0014" + hash160(bytes.fromhex(maker)).hex()
+            if script not in self.bid_sats:
+                self.bid_wanted.add(script)
+            return self.bid_sats.get(script)
         for c in list(self.coins.values()):
             if c.d.id_hex == chain:
                 return c.spendable("0014" + hash160(bytes.fromhex(maker)).hex())
@@ -468,6 +514,7 @@ def serve(site: Site, host: str, port: int) -> ThreadingHTTPServer:
     srv = ThreadingHTTPServer((host, port), handler(site))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     threading.Thread(target=site.run, daemon=True).start()
+    threading.Thread(target=site.run_bids, daemon=True).start()
     return srv
 
 

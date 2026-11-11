@@ -60,6 +60,15 @@ class Handle:
         self.rpc = rpc
 
 
+# The real extension also says which chain it is on and can be asked to switch (unisat-wallet/wallet:
+# getChain() -> {enum}, switchChain(enum)). Here it starts on Fractal, whose addresses look like Bitcoin's.
+CHAIN_MOCK = """
+window.__chain = 'FRACTAL_BITCOIN_MAINNET'; window.__allow = false;
+Object.assign(window.unisat, {
+  getChain: async () => ({ enum: window.__chain, name: 'mock', network: 'livenet' }),
+  switchChain: async (c) => { await window.__hf_note('switch:' + c); if (!window.__allow) throw new Error('User rejected the request.'); window.__chain = c; return { enum: c }; },
+});
+"""
 SIG2 = "H" + base64.b64encode(hashlib.sha256(b"hashfun web test wallet two").digest() * 2).decode()
 PICTURE = png(16, 16)
 
@@ -403,7 +412,8 @@ def main():
         moon1, moon2 = segwit_encode(d2.hrp, 0, hash160(pub)), segwit_encode(d2.hrp, 0, hash160(pub2))
         bal_of = lambda t, addr: get(f"/coin/{t}/address/{addr}")["balance"]  # noqa: E731
         sats_of = lambda wallet: int(round(sum(wallet.getbalances()["mine"].values()) * COIN))  # noqa: E731
-        recs_of = lambda pg: pg.evaluate("Object.values(JSON.parse(localStorage.getItem('hf_p2p') || '{}'))")  # noqa: E731
+        recs_of = lambda pg: pg.evaluate(  # noqa: E731
+            "Object.keys(localStorage).filter((k) => k.startsWith('hf_p2p_')).flatMap((k) => Object.values(JSON.parse(localStorage.getItem(k))))")
         flow_text = lambda pg: pg.locator(".flow").inner_text()[:300] if pg.locator(".flow").count() else "no flow window"  # noqa: E731
 
         def post(pg, give_text, want_text, listed, what):
@@ -551,6 +561,42 @@ def main():
               f"lost {cat1_before - back}; {[r['state'] for r in recs_of(page)]}")
         if page.locator(".flow").count():
             page.click(".flow >> text=Close")
+
+        # ================================================================= U1
+        print("-- U1 the wallet is on another chain (Fractal: same addresses as Bitcoin)", flush=True)
+        ctx3 = browser.new_context(viewport={"width": 1200, "height": 800})
+        page3 = ctx3.new_page()
+
+        def as_mainnet(route):  # this page is told the site runs on Bitcoin mainnet
+            r = route.fetch()
+            body = r.json()
+            body["btc"]["chain"] = "main"
+            route.fulfill(response=r, json=body)
+        page3.route("**/api/config", as_mainnet)
+        calls = []
+        page3.expose_function("__hf_sign", lambda m: calls.append("sign") or SIG)
+        page3.expose_function("__hf_send", lambda to, amount: calls.append("send") or "00" * 32)
+        page3.expose_function("__hf_note", lambda what: calls.append(what))
+        page3.add_init_script(MOCK % (user_addr, user_addr) + CHAIN_MOCK)
+        page3.on("dialog", lambda dlg: dlg.accept("5000"))
+        page3.goto(url, wait_until="domcontentloaded")
+        page3.wait_for_selector("#wallet")
+        page3.click("#wallet")
+        refused = wait(lambda: "Switch UniSat to bitcoin mainnet" in page3.locator("#toast").inner_text(), 15, "the page refuses")
+        check("U1 a wallet on the wrong chain is asked to switch, and refused if it will not: no key is derived",
+              refused and calls == ["switch:BITCOIN_MAINNET"] and "CONNECT" in page3.locator("#wallet").inner_text().upper(), str(calls))
+        page3.evaluate("window.__allow = true")
+        page3.click("#wallet")
+        ok = wait(lambda: page3.locator("#wallet").inner_text().startswith(user_addr[:6]), 15, "connected after switching")
+        check("U1 once the wallet switches to Bitcoin the page connects", ok and calls[-2:] == ["switch:BITCOIN_MAINNET", "sign"], str(calls))
+        # the wallet goes back to Fractal behind the page's back, then the page is asked to pay
+        page3.evaluate("window.__chain = 'FRACTAL_BITCOIN_MAINNET'; window.__allow = false")
+        page3.goto(url + "#/swap/btc/RIGCAT", wait_until="domcontentloaded")
+        page3.wait_for_selector("#po-give")
+        page3.click("text=Deposit from UniSat")
+        refused = wait(lambda: "Switch UniSat" in page3.locator("#toast").inner_text(), 15, "the payment is refused")
+        check("U1 no payment is requested from a wallet that moved to another chain", refused and "send" not in calls, str(calls))
+        ctx3.close()
         page.goto(url, wait_until="domcontentloaded")
         wait(lambda: page.locator(".feed b.l").count() >= 1, 30, "payout feed")
         shot(page, "board")

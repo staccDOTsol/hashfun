@@ -2,7 +2,7 @@
 // in the browser.
 // Keys never leave the page: the server only reads chains and broadcasts what is signed here.
 import * as B from './btc.js';
-import { createBook, findOutput } from './book.js';
+import { createBook, findOutput, FINAL } from './book.js';
 
 const O = '#FF9A1F', L = '#C7F23E', WHT = '#F2F0EC', K = '#0A0A0B';
 const COIN = 1e8;
@@ -55,11 +55,35 @@ const W = { addr: null, key: null, pub: null };
 const launchAddr = (t) => B.segwitEncode(cfg.launches[t].hrp, 0, B.hash160(W.pub));
 const btcAddr = () => B.segwitEncode(cfg.btc.hrp, 0, B.hash160(W.pub));
 const paintWallet = () => { const b = $('wallet'); b.textContent = W.addr ? short(W.addr) : 'CONNECT UNISAT'; b.className = 'm wallet' + (W.addr ? ' on' : ''); };
+// UniSat runs on several chains, and Fractal's addresses look exactly like Bitcoin's: a payment
+// from the wrong one would fund a swap contract on a chain this site never looks at. So the
+// wallet's chain is checked at connect and again before every payment. (Read from the extension's
+// source, unisat-wallet/wallet: getChain() -> { enum }, switchChain(enum), older builds only getNetwork().)
+const WALLET_CHAIN = { main: 'BITCOIN_MAINNET', test: 'BITCOIN_TESTNET', testnet4: 'BITCOIN_TESTNET4', signet: 'BITCOIN_SIGNET' };
+async function rightChain(u, ask) {
+  const want = WALLET_CHAIN[cfg.btc.chain];
+  if (!want) return true; // regtest: no real wallet runs there, only test doubles
+  const wrong = () => new Error(`Switch UniSat to ${want.replace(/_/g, ' ').toLowerCase()}: this site is on that network`);
+  if (!u.getChain) { if (((await u.getNetwork()) === 'livenet') !== (cfg.btc.chain === 'main')) throw wrong(); return true; }
+  let c = await u.getChain();
+  if (c.enum !== want) { if (!ask) return false; c = await u.switchChain(want).catch(() => { throw wrong(); }); }
+  if (!c || c.enum !== want) throw wrong();
+  return true;
+}
+// Every payment the page asks the wallet for goes through here.
+async function walletPay(address, sats) {
+  const u = window.unisat;
+  await rightChain(u, true);
+  const accts = await u.getAccounts();
+  if (!accts || accts[0] !== W.addr) throw new Error('UniSat is on another account than this page. Reload and connect again.');
+  return u.sendBitcoin(address, sats);
+}
 async function connect(ask = true) {
   const u = window.unisat;
   if (!u) { if (ask) throw new Error('UniSat wallet not found in this browser'); return false; }
   const accts = ask ? await u.requestAccounts() : await u.getAccounts();
   if (!accts || !accts.length) return false;
+  if (!(await rightChain(u, ask))) return false;
   let k = localStorage.getItem('hf_key_' + accts[0]);
   if (!k) {
     if (!ask) return false;
@@ -74,8 +98,11 @@ async function connect(ask = true) {
 const needWallet = async () => { if (!W.key && !(await connect(true))) throw new Error('wallet not connected'); };
 
 // ---------------------------------------------------------------- swaps
-const swaps = () => JSON.parse(localStorage.getItem('hf_swaps') || '{}');
-const saveSwap = (rec) => { const all = swaps(); all[rec.id] = rec; localStorage.setItem('hf_swaps', JSON.stringify(all)); };
+// Swap records belong to the key that made them: another wallet account in the same browser
+// cannot finish or refund them, so it does not see them.
+const swapsKey = () => 'hf_swaps_' + (W.pub ? B.hex(W.pub).slice(0, 16) : 'none');
+const swaps = () => JSON.parse(localStorage.getItem(swapsKey()) || '{}');
+const saveSwap = (rec) => { const all = swaps(); all[rec.id] = rec; localStorage.setItem(swapsKey(), JSON.stringify(all)); };
 const HTLC_VB = 180;
 const chainOf = (rec, leg) => ((rec.side === 'buy') === (leg === 'init') ? 'btc' : rec.ticker);
 
@@ -92,7 +119,7 @@ async function startSwap(ticker, side, q, ui) {
   saveSwap(rec); // before any money moves: the secret and the refund path must survive a reload
   ui.step('sign');
   if (side === 'buy') {
-    rec.init_txid = await window.unisat.sendBitcoin(B.segwitEncode(cfg.btc.hrp, 0, spk.slice(2)), q.btc_amount);
+    rec.init_txid = await walletPay(B.segwitEncode(cfg.btc.hrp, 0, spk.slice(2)), q.btc_amount);
     saveSwap(rec);
     for (let i = 0; rec.init_vout == null; i++) {
       const n = await findOutput(api, 'btc', rec.init_txid, B.hex(spk));
@@ -466,7 +493,7 @@ function bags(view) {
 // Holders trade with each other: any coin for sats, any coin for any other coin. The page signs
 // offers, answers takes and runs the swap (book.js); the site only passes signed messages along.
 const told = new Set();
-const book = createBook({ api, W, cfg: () => cfg, store: localStorage, unisat: () => window.unisat, onChange: (r) => {
+const book = createBook({ api, W, cfg: () => cfg, store: localStorage, unisat: () => (window.unisat ? { sendBitcoin: walletPay } : null), onChange: (r) => {
   if (r.role === 'maker' && r.state === 'done' && !told.has(r.id)) { told.add(r.id); toast(`Your offer filled: +${amt(r.get, r.got)}`); }
 } });
 const amt = (n, v) => (n === 'btc' ? fmt(v) + ' sats' : coins(v) + ' $' + n);
@@ -478,7 +505,22 @@ const dur = (sec) => (sec >= 7200 ? Math.round(sec / 3600) + ' hours' : Math.max
 // The price in the units people quote: sats per coin when Bitcoin is one side.
 const rate = (pay, get, payAmt, getAmt) => (pay === 'btc' ? `${price((payAmt / getAmt) * COIN)} sats per coin` : get === 'btc' ? `${price((getAmt / payAmt) * COIN)} sats per coin` : `1 $${get} = ${price(payAmt / getAmt)} $${pay}`);
 const assetTile = (n) => (n === 'btc' ? h('span', { class: 'tile', 'aria-hidden': 'true', style: 'background:#FF9A1F;color:#0A0A0B;border-color:#FF9A1F' }, 'B') : tile(n));
-const swapState = (r) => ({ requested: 'asking the maker', accepted: 'about to lock', locking: 'locking', locked: r.role === 'taker' ? 'waiting for the maker' : 'waiting for the taker to claim', done: 'done', failed: 'did not happen', released: 'the taker did not lock', refunded: 'refunded' }[r.state] || r.state);
+const swapState = (r) => ({ requested: 'asking the maker', accepted: r.role === 'taker' ? 'about to lock' : 'waiting for the taker to lock', locking: 'locking',
+  locked: r.role === 'taker' ? 'waiting for the maker to lock' : 'waiting for the taker to claim', done: 'done', failed: 'did not happen', released: 'nothing locked', refunded: 'refunded' }[r.state] || r.state);
+// One line for a swap in a list: where it stands, in the state's words or in the engine's note
+// (book.js), whichever says more, and never both saying the same thing.
+const swapLine = (r) => {
+  const st = swapState(r), n = (r.note || '').trim();
+  if (FINAL.includes(r.state)) { // over: a note here was written with the outcome and is its reason
+    if (r.state === 'done' || !n || n === st) return st;
+    return r.state === 'refunded' ? n : `${st}: ${n}`;
+  }
+  // A maker's page counts confirmations on the taker's lock before it locks; once it has locked, that count is history.
+  if (!n || n === st || (r.role === 'maker' && r.state !== 'accepted' && /confirmations on the taker's lock$/.test(n))) return st;
+  // Progress on the other side's lock, or why this side now only waits for its timelock: the note is the whole story.
+  if (/confirmations on the (maker|taker)'s lock$/.test(n) || /after its timelock$/.test(n) || /resumes by itself when it does$/.test(n) || n.startsWith("the maker's lock is not on the chain")) return n;
+  return `${st} · ${n}`;
+};
 
 // A picture for a launch: at most 48 KB, square. Small files go in untouched (animations
 // survive); big ones are cropped to the middle and re-encoded here, before anything is hashed.
@@ -522,12 +564,14 @@ function p2pLists(myOrders) {
   const nm = (id) => book.nameOf(id) || '?', out = [];
   const rs = Object.values(book.recs()).filter((r) => r.taker).sort((a, b) => b.created - a.created).slice(0, 12);
   if (myOrders.length) out.push(h('h2', { class: 'd', style: 'font-size:32px' }, 'Your offers'), ...myOrders.map((o) => h('div', { class: 'panel pad between', 'data-offer': o.id, style: 'align-items:center' },
-    h('span', { class: 'm' }, `give ${amt(nm(o.give), o.remaining)} for ${amt(nm(o.get), o.remaining_get)}`, h('span', { class: 'muted' }, o.remaining < o.give_amount ? ' · partly filled' : '')),
+    h('span', { class: 'm' }, `give ${amt(nm(o.give), o.remaining)} for ${amt(nm(o.get), o.remaining_get)}`, h('span', { class: 'muted' }, o.remaining < o.give_amount ? ' · partly filled' : ''),
+      // takers are shown an offer only once the board has seen what backs it at the maker's key
+      o.backed === false ? h('span', { class: 'o', 'data-unlisted': '' }, ` · not listed yet: the board has not seen the ${nm(o.give) === 'btc' ? 'sats' : 'coins'} behind it`) : null),
     h('button', { class: 'ghost', type: 'button', onclick: () => book.cancel(o.id).then(() => { toast('Offer cancelled'); route(); }).catch((e) => toast(e.message, true)) }, 'Cancel'))));
   if (rs.length) out.push(h('h2', { class: 'd', style: 'font-size:32px' }, 'Peer-to-peer swaps'), ...rs.map((r) => {
     const pays = r.role === 'taker' ? [r.get, r.get_amount] : [r.give, r.give_amount], gets = r.role === 'taker' ? [r.give, r.give_amount] : [r.get, r.get_amount];
     return h('div', { class: 'panel pad between', 'data-p2p': r.state, 'data-role': r.role, style: 'align-items:center' }, h('span', { class: 'm' }, `${amt(...pays)} for ${amt(...gets)}`),
-      h('span', { class: 'm ' + (r.state === 'done' ? 'l' : 'muted'), style: 'font-size:12px;text-align:right;flex:1 1 200px' }, swapState(r) + (r.note ? ' · ' + r.note : '')));
+      h('span', { class: 'm ' + (r.state === 'done' ? 'l' : 'muted'), style: 'font-size:12px;text-align:right;flex:1 1 200px' }, swapLine(r)));
   }));
   return out;
 }
@@ -582,7 +626,7 @@ function swap(view, a, b, pick) {
     ...(offers.length ? offers.map((o) => h('button', { type: 'button', class: 'offer' + (st.sel === o.id ? ' on' : ''), 'data-order': o.id, 'aria-pressed': String(st.sel === o.id), onclick: () => { st.sel = o.id; st.payIn = ''; st.seen = ''; paintOffers(); paintTake(); } },
       h('span', { class: 'd', style: 'font-size:26px;line-height:1' }, rate(pay, get, o.remaining_get, o.remaining)), h('span', { class: 'm', style: 'font-size:13px' }, `up to ${amt(get, o.remaining)} for ${amt(pay, o.remaining_get)}`),
       h('span', { class: 'm muted', style: 'font-size:12px' }, `from ${short(o.maker)}${W.pub && o.maker === B.hex(W.pub) ? ' (you)' : ''}, online now`)))
-      : [h('div', { class: 'pad col' }, h('span', { class: 'd', style: 'font-size:26px' }, 'No offers this way yet'), h('p', { class: 'muted', style: 'font-size:13px' }, 'Leave your own: it is live the moment you sign it.'))]));
+      : [h('div', { class: 'pad col' }, h('span', { class: 'd', style: 'font-size:26px' }, 'No offers this way yet'), h('p', { class: 'muted', style: 'font-size:13px' }, 'Leave your own: it is listed as soon as the board has seen the coins or sats behind it.'))]));
 
   const paintTake = () => {
     const o = offers.find((x) => x.id === st.sel);
@@ -607,11 +651,17 @@ function swap(view, a, b, pick) {
     const rateEl = h('span', { class: 'm', id: 'po-rate', style: 'font-size:13px' });
     const post = async () => {
       st.perr = '';
-      try { await needWallet(); await book.post({ give: pay, get, give_amount: g(), get_amount: w() }); st.giveIn = st.wantIn = ''; toast('Your offer is live'); await refresh(); } catch (e) { st.perr = e.message; }
+      try {
+        await needWallet();
+        const o = await book.post({ give: pay, get, give_amount: g(), get_amount: w() });
+        st.giveIn = st.wantIn = '';
+        toast(o && o.backed === false ? `Offer signed. It is listed once the board sees the ${pay === 'btc' ? 'sats' : 'coins'} behind it.` : 'Your offer is live');
+        await refresh();
+      } catch (e) { st.perr = e.message; }
       paintPost();
     };
     const deposit = async () => {
-      try { await needWallet(); const n = parseInt(prompt('Sats to move from UniSat to your hashfun key (your offers are paid from there):', '100000') || '0', 10); if (n > 0) { await window.unisat.sendBitcoin(btcAddr(), n); toast('On its way. It counts after 1 confirmation.'); } } catch (e) { toast(e.message, true); }
+      try { await needWallet(); const n = parseInt(prompt('Sats to move from UniSat to your hashfun key (your offers are paid from there):', '100000') || '0', 10); if (n > 0) { await walletPay(btcAddr(), n); toast('On its way. It counts after 1 confirmation.'); } } catch (e) { toast(e.message, true); }
     };
     const btn = h('button', { class: 'btn wide white', id: 'po-go', type: 'button', onclick: post }, 'Post offer');
     const upd = () => { const ok = g() > 0 && w() > 0; rateEl.textContent = ok ? rate(get, pay, w(), g()) : 'Set both sides: the price is what you make it.'; btn.disabled = !ok; };
@@ -662,6 +712,11 @@ function route() {
   $('wallet').addEventListener('click', () => (W.addr ? (location.hash = '#/bags') : connect(true).then(route).catch((e) => toast(e.message, true))));
   await connect(false).catch(() => false);
   paintWallet();
+  // Another account or network in the wallet is another key and another set of records: start over.
+  if (window.unisat && window.unisat.on) {
+    window.unisat.on('accountsChanged', (a) => { if (W.addr && (!a || a[0] !== W.addr)) location.reload(); });
+    for (const ev of ['networkChanged', 'chainChanged']) window.unisat.on(ev, () => { if (W.addr) location.reload(); });
+  }
   book.start(); // answers takes on your offers and finishes or refunds your swaps while a tab is open
   // Mid-swap the page still has work to do (claim, or refund after the timelock): say so before it is closed.
   window.addEventListener('beforeunload', (e) => { if (book.pending()) { e.preventDefault(); e.returnValue = ''; } });

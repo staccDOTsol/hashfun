@@ -134,7 +134,8 @@ def give_for(o: dict, get_amount: int) -> int:
 class Book:
     """chains(): {chain id: display ticker} of the chains this site follows.
     backing(chain id, maker pub hex): spendable balance of the maker's key on that chain, or None
-    when the site cannot tell cheaply (Bitcoin)."""
+    while the site does not know yet (sats on Bitcoin take a UTXO-set scan, which the site runs in
+    the background: an offer waits, unlisted, until its backing has been seen)."""
 
     def __init__(self, chains: Callable[[], Dict[str, str]], backing: Callable[[str, str], Optional[int]],
                  path: Optional[str] = None, now: Callable[[], float] = time.time, min_lock: int = 600):
@@ -191,7 +192,7 @@ class Book:
     def backed(self, o: dict) -> bool:
         have = self.backing(o["give"], o["maker"])
         if have is None:
-            return True
+            return False  # not checked yet: nobody is shown an offer the site has not seen coins behind
         need = sum(self.remaining(x) for x in self.orders.values()
                    if x["maker"] == o["maker"] and x["give"] == o["give"] and self.open(x))
         return have >= need
@@ -199,7 +200,7 @@ class Book:
     def public(self, o: dict) -> dict:
         names = self.chains()
         left = self.remaining(o)
-        return {**o, "remaining": left, "remaining_get": self.remaining_get(o),
+        return {**o, "remaining": left, "remaining_get": self.remaining_get(o), "backed": self.backed(o),
                 "give_ticker": names.get(o["give"], "?"), "get_ticker": names.get(o["get"], "?"),
                 "open": self.open(o), "live": self.live(o["maker"])}
 
@@ -336,6 +337,8 @@ class Book:
                 raise BookError("that order is gone")
             if not self.live(o["maker"]):
                 raise BookError("the maker of that order is offline")
+            if not self.backed(o):
+                raise BookError("that order is gone: the coins behind it are not there (or not checked yet)")
             if clean["taker"] == o["maker"]:
                 raise BookError("that is your own order")
             if abs(clean["ts"] - now) > 300:

@@ -162,13 +162,15 @@ class WebJsTest(unittest.TestCase):
         esbuild = os.path.join(WEB, "node_modules", ".bin", "esbuild")
         if not os.path.exists(esbuild):
             self.skipTest("esbuild not installed")
+        builds = (("static/app.js", ["src/app.js", "--bundle", "--minify", "--format=iife", "--target=es2020"]),
+                  ("maker.cjs", ["src/maker.mjs", "--bundle", "--platform=node", "--format=cjs", "--target=node18"]))
         with tempfile.TemporaryDirectory() as tmp:
-            out = os.path.join(tmp, "app.js")
-            subprocess.run([esbuild, "src/app.js", "--bundle", "--minify", "--format=iife", "--target=es2020", "--outfile=" + out,
-                            "--log-level=error"], cwd=WEB, check=True, timeout=120)
-            with open(out, "rb") as a, open(os.path.join(WEB, "static", "app.js"), "rb") as b:
-                self.assertEqual(hashlib.sha256(a.read()).hexdigest(), hashlib.sha256(b.read()).hexdigest(),
-                                 "static/app.js is stale: cd hashfun/web && npm run build")
+            for committed, args in builds:
+                out = os.path.join(tmp, os.path.basename(committed))
+                subprocess.run([esbuild, *args, "--outfile=" + out, "--log-level=error"], cwd=WEB, check=True, timeout=120)
+                with open(out, "rb") as a, open(os.path.join(WEB, committed), "rb") as b:
+                    self.assertEqual(hashlib.sha256(a.read()).hexdigest(), hashlib.sha256(b.read()).hexdigest(),
+                                     f"{committed} is stale: cd hashfun/web && npm run build")
 
     def test_sources_lint_clean(self):
         """A name used before its declaration in the same scope throws only when that line runs
