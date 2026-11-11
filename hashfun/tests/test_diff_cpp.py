@@ -59,7 +59,7 @@ def launch(rng, easy=True, **kw):
         pubkey_prefix=rng.choice([40, 1, 255]), script_prefix=rng.choice([100, 2, 254]),
         secret_prefix=rng.randrange(256),
         pow_limit_bits=rng.choice([0x207FFFFF, 0x2000FFFF, 0x1F00FFFF, 0x1F7FFFFF] if easy else [0x1D00FFFF]),
-        target_spacing=rng.choice([1, 10, 60, 600, 3600]), lwma_window=rng.choice([3, 10, 45, 144, 1000]),
+        target_spacing=rng.choice([2, 10, 60, 600, 3600]), lwma_window=rng.choice([3, 10, 45, 144, 1000]),
         ftl=rng.choice([1, 300, 7200]), tail_reward=tail, tail_halving_interval=ihl if tail else rng.choice([0, ihl]),
         creator_script=script, creator_fee_bps=rng.choice([0, 1, 100, 1000]) if script else 0,
         test=rng.random() < 0.5,
@@ -67,6 +67,7 @@ def launch(rng, easy=True, **kw):
         btc_anchor_header=rng.randbytes(80), sats_num=rng.randrange(1, 2**62), sats_shift=rng.randrange(129),
         sats_min_payment=rng.choice([546, 10_000, 10**8]), settle_deadline=rng.choice([110, 720, 10**6]),
         btc_confs=rng.choice([1, 6, 100]), creator_btc_script=rng.randbytes(rng.choice([1, 22, 34, 80])),
+        btc_regtest=rng.random() < 0.5,
     )
     base.update(kw)
     d = D.Launch(**base)
@@ -160,7 +161,7 @@ class DiffCpp(unittest.TestCase):
             {"pubkey_prefix": 100, "script_prefix": 100}, {"pubkey_prefix": 256},
             {"pow_limit_bits": "0x20800000"}, {"pow_limit_bits": "0x00000000"}, {"pow_limit_bits": "0x03000000"},
             {"pow_limit_bits": "0x22000001"}, {"pow_limit_bits": "0x2100ffff"}, {"pow_limit_bits": 545259519},
-            {"target_spacing": 0}, {"target_spacing": 3600}, {"target_spacing": 3601},
+            {"target_spacing": 0}, {"target_spacing": 1}, {"target_spacing": 2}, {"target_spacing": 3600}, {"target_spacing": 3601},
             {"lwma_window": 2}, {"lwma_window": 3}, {"lwma_window": 1000}, {"lwma_window": 1001},
             {"ftl": 0}, {"ftl": 7200}, {"ftl": 7201},
             {"virtual_work": "0"}, {"virtual_work": str(2**160)}, {"virtual_work": str(2**160 + 1)},
@@ -186,6 +187,7 @@ class DiffCpp(unittest.TestCase):
             {"btc_anchor_header": " " + "ab" * 79 + "a"}, {"btc_anchor_header": 5}, {"btc_anchor_header": None},
             {"btc_anchor_header": ""}, {"sats_num": 0}, {"sats_num": DELETE}, {"creator_btc_script": DELETE},
             {"btc_anchor_header": DELETE}, {"btc_anchor_header": "00" * 80},
+            {"btc_regtest": True}, {"btc_regtest": False}, {"btc_regtest": 1}, {"btc_regtest": "true"}, {"btc_regtest": None},
             {**SATS}, {**SATS, "sats_num": 2**62}, {**SATS, "sats_num": 2**62 + 1}, {**SATS, "sats_shift": 128},
             {**SATS, "sats_shift": 129}, {**SATS, "sats_min_payment": 545}, {**SATS, "sats_min_payment": 546},
             {**SATS, "settle_deadline": 109}, {**SATS, "settle_deadline": 110}, {**SATS, "settle_deadline": 10**6 + 1},
@@ -229,7 +231,7 @@ class DiffCpp(unittest.TestCase):
     def test_curve_lwma_subsidy_graduation(self):
         rng = random.Random(SEED + 3)
         for i in range(max(4, N // 4)):
-            T = rng.choice([1, 10, 60])
+            T = rng.choice([2, 10, 60])
             window = rng.choice([3, 10, 45])
             t0 = 15_000_000 * COIN
             d = launch(rng, pow_limit_bits=rng.choice([0x207FFFFF, 0x1F00FFFF]), target_spacing=T, lwma_window=window,

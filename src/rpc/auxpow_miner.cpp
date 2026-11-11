@@ -2,6 +2,7 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <common/args.h>
 #include <rpc/auxpow_miner.h>
 
 #include <arith_uint256.h>
@@ -13,6 +14,7 @@
 #include <node/block_template_manager.h>
 #include <node/context.h>
 #include <node/mining_types.h>
+#include <pow.h>
 #include <rpc/blockchain.h>
 #include <rpc/protocol.h>
 #include <rpc/request.h>
@@ -32,7 +34,8 @@ void auxMiningCheck(const node::NodeContext& node)
   const auto& chainman = EnsureChainman (node);
 
   const bool relaxed = Params ().MineBlocksOnDemand () || Params ().IsTestChain ();
-  if (connman.GetNodeCount (ConnectionDirection::Both) == 0 && !relaxed)
+  if (connman.GetNodeCount (ConnectionDirection::Both) == 0 && !relaxed
+      && !gArgs.GetBoolArg ("-minewithoutpeers", false))
     throw JSONRPCError (RPC_CLIENT_NOT_CONNECTED,
                         "hashfun node is not connected!");
 
@@ -81,7 +84,12 @@ AuxpowMiner::getCurrentBlock (ChainstateManager& chainman,
     if (pblockCur == nullptr
         || pindexPrev != chainman.ActiveChain ().Tip ()
         || (mempool.GetTransactionsUpdated () != txUpdatedLast
-            && GetTime () - startTime > 60))
+            && GetTime () - startTime > 60)
+        /* hashfun: an aux block keeps the timestamp it was built with, so
+           without this a stalled chain would never offer the easier target
+           that stall relief grants as time passes.  */
+        || LaunchTemplateStale (pindexPrev, *pblockCur, GetTime (),
+                                chainman.GetConsensus ()))
       {
         if (pindexPrev != chainman.ActiveChain ().Tip ())
           {
@@ -112,7 +120,7 @@ AuxpowMiner::getCurrentBlock (ChainstateManager& chainman,
 
         /* Save in our map of constructed blocks.  */
         pblockCur = &newBlock;
-        curBlocks.emplace(scriptID, pblockCur);
+        curBlocks.insert_or_assign(scriptID, pblockCur);
         mapBlocks[pblockCur->GetHash ()] = pblockCur;
       }
   }

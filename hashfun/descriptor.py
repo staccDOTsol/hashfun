@@ -56,6 +56,7 @@ class Launch:
     settle_deadline: int = 720
     btc_confs: int = 1
     creator_btc_script: bytes = b""
+    btc_regtest: bool = False  # sats leg follows regtest Bitcoin (test fleets); independent of `test`
     p2p_port: int = 0
     rpc_port: int = 0
     seeds: List[str] = field(default_factory=list)
@@ -77,7 +78,7 @@ class Launch:
                 bytes([1 if self.test else 0]) + u32(self.btc_anchor_height) + self.btc_anchor_header +
                 u32(self.btc_anchor_period_time) + struct.pack("<q", self.sats_num) + u32(self.sats_shift) +
                 struct.pack("<q", self.sats_min_payment) + u32(self.settle_deadline) + u32(self.btc_confs) +
-                vs(self.creator_btc_script))
+                vs(self.creator_btc_script) + bytes([1 if self.btc_regtest else 0]))
 
     @property
     def id(self) -> bytes:
@@ -250,6 +251,7 @@ class Launch:
             "sats_num": self.sats_num, "sats_shift": self.sats_shift, "sats_min_payment": self.sats_min_payment,
             "settle_deadline": self.settle_deadline, "btc_confs": self.btc_confs,
             **({"creator_btc_script": self.creator_btc_script.hex()} if self.creator_btc_script else {}),
+            "btc_regtest": self.btc_regtest,
             **({"p2p_port": self.p2p_port} if self.p2p_port else {}),
             **({"rpc_port": self.rpc_port} if self.rpc_port else {}), "seeds": self.seeds,
         }
@@ -333,6 +335,9 @@ def parse(text_or_obj) -> Launch:
         raise DescriptorError("test: expected bool")
     anchor = _hexbytes(o, "btc_anchor_header", 80, 80, bytes(80))
     creator_btc = _hexbytes(o, "creator_btc_script", 1, 80, b"")
+    btc_regtest = o.get("btc_regtest")
+    if btc_regtest is not None and not isinstance(btc_regtest, bool):
+        raise DescriptorError("btc_regtest: expected bool")
     seeds = o.get("seeds")
     if seeds is not None and (not isinstance(seeds, list) or not all(isinstance(x, str) for x in seeds)):
         raise DescriptorError("seeds: expected array of strings")
@@ -359,7 +364,7 @@ def parse(text_or_obj) -> Launch:
         sats_num=_int(o, "sats_num", 2**62), sats_shift=_int(o, "sats_shift", 128),
         sats_min_payment=_int(o, "sats_min_payment", MAX_MONEY, 10_000),
         settle_deadline=_int(o, "settle_deadline", 1_000_000, 720), btc_confs=_int(o, "btc_confs", 100, 1),
-        creator_btc_script=creator_btc,
+        creator_btc_script=creator_btc, btc_regtest=bool(btc_regtest),
         p2p_port=_int(o, "p2p_port", 65535), rpc_port=_int(o, "rpc_port", 65535),
         seeds=list(seeds or []),
     )
@@ -400,8 +405,10 @@ def validate(d: Launch):
         raise DescriptorError("pubkey_prefix/script_prefix: must differ from each other and from Bitcoin's")
     if d.pow_limit_bits & 0x00800000 or bits_to_target(d.pow_limit_bits) == 0 or bits_to_target(d.pow_limit_bits) >= 2**256:
         raise DescriptorError("pow_limit_bits: invalid compact target")
-    if d.target_spacing < 1:
-        raise DescriptorError("target_spacing: 1..3600")
+    # Block times are whole seconds and LWMA counts every solvetime as at least 1 s, so with
+    # T = 1 no window can ever look faster than the target and difficulty could never rise.
+    if d.target_spacing < 2:
+        raise DescriptorError("target_spacing: 2..3600")
     if d.lwma_window < 3:
         raise DescriptorError("lwma_window: 3..1000")
     if d.ftl < 1:
@@ -463,7 +470,7 @@ def btc_anchor_from_rpc(rpc, depth: int = 6):
 def make(name: str, ticker: str, creator_script: bytes, graduation_hashes: int, *, supply_coins=15_000_000,
          creator_fee_bps=100, target_spacing=5, lwma_window=90, ftl=None, test=False, tail_years=8,
          pow_limit_bits=0x1E0FFFFF, genesis_time=None, hrp=None, btc_anchor=None, sats_total=None,
-         creator_btc_script=None, _validate=True) -> Launch:
+         creator_btc_script=None, btc_regtest=None, _validate=True) -> Launch:
     """Build a descriptor with pump.fun-proportioned curve and a tail that emits
     the rest of the supply over `tail_years` with 4 halvings-ish."""
     t0 = supply_coins * COIN
@@ -478,16 +485,16 @@ def make(name: str, ticker: str, creator_script: bytes, graduation_hashes: int, 
                target_spacing=target_spacing, lwma_window=lwma_window,
                ftl=ftl or max(15, lwma_window * target_spacing // 20), tail_reward=tail,
                tail_halving_interval=interval, creator_script=creator_script, creator_fee_bps=creator_fee_bps,
-               test=test)
+               test=test, btc_regtest=test if btc_regtest is None else btc_regtest)
     if btc_anchor:  # (height, 80-byte header hex, period start time)
         d.btc_anchor_height, d.btc_anchor_header = int(btc_anchor[0]), bytes.fromhex(btc_anchor[1])
         d.btc_anchor_period_time = int(btc_anchor[2]) if len(btc_anchor) > 2 else 0
-    elif test:  # test launches follow a regtest Bitcoin: anchor at its genesis
+    elif d.btc_regtest:  # anchor at the regtest genesis
         d.btc_anchor_header = REGTEST_GENESIS_HEADER
-    d.creator_btc_script = creator_btc_script or (TEST_BTC_SCRIPT if test else b"")
+    d.creator_btc_script = creator_btc_script or (TEST_BTC_SCRIPT if d.btc_regtest else b"")
     if sats_total is not None:
         set_sats_total(d, sats_total)
-    elif test:
+    elif d.btc_regtest:
         d.sats_num, d.sats_shift = 5000, 0  # 10,000 sats per 2-hash block at the regtest floor
     if _validate:
         validate(d)

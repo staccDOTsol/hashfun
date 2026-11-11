@@ -61,6 +61,9 @@ struct LaunchDescriptor {
     uint32_t settle_deadline{720};
     uint32_t btc_confs{1};
     std::vector<unsigned char> creator_btc_script;
+    //! Which Bitcoin the sats leg follows: mainnet rules (false) or regtest (true, for
+    //! test fleets). Independent of `test`, which only relaxes mining RPC checks.
+    bool btc_regtest{false};
 
     // Not part of the launch id.
     uint16_t p2p_port{0};

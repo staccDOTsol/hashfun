@@ -23,7 +23,8 @@ def test_launch(**kw):
                 virtual_tokens=15_000_000 * COIN, graduation_tokens=11_086_000 * COIN, pow_limit_bits=0x207FFFFF,
                 target_spacing=60, lwma_window=10, ftl=60, tail_reward=10 * COIN, tail_halving_interval=1000,
                 creator_script=bytes.fromhex("0014" + "11" * 20), creator_fee_bps=100, test=True, hrp="tst",
-                btc_anchor_header=D.REGTEST_GENESIS_HEADER, sats_num=5000, creator_btc_script=D.TEST_BTC_SCRIPT)
+                btc_anchor_header=D.REGTEST_GENESIS_HEADER, sats_num=5000, creator_btc_script=D.TEST_BTC_SCRIPT,
+                btc_regtest=True)
     base.update(kw)
     d = D.Launch(**base)
     D.validate(d)

@@ -45,6 +45,15 @@ bool CheckProofOfWorkImpl(uint256 hash, unsigned int nBits, const Consensus::Par
  * Always returns true on networks where min difficulty blocks are allowed,
  * such as regtest/testnet.
  */
+/**
+ * hashfun: a launch-chain block template is built for one stall-relief step: its nBits, and
+ * with them its subsidy, belong to the 6T bucket its nTime fell in. Once the clock is in a
+ * later bucket the cached template is wrong for a miner who stamps the block now (bad-diffbits)
+ * and needlessly hard for one who keeps the old stamp, which is exactly how a stalled chain
+ * would stay stalled. True if a template on top of pindexPrev must be rebuilt at time `now`.
+ */
+bool LaunchTemplateStale(const CBlockIndex* pindexPrev, const CBlockHeader& header, int64_t now, const Consensus::Params& params);
+
 bool PermittedDifficultyTransition(const Consensus::Params& params, int64_t height, uint32_t old_nbits, uint32_t new_nbits);
 
 #endif // BITCOIN_POW_H

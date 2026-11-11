@@ -79,6 +79,7 @@ def main(argv=None):
     p.add_argument("--sats-total", type=float, metavar="BTC",
                    help="sats leg: total BTC the curve owes holders/creator/dev (needs an anchor and --creator-btc-address)")
     p.add_argument("--creator-btc-address", help="Bitcoin address for the creator's 10% of the sats leg")
+    p.add_argument("--btc-regtest", action="store_true", help="sats leg follows a regtest Bitcoin (test fleets)")
     p.add_argument("--btc-hrp", default="bc", help="bech32 prefix of the Bitcoin network (bc, tb, bcrt)")
     p.add_argument("--pow-limit", default="1e0fffff", help="difficulty floor (compact); LWMA ramps up from here")
     p.add_argument("--tail-years", type=int, default=8)
@@ -97,11 +98,12 @@ def main(argv=None):
     if a.cmd == "new":
         hrp = a.hrp or a.ticker.lower()
         creator = address_to_script(a.creator_address, hrp)
-        need_late = not a.test  # sats leg and anchor are filled in below, then validated
+        regtest = a.test or a.btc_regtest
+        need_late = not regtest  # sats leg and anchor are filled in below, then validated
         d = D.make(a.name, a.ticker, creator, int(a.graduation_hashes), supply_coins=a.supply, _validate=not need_late,
                    creator_fee_bps=a.fee_bps, target_spacing=a.spacing, lwma_window=a.window, test=a.test,
                    tail_years=a.tail_years, pow_limit_bits=int(a.pow_limit, 16), hrp=hrp,
-                   btc_anchor=a.btc_anchor.split(":") if a.btc_anchor else None)
+                   btc_anchor=a.btc_anchor.split(":") if a.btc_anchor else None, btc_regtest=regtest)
         d.seeds = a.seed
         if a.btc_rpc:
             from .rpc import RPC

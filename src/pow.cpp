@@ -90,6 +90,14 @@ static unsigned int LaunchStallRelief(unsigned int base_bits, const CBlockIndex*
     return target.GetCompact();
 }
 
+bool LaunchTemplateStale(const CBlockIndex* pindexPrev, const CBlockHeader& header, int64_t now, const Consensus::Params& params)
+{
+    if (pindexPrev == nullptr || params.lwma_window <= 0) return false;
+    CBlockHeader probe{header};
+    if (now > probe.GetBlockTime()) probe.nTime = static_cast<uint32_t>(now);
+    return LaunchStallRelief(LwmaNextWorkRequired(pindexPrev, params), pindexPrev, &probe, params) != header.nBits;
+}
+
 unsigned int GetNextWorkRequired(const CBlockIndex* pindexLast, const CBlockHeader *pblock, const Consensus::Params& params)
 {
     assert(pindexLast != nullptr);

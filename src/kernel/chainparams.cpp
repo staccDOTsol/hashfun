@@ -876,7 +876,7 @@ public:
         consensus.launch_btc_anchor_header.assign(d.btc_anchor_header.begin(), d.btc_anchor_header.end());
         consensus.launch_btc_anchor_height = d.btc_anchor_height;
         consensus.launch_btc_anchor_period_time = d.btc_anchor_period_time;
-        consensus.launch_btc_regtest = d.test; // test launches follow a regtest Bitcoin
+        consensus.launch_btc_regtest = d.btc_regtest;
 
         const auto magic = LaunchMessageStart(d);
         std::copy(magic.begin(), magic.end(), pchMessageStart.begin());

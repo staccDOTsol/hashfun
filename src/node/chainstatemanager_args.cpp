@@ -46,7 +46,15 @@ util::Result<void> ApplyArgsManOptions(const ArgsManager& args, ChainstateManage
         }
     }
 
-    if (auto value{args.GetIntArg("-maxtipage")}) opts.max_tip_age = std::chrono::seconds{*value};
+    if (auto value{args.GetIntArg("-maxtipage")}) {
+        opts.max_tip_age = std::chrono::seconds{*value};
+    } else if (opts.chainparams.GetConsensus().launch_enabled) {
+        // hashfun: a launch only gets blocks while minting pays, and stall relief exists so
+        // anyone can revive it later. An old tip therefore says nothing about being in sync;
+        // treating it as "initial block download" would stop restarted nodes from mining or
+        // relaying transactions on exactly the chains that need reviving.
+        opts.max_tip_age = std::chrono::hours{24 * 365 * 100};
+    }
 
     ReadDatabaseArgs(args, opts.coins_db);
     ReadCoinsViewArgs(args, opts.coins_view);

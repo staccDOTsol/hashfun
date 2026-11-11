@@ -3,6 +3,7 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <common/args.h>
 #include <bitcoin-build-config.h> // IWYU pragma: keep
 
 #include <rpc/register.h> // IWYU pragma: associated
@@ -809,8 +810,8 @@ static RPCMethod getblocktemplate()
 
     if (!chainman.GetParams().IsTestChain()) {
         const CConnman& connman = EnsureConnman(node);
-        if (connman.GetNodeCount(ConnectionDirection::Both) == 0) {
-            throw JSONRPCError(RPC_CLIENT_NOT_CONNECTED, CLIENT_NAME " is not connected!");
+        if (connman.GetNodeCount(ConnectionDirection::Both) == 0 && !gArgs.GetBoolArg("-minewithoutpeers", false)) {
+            throw JSONRPCError(RPC_CLIENT_NOT_CONNECTED, CLIENT_NAME " is not connected! (start with -minewithoutpeers to mine as the first node of a launch)");
         }
 
         // hashfun: a fresh launch sits at genesis, which may be older than
@@ -908,7 +909,9 @@ static RPCMethod getblocktemplate()
     static int64_t time_start;
     static std::unique_ptr<node::CBlockTemplate> block_template;
     if (!pindexPrev || pindexPrev->GetBlockHash() != tip ||
-        (mempool.GetTransactionsUpdated() != nTransactionsUpdatedLast && GetTime() - time_start > 5))
+        (mempool.GetTransactionsUpdated() != nTransactionsUpdatedLast && GetTime() - time_start > 5) ||
+        // hashfun: nBits and the subsidy follow the clock on launch chains (stall relief).
+        (block_template && LaunchTemplateStale(pindexPrev, block_template->block, GetTime(), consensusParams)))
     {
         // Clear pindexPrev so future calls make a new block, despite any failures from here on
         pindexPrev = nullptr;

@@ -236,6 +236,7 @@ std::vector<unsigned char> LaunchCanonicalBytes(const LaunchDescriptor& d)
     PutU32(v, d.settle_deadline);
     PutU32(v, d.btc_confs);
     PutBytes(v, d.creator_btc_script.data(), d.creator_btc_script.size());
+    PutU8(v, d.btc_regtest ? 1 : 0);
     return v;
 }
 
@@ -330,6 +331,16 @@ std::optional<LaunchDescriptor> ParseLaunchDescriptor(const std::string& json, s
     if (!GetUInt(o, "btc_confs", d.btc_confs, error, 100)) return std::nullopt;
     if (!GetHexBytes(o, "creator_btc_script", d.creator_btc_script, error, 1, 80)) return std::nullopt;
     {
+        const UniValue& t = o.find_value("btc_regtest");
+        if (!t.isNull()) {
+            if (!t.isBool()) {
+                error = "btc_regtest: expected bool";
+                return std::nullopt;
+            }
+            d.btc_regtest = t.get_bool();
+        }
+    }
+    {
         const bool has_anchor = std::any_of(d.btc_anchor_header.begin(), d.btc_anchor_header.end(), [](unsigned char c) { return c != 0; });
         if ((d.btc_anchor_height != 0 || d.btc_anchor_period_time != 0) && !has_anchor) {
             error = "btc_anchor_header: required with btc_anchor_height / btc_anchor_period_time";
@@ -408,8 +419,10 @@ std::optional<LaunchDescriptor> ParseLaunchDescriptor(const std::string& json, s
             return std::nullopt;
         }
     }
-    if (d.target_spacing < 1) {
-        error = "target_spacing: 1..3600";
+    // Block times are whole seconds and LWMA counts every solvetime as at least 1 s, so with
+    // T = 1 no window can ever look faster than the target and difficulty could never rise.
+    if (d.target_spacing < 2) {
+        error = "target_spacing: 2..3600";
         return std::nullopt;
     }
     if (d.lwma_window < 3) {
@@ -505,6 +518,7 @@ std::string LaunchDescriptorToJSON(const LaunchDescriptor& d)
     o.pushKV("settle_deadline", static_cast<int64_t>(d.settle_deadline));
     o.pushKV("btc_confs", static_cast<int64_t>(d.btc_confs));
     if (!d.creator_btc_script.empty()) o.pushKV("creator_btc_script", HexStr(d.creator_btc_script));
+    o.pushKV("btc_regtest", d.btc_regtest);
     o.pushKV("p2p_port", static_cast<int64_t>(LaunchP2PPort(d)));
     o.pushKV("rpc_port", static_cast<int64_t>(LaunchRPCPort(d)));
     UniValue seeds(UniValue::VARR);
