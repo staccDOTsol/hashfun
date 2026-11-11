@@ -571,6 +571,10 @@ def r_sendtoaddress(c, address, amount):
     return tx.txid_hex()
 
 
+def r_getbalances(c):
+    return {"mine": {"trusted": sum(o.value for _, o in c.wallet_utxos()) / COIN, "untrusted_pending": 0, "immature": 0}}
+
+
 def r_gettransaction(c, txid):
     t = c.find_tx(bytes.fromhex(txid)[::-1])
     if t is None:

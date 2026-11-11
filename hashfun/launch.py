@@ -78,7 +78,7 @@ def main(argv=None):
     p.add_argument("--btc-cookie", help="Bitcoin Core .cookie file, if the URL has no user:pass")
     p.add_argument("--sats-total", type=float, metavar="BTC",
                    help="sats leg: total BTC the curve owes holders/creator/dev (needs an anchor and --creator-btc-address)")
-    p.add_argument("--creator-btc-address", help="Bitcoin address for the creator's 10% of the sats leg")
+    p.add_argument("--creator-btc-address", help="Bitcoin address for the creator's 10%% of the sats leg")
     p.add_argument("--btc-regtest", action="store_true", help="sats leg follows a regtest Bitcoin (test fleets)")
     p.add_argument("--btc-hrp", default="bc", help="bech32 prefix of the Bitcoin network (bc, tb, bcrt)")
     p.add_argument("--pow-limit", default="1e0fffff", help="difficulty floor (compact); LWMA ramps up from here")

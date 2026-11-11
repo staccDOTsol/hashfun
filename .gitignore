@@ -30,3 +30,5 @@ target/
 hashfun/web/node_modules/
 hashfun.egg-info/
 __pycache__/
+contrib/hashfun/npm/py/
+contrib/hashfun/npm/*.tgz

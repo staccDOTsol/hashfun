@@ -1,0 +1,14 @@
+{
+  "name": "hashfun",
+  "version": "0.1.0",
+  "description": "hashfun CLI: launch a proof-of-work coin on its own Bitcoin-fork chain, run its node, mine it, settle the BTC it owes, swap it, and serve the site",
+  "license": "MIT",
+  "bin": { "hashfun": "bin/hashfun.js" },
+  "files": ["bin", "py", "README.md"],
+  "engines": { "node": ">=16" },
+  "scripts": {
+    "prepack": "node scripts/copy-py.js",
+    "test": "node bin/hashfun.js --help"
+  },
+  "keywords": ["bitcoin", "proof-of-work", "merged-mining", "atomic-swap", "launchpad"]
+}

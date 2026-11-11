@@ -122,11 +122,37 @@ hashfund -launch=cndh.json
 
 Version rolling is refused by the pool (`mining.configure`): ASICs rolling bits 13-28 would overwrite the auxpow chain ID.
 
+## The site
+
+`hashfun web --btc-rpc URL [--maker maker.json] [--allow-launch] [--listen 127.0.0.1:8080]` serves the board, coin pages, the launch form and Bags for every launch registered on the machine. Source in `hashfun/web/src` (`npm install && npm run build` writes `hashfun/web/static/app.js`; the built file and the fonts are committed, so running the site needs no Node).
+
+| Piece | How it works |
+|---|---|
+| Keys | the page asks the wallet (UniSat: `requestAccounts`, `signMessage`) for one signature over a fixed message and derives its own key from it (`SHA256("hashfun-key-v1" \|\| signature)`), kept in the browser. That key holds launch coins (P2WPKH on every launch) and receives BTC yield (the same script on Bitcoin). The server never sees a key |
+| Buy | atomic swap in the page: quote, HTLC built and checked in the browser, BTC paid into it with `sendBitcoin`, the maker locks coins on the launch chain, the page audits that contract (script, amount, confirmations, timelocks) and claims with the secret. Swap state is saved before any money moves; Bags can resume or, after the timelock, refund |
+| Instant | `instant_max_sats` in the maker config: buys up to that size are filled on the unconfirmed Bitcoin lock. The maker carries the double-spend risk; larger buys wait for `btc_confs` |
+| Sell | the page locks coins on the launch chain (it signs the P2WPKH spend), the maker locks BTC, the page claims it to the wallet address after one Bitcoin confirmation |
+| Yield | Bags reads the Bitcoin outputs at the page key's script and sweeps them to the wallet address |
+| Launch | the form posts name, ticker, curve size, BTC total and the creator's scripts; the server builds the descriptor, grinds genesis, starts the node (`--allow-launch`) |
+| API | `/api/board`, `/api/coin/T`, `/api/coin/T/address/A`, `/api/chain/<btc\|T>/{time,txout,tx,spender,address}`, `/api/quote`, `/api/orders`, `/api/launch`. Reads and broadcasts only |
+
+`hashfun/tests/test_web_js.py` holds the browser's Bitcoin code to the Python byte for byte (addresses, HTLC scripts, signed redeem, refund and P2WPKH transactions). `hashfun/tests/web_regtest.py` drives the real site in Chromium against real nodes, pool, settler and maker; only the wallet is a stand-in (a mock `window.unisat` backed by a regtest wallet).
+
+The maker quotes `hashes_per_coin x (hashprice + sats owed per hash) x (1 +/- spread)` and refuses a quote it cannot fill from its wallet. The node wallet treats curve coinbases that are not settled as immature, so they stay out of its balance and coin selection.
+
+## Wallet file
+
+`hashfun wallet init` asks for a password (or reads `$HASHFUN_WALLET_PASSWORD`). The seed phrase, BIP39 passphrase and swap secrets are kept in a vault inside the wallet file: ChaCha20-Poly1305 (RFC 8439) under a key from scrypt (N=2^15, r=8, p=1). `hashfun wallet encrypt` sets or changes the password of an existing file; `--no-encrypt` is for throwaway wallets.
+
+## npm
+
+`contrib/hashfun/npm` is the `hashfun` npm package: a small Node wrapper that runs the Python CLI shipped inside it (Python >= 3.10, standard library only). `cd contrib/hashfun/npm && npm pack` (or `npm publish`) copies the package and the built site in first. The node binary stays separate (`HASHFUND=/path/to/hashfund`).
+
 ## Swaps
 
 HTLC (P2WSH): `IF SIZE 32 EQUALVERIFY SHA256 <H> EQUALVERIFY <recipient> ELSE <locktime> CLTV DROP <refund> ENDIF CHECKSIG`. The size check pins the secret to 32 bytes on both chains.
 
-Maker rules: quote `= hashes_per_coin x hashprice x (1 +/- spread)` (the curve is the fair-value anchor); quotes carry an id and a TTL so price movement between quote and lock cannot strand the taker; order size capped at the cost of renting enough hash to reorg `fork_confs` blocks; participates only after `btc_confs`/`fork_confs` on the initiator lock and only if the initiator's lock outlives its own by a margin; redeems as soon as the secret appears; refunds after its locktime.
+Maker rules: quote `= hashes_per_coin x (hashprice + sats owed per hash) x (1 +/- spread)` (the curve is the fair-value anchor); quotes carry an id and a TTL so price movement between quote and lock cannot strand the taker; order size capped at the cost of renting enough hash to reorg `fork_confs` blocks; participates only after `btc_confs`/`fork_confs` on the initiator lock and only if the initiator's lock outlives its own by a margin; redeems as soon as the secret appears; refunds after its locktime.
 
 Taker rules (wallet): reveals the secret only after `N` confirmations on the maker's lock, only while `now + margin < maker_locktime` (otherwise the maker could refund and still claim with the revealed secret), refunds at its own locktime.
 
@@ -138,6 +164,8 @@ python -m unittest hashfun.tests.test_stack     # pool+miner, merged mining gate
 bash contrib/hashfun/difftest/build.sh build/hfdiff && HFDIFF=build/hfdiff python -m unittest hashfun.tests.test_diff_cpp
 python -m hashfun.tests.e2e_regtest --hashfund build/bin/hashfund --bitcoind /path/to/stock/bitcoind
 python -m hashfun.tests.fleet_regtest --hashfund build/bin/hashfund --bitcoind /path/to/stock/bitcoind   # ~4.5 min, real time
+python -m unittest hashfun.tests.test_web_js    # browser Bitcoin code vs Python (needs node; cd hashfun/web && npm install)
+python -m hashfun.tests.web_regtest --hashfund build/bin/hashfund --bitcoind /path/to/stock/bitcoind     # ~6 min, needs playwright
 ```
 
 `test_stack` runs against an in-process simulator whose consensus is the Python model, not the C++ node. `test_diff_cpp` compiles the node's own consensus sources (descriptor parser and identity, `CLaunchParams` + genesis, curve, LWMA, tail) without the rest of the node, in ~20 s, and compares them value by value with the Python model on random descriptors and adversarial header sequences (zero, negative and >6T solvetimes, off-schedule nBits, graduation crossings); it also requires both parsers to accept and reject exactly the same descriptor JSON. `e2e_regtest` covers what needs a running node: block acceptance (creator output, excess coinbase, nBits), the auxpow gate, GBT, merged mining against stock bitcoind and a swap over real nodes. With `--workdir` its phases can run in separate processes (`--phases 1-6`, `7-8`, `9`). `fleet_regtest` is the multi-node test: production-mode launches, P2P on localhost, real time; gating, state agreement (tip, UTXO set, Bitcoin relay, every obligation) across nodes, late joiner, restarts, partitions and reorgs in both directions including a forged Bitcoin header branch, two competing pools, AuxPoW blocks over P2P, the settlement lock in the mempool, transaction relay, `verifychain`, stall relief against the wall clock.

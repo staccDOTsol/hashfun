@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Smoke test of the `hashfun` CLI against real binaries: create two launches (one that graduates
 # at once, one with a long curve), run their nodes, mine both through the CLI's pool with
-# the CPU miner, and check merge mining + automatic sats settlement happened.
+# the CPU miner, check merge mining + automatic sats settlement happened, and that the site
+# (`hashfun web`) serves both launches.
 #   HASHFUND=/path/hashfund BITCOIND=/path/bitcoind bash contrib/hashfun/cli_smoke.sh
 set -euo pipefail
 : "${HASHFUND:?}" "${BITCOIND:?}"
@@ -52,7 +53,7 @@ for t in GRD STS; do hf node rpc $t createwallet w >/dev/null; done
 GA=$(hf node rpc GRD getnewaddress "" bech32); SA=$(hf node rpc STS getnewaddress "" bech32)
 
 # 1. mine GRD past graduation with the CLI pool + CPU miner
-hf mine GRD --payout "$GA" --btc-rpc "$BTC" --btc-cookie "$COOKIE" --btc-wallet w --btc-hrp bcrt --listen 127.0.0.1:$(port) --difficulty 1e-6 --duration 6 > "$W/mine1.log" 2>&1
+hf mine GRD --payout "$GA" --btc-rpc "$BTC" --btc-cookie "$COOKIE" --btc-wallet w --btc-hrp bcrt --listen 127.0.0.1:$(port) --difficulty 1e-6 --duration 6 --pay-depth 0 > "$W/mine1.log" 2>&1
 hf node ls GRD > "$W/ls1.json"
 echo "GRD: height $(j "d[0]['height']" < "$W/ls1.json") graduated $(j "d[0]['graduated']" < "$W/ls1.json")"
 [ "$(j "d[0]['graduated']" < "$W/ls1.json")" = "True" ]
@@ -61,7 +62,7 @@ G0=$(hf node rpc GRD getblockcount)
 # 2. mine STS: must merge-mine GRD and settle its own Bitcoin obligations
 ( for _ in $(seq 14); do sleep 1; b w generatetoaddress 1 "$BA" >/dev/null 2>&1 || true; done ) &
 hf mine STS --payout "$SA" --btc-rpc "$BTC" --btc-cookie "$COOKIE" --btc-wallet w --btc-hrp bcrt \
-  --listen 127.0.0.1:$(port) --difficulty 1e-6 --duration 14 > "$W/mine2.log" 2>&1
+  --listen 127.0.0.1:$(port) --difficulty 1e-6 --duration 14 --pay-depth 0 > "$W/mine2.log" 2>&1
 wait %2 2>/dev/null || true
 head -1 "$W/mine2.log"
 G1=$(hf node rpc GRD getblockcount); S1=$(hf node rpc STS getblockcount)
@@ -76,6 +77,17 @@ PY
 )
 echo "STS: height $S1, blocks settled by Bitcoin payment: $SETTLED; GRD merge-mined +$((G1-G0)); relay $(hf node rpc STS getbtcrelay | j "d['height']")/$(b getblockcount)"
 [ "$S1" -ge 8 ] && [ "$((G1-G0))" -ge 1 ] && [ "$SETTLED" -ge 1 ]
+
+# 3. the site serves both launches from the same registry
+WP=$(port)
+hf web --btc-rpc "$BTC" --btc-cookie "$COOKIE" --listen "127.0.0.1:$WP" > "$W/web.log" 2>&1 &
+WEBPID=$!
+for _ in $(seq 100); do [ "$(curl -sf "http://127.0.0.1:$WP/api/board" 2>/dev/null | j "sum('height' in c for c in d)" 2>/dev/null)" = "2" ] && break; sleep 0.2; done
+echo "site: $(curl -sf "http://127.0.0.1:$WP/api/board" | j "[(c['ticker'], c['height'], c['graduated']) for c in d]")"
+[ "$(curl -sf "http://127.0.0.1:$WP/api/coin/STS" | j "len(d['blocks']) > 5 and d['paid']['holder'] + d['paid']['creator'] + d['paid']['dev'] > 0")" = "True" ]
+curl -sf "http://127.0.0.1:$WP/" | grep -q "<title>hashfun</title>"
+[ "$(curl -sf "http://127.0.0.1:$WP/app.js" | wc -c)" -gt 20000 ]
+kill "$WEBPID" 2>/dev/null || true
 hf node down | j "d['GRD']+d['STS']"
 [ "$(hf node ls | j "d[0]['running'] or d[1]['running']")" = "False" ]
 echo "CLI SMOKE PASS"

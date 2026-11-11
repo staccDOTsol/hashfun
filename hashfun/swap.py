@@ -107,6 +107,10 @@ class NodeChain:
     def dest_script(self) -> bytes:
         return address_to_script(self.rpc.getnewaddress("", "bech32"), self.hrp)
 
+    def balance(self) -> int:
+        """Spendable sats in the node wallet (on a launch: matured and settled)."""
+        return sats(self.rpc.getbalances()["mine"]["trusted"])
+
     def feerate(self) -> int:
         try:
             r = self.rpc.estimatesmartfee(self.conf_target)
@@ -306,6 +310,13 @@ class Maker:
         spread = float(cc.get("spread", 0.03))
         price = int(fair * (1 + spread if side == "buy" else 1 - spread))
         btc_amount = amount * price // COIN
+        if amount <= 0 or btc_amount < int(cc.get("min_order_sats", 2000)):
+            raise ValueError(f"order too small: the minimum is {int(cc.get('min_order_sats', 2000))} sats")
+        # Never quote what cannot be delivered: the taker would lock funds and wait for a refund.
+        give, have = (self.forks[ticker], amount) if side == "buy" else (self.btc, btc_amount)
+        held = give.balance() if hasattr(give, "balance") else None
+        if held is not None and have + 10_000 > held:
+            raise ValueError(f"the maker holds {coins(held)} {ticker if side == 'buy' else 'BTC'} right now, not enough for this order")
         now_btc = self.btc.median_time()
         now_fork = self.forks[ticker].median_time()
         q = {"ticker": ticker, "side": side, "amount": amount, "price": price, "btc_amount": btc_amount,

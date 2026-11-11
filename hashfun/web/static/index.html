@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hashfun</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="top">
+  <div class="wrap bar">
+    <a class="logo" href="#/"><span class="d mark" aria-hidden="true">#</span><span class="d">hashfun</span></a>
+    <nav aria-label="Main">
+      <a href="#/" data-nav="board">Board</a>
+      <a href="#/launch" data-nav="launch">Launch</a>
+      <a href="#/bags" data-nav="bags">Bags</a>
+    </nav>
+    <button id="wallet" class="m wallet" type="button">CONNECT UNISAT</button>
+  </div>
+</header>
+<main id="view" class="wrap"></main>
+<div id="modal" hidden></div>
+<div id="toast" role="status" aria-live="polite"></div>
+<footer class="foot"><div class="wrap">Every launch is a public chain. Run a node and check everything yourself. <span class="m">npm i -g hashfun</span></div></footer>
+<script src="/app.js"></script>
+</body>
+</html>

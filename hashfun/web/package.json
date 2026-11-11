@@ -1,0 +1,21 @@
+{
+  "name": "hashfun-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/app.js --bundle --minify --format=iife --target=es2020 --outfile=static/app.js",
+    "vectors": "node src/vectors.mjs",
+    "fonts": "node -e \"const f=require('fs'),b='node_modules/@fontsource/';[['anton','anton',[400]],['inter','inter',[400,500,600,700]],['jetbrains-mono','mono',[400,500,700]]].forEach(([p,o,ws])=>ws.forEach(w=>f.copyFileSync(b+p+'/files/'+p+'-latin-'+w+'-normal.woff2','static/'+o+'-'+w+'.woff2')))\""
+  },
+  "dependencies": {
+    "@noble/hashes": "1.4.0",
+    "@noble/secp256k1": "2.1.0"
+  },
+  "devDependencies": {
+    "@fontsource/anton": "^5.0.20",
+    "@fontsource/inter": "^5.0.20",
+    "@fontsource/jetbrains-mono": "^5.0.20",
+    "esbuild": "0.21.5"
+  }
+}
