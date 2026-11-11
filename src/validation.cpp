@@ -4394,6 +4394,17 @@ static bool ContextualCheckBlock(const CBlock& block, BlockValidationState& stat
         }
     }
 
+    // hashfun: the coinbase names its launch, right after the height. Without this two launches
+    // with the same preset can contain byte-identical coinbases (same height, same reward, same
+    // payout script), and a spend of one would be valid on the other.
+    if (const Consensus::Params& launch_params = chainman.GetConsensus(); launch_params.launch_enabled && pindexPrev != nullptr) {
+        const CScript expect = CScript() << nHeight << LaunchCoinbaseTag(launch_params);
+        const CScript& sig = block.vtx[0]->vin[0].scriptSig;
+        if (sig.size() < expect.size() || !std::equal(expect.begin(), expect.end(), sig.begin())) {
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-launch-id", "coinbase does not name this launch");
+        }
+    }
+
     // Validation for witness commitments.
     // * We compute the witness hash (which is the hash including witnesses) of all the block's transactions, except the
     //   coinbase (where 0x0000....0000 is used instead).

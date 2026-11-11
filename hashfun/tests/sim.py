@@ -214,6 +214,8 @@ class SimChain:
             cb = blk.txs[0]
             if not cb.vin[0].script_sig.startswith(push_int(height)):
                 return "bad-cb-height"
+            if self.launch and not cb.vin[0].script_sig.startswith(self.launch.coinbase_prefix(height)):
+                return "bad-cb-launch-id"
             # witness commitment
             if any(t.has_witness() for t in blk.txs[1:]) or any(o.script_pubkey[2:6] == WITNESS_MAGIC for o in cb.vout):
                 wt = [b"\0" * 32] + [t.wtxid() for t in blk.txs[1:]]
@@ -283,7 +285,8 @@ class SimChain:
         if t["creator_fee"]:
             outs.append(TxOut(t["creator_fee"], self.launch.creator_script))
         outs.append(TxOut(0, t["commitment"]))
-        cb = Tx(version=2, vin=[TxIn(b"\0" * 32, 0xFFFFFFFF, push_int(t["height"]) + push(en or b"\x00\x00"), 0xFFFFFFFF,
+        head = self.launch.coinbase_prefix(t["height"]) if self.launch else push_int(t["height"])
+        cb = Tx(version=2, vin=[TxIn(b"\0" * 32, 0xFFFFFFFF, head + push(en or b"\x00\x00"), 0xFFFFFFFF,
                                      [b"\0" * 32])], vout=outs)
         txs = [cb] + t["txs"]
         version = self.version() | (0x100 if aux else 0)
@@ -469,6 +472,8 @@ def r_getblocktemplate(c, req=None):
            "default_witness_commitment": t["commitment"].hex()}
     if t["creator_fee"]:
         out["creatorfee"] = {"script": c.launch.creator_script.hex(), "amount": t["creator_fee"]}
+    if c.launch:
+        out["launchcoinbase"] = c.launch.coinbase_prefix(t["height"]).hex()
     return out
 
 

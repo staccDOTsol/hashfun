@@ -50,18 +50,27 @@ def difficulty_for_target(target: int) -> float:
     return DIFF1_TARGET / max(target, 1)
 
 
-def coinbase_parts(height: int, outputs: List[TxOut], extra: bytes = b"", tag: bytes = b"/hashfun/") -> (bytes, bytes):
-    """Split a non-witness coinbase so that coinb1 + extranonce(8) + coinb2 is the tx."""
-    script_len = len(push_int(height)) + len(extra) + 1 + EN1_SIZE + EN2_SIZE + len(push(tag))
+def coinbase_parts(height: int, outputs: List[TxOut], extra: bytes = b"", tag: bytes = b"/hashfun/",
+                   prefix: Optional[bytes] = None) -> (bytes, bytes):
+    """Split a non-witness coinbase so that coinb1 + extranonce(8) + coinb2 is the tx.
+    `prefix` is what the scriptSig must start with when the chain says so (a launch: the height, then
+    the launch: getblocktemplate's "launchcoinbase"); without it, the height alone."""
+    head = prefix if prefix is not None else push_int(height)
+    script_len = len(head) + len(extra) + 1 + EN1_SIZE + EN2_SIZE + len(push(tag))
     if script_len > 100:
         raise ValueError("coinbase scriptSig too long")
     coinb1 = (struct.pack("<i", 2) + b"\x01" + b"\x00" * 32 + b"\xff\xff\xff\xff" + varint(script_len) +
-              push_int(height) + extra + bytes([EN1_SIZE + EN2_SIZE]))
+              head + extra + bytes([EN1_SIZE + EN2_SIZE]))
     coinb2 = push(tag) + b"\xff\xff\xff\xff" + varint(len(outputs))
     for o in outputs:
         coinb2 += struct.pack("<q", o.value) + varint(len(o.script_pubkey)) + o.script_pubkey
     coinb2 += struct.pack("<I", 0)
     return coinb1, coinb2
+
+
+def _cb_prefix(tmpl: dict) -> Optional[bytes]:
+    """The coinbase scriptSig prefix a launch's node asks for, if this template is a launch's."""
+    return bytes.fromhex(tmpl["launchcoinbase"]) if "launchcoinbase" in tmpl else None
 
 
 def witness_coinbase(coinbase_nonwit: bytes, with_witness: bool) -> Tx:
@@ -269,7 +278,7 @@ class LaunchSource(JobSource):
         if has_commit:
             outs.append(TxOut(0, bytes.fromhex(t["default_witness_commitment"])))
         extra, auxctx = self.auxset.commit()
-        c1, c2 = coinbase_parts(t["height"], outs, extra=extra)
+        c1, c2 = coinbase_parts(t["height"], outs, extra=extra, prefix=_cb_prefix(t))
         txids, datas = _gbt_txs(t)
         return Job(job_id, self, bytes.fromhex(t["previousblockhash"])[::-1], c1, c2,
                    merkle_branch_for_first([b"\0" * 32] + txids), t["version"], int(t["bits"], 16), t["curtime"],
@@ -355,7 +364,7 @@ class MergedSource(JobSource):
         if has_commit:
             outs.append(TxOut(0, bytes.fromhex(t["default_witness_commitment"])))
         extra, auxctx = self.auxset.commit()
-        c1, c2 = coinbase_parts(t["height"], outs, extra=extra)
+        c1, c2 = coinbase_parts(t["height"], outs, extra=extra, prefix=_cb_prefix(t))
         txids, datas = _gbt_txs(t)
         return Job(job_id, self, bytes.fromhex(t["previousblockhash"])[::-1], c1, c2,
                    merkle_branch_for_first([b"\0" * 32] + txids), t["version"], int(t["bits"], 16), t["curtime"],

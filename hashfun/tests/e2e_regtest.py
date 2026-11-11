@@ -144,7 +144,7 @@ def solve(header76: bytes, target: int) -> bytes:
 
 
 def block_from_gbt(t, payout_spk, *, extra_value=0, drop_creator=False, bits=None, version=None, auxpow=b"",
-                   extra_outs=(), extra_txs=()):
+                   extra_outs=(), extra_txs=(), cb_prefix=None):
     outs = [TxOut(t["coinbasevalue"] + extra_value, payout_spk)]
     if "creatorfee" in t and not drop_creator:
         outs.append(TxOut(t["creatorfee"]["amount"], bytes.fromhex(t["creatorfee"]["script"])))
@@ -155,7 +155,9 @@ def block_from_gbt(t, payout_spk, *, extra_value=0, drop_creator=False, bits=Non
         wroot = merkle_root([b"\0" * 32] + [sha256d(x.serialize(witness=True)) for x in body])
         commitment = bytes.fromhex("6a24aa21a9ed") + sha256d(wroot + b"\0" * 32)
     outs.append(TxOut(0, commitment))
-    cb = Tx(version=2, vin=[TxIn(b"\0" * 32, 0xFFFFFFFF, push_int(t["height"]) + push(os.urandom(4)), 0xFFFFFFFF,
+    if cb_prefix is None:  # a launch's coinbase starts with the height and the launch; the template says how
+        cb_prefix = bytes.fromhex(t["launchcoinbase"]) if "launchcoinbase" in t else push_int(t["height"])
+    cb = Tx(version=2, vin=[TxIn(b"\0" * 32, 0xFFFFFFFF, cb_prefix + push(os.urandom(4)), 0xFFFFFFFF,
                                  [b"\0" * 32])], vout=outs)
     txs = [cb] + [Tx.parse(bytes.fromhex(x["data"])) for x in t["transactions"]] + list(extra_txs)
     b = bits if bits is not None else int(t["bits"], 16)
@@ -344,6 +346,19 @@ class E2E:
         check("3 reject missing creator output", r == "bad-cb-creator-fee", r)
         r = n1.rpc.submitblock(ser_block(*block_from_gbt(t, spk, bits=0x2007FFFF)))
         check("3 reject wrong nBits", r == "bad-diffbits", r)
+        # Every coinbase names its launch right after the height, so no transaction exists on two launches.
+        h, d1 = t["height"], self.d1
+        check("3 the template's coinbase prefix is the height, then 16 bytes of the launch id (the rules' own arithmetic)",
+              t.get("launchcoinbase") == d1.coinbase_prefix(h).hex() == (push_int(h) + push(d1.id[:16])).hex(),
+              f"{t.get('launchcoinbase')} vs {d1.coinbase_prefix(h).hex()}")
+        r = n1.rpc.submitblock(ser_block(*block_from_gbt(t, spk, cb_prefix=push_int(h))))
+        check("3 reject a coinbase that does not name the launch", r == "bad-cb-launch-id", r)
+        r = n1.rpc.submitblock(ser_block(*block_from_gbt(t, spk, cb_prefix=push_int(h) + push(self.d2.id[:16]))))
+        check("3 reject a coinbase that names another launch", r == "bad-cb-launch-id", r)
+        r = n1.rpc.submitblock(ser_block(*block_from_gbt(t, spk, cb_prefix=push_int(h) + push(d1.id[:15]))))
+        check("3 reject a coinbase that names the launch by 15 bytes", r == "bad-cb-launch-id", r)
+        r = n1.rpc.submitblock(ser_block(*block_from_gbt(t, spk, cb_prefix=push(d1.id[:16]) + push_int(h))))
+        check("3 reject the launch before the height", r == "bad-cb-height", r)
         r = n1.rpc.submitblock(ser_block(*block_from_gbt(t, spk)))
         check("3 accept the honest template block", r is None, r)
 

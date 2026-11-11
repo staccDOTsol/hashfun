@@ -209,6 +209,8 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     // increasing its length would reduce the space they can use and may break
     // existing clients.
     coinbaseTx.vin[0].scriptSig = CScript() << nHeight;
+    // hashfun: then the launch (consensus, bad-cb-launch-id). Part of the prefix clients build on.
+    if (launch_chain) coinbaseTx.vin[0].scriptSig << LaunchCoinbaseTag(chainparams.GetConsensus());
     // Set script_sig_prefix here, so IPC mining clients are not affected by
     // the optional scriptSig padding below. They provide their own extraNonce,
     // and in a typical setup a pool name or realistic extraNonce already makes

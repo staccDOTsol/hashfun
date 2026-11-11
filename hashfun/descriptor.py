@@ -144,6 +144,12 @@ class Launch:
         return f"launch_{self.ticker.lower()}_{self.id_hex[:8]}"
 
     # ------------------------------------------------------------ genesis
+    def coinbase_prefix(self, height: int) -> bytes:
+        """What the scriptSig of the coinbase at `height` must start with (consensus, bad-cb-launch-id):
+        the height, then the first 16 bytes of the launch id. A coinbase names its launch, so no
+        transaction can exist on two launches and nothing spent on one can be replayed on another."""
+        return push_int(height) + push(self.id[:16])
+
     def genesis_coinbase(self) -> Tx:
         return Tx(version=1, vin=[TxIn(b"\0" * 32, 0xFFFFFFFF, push(self.id), 0xFFFFFFFF)],
                   vout=[TxOut(0, bytes([OP_RETURN]))], locktime=0)

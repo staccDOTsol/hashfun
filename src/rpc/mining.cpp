@@ -22,6 +22,7 @@
 #include <crypto/hex_base.h>
 #include <interfaces/types.h>
 #include <key_io.h>
+#include <launchcurve.h>
 #include <net.h>
 #include <netbase.h>
 #include <node/block_template_manager.h>
@@ -738,6 +739,7 @@ static RPCMethod getblocktemplate()
                 {RPCResult::Type::NUM, "height", "The height of the next block"},
                 {RPCResult::Type::STR_HEX, "signet_challenge", /*optional=*/true, "Only on signet"},
                 {RPCResult::Type::STR_HEX, "default_witness_commitment", /*optional=*/true, "a valid witness commitment for the unmodified block template"},
+                {RPCResult::Type::STR_HEX, "launchcoinbase", /*optional=*/true, "hashfun launch chains: the bytes the coinbase scriptSig must start with (the block height, then the launch)"},
                 {RPCResult::Type::OBJ, "creatorfee", /*optional=*/true, "hashfun launch chains: mandatory coinbase output paying the launch creator (not included in coinbasevalue)",
                 {
                     {RPCResult::Type::STR_HEX, "script", "creator scriptPubKey"},
@@ -1070,6 +1072,10 @@ static RPCMethod getblocktemplate()
     result.pushKV("curtime", block_header.GetBlockTime());
     result.pushKV("bits", strprintf("%08x", block_header.nBits));
     result.pushKV("height", pindexPrev->nHeight + 1);
+    if (consensusParams.launch_enabled) {
+        const CScript prefix = CScript() << (pindexPrev->nHeight + 1) << LaunchCoinbaseTag(consensusParams);
+        result.pushKV("launchcoinbase", HexStr(prefix));
+    }
 
     if (consensusParams.signet_blocks) {
         result.pushKV("signet_challenge", HexStr(consensusParams.signet_challenge));

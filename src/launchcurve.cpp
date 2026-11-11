@@ -113,3 +113,8 @@ double LaunchHashesPerCoin(const arith_uint256& w, const Consensus::Params& para
     const double t0 = static_cast<double>(params.launch_virtual_tokens);
     return (v0 + wd) * (v0 + wd) / (t0 * v0) * static_cast<double>(COIN);
 }
+
+std::vector<unsigned char> LaunchCoinbaseTag(const Consensus::Params& params)
+{
+    return {params.launch_id.begin(), params.launch_id.begin() + 16};
+}

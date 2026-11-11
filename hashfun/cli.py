@@ -335,6 +335,8 @@ def _check_mints(rpc: RPC, d, upto: int):
         minted = sum(round(v["value"] * D.COIN) for v in blk["tx"][0]["vout"])
         if minted != d.subsidy(work, bits, h):
             raise RuntimeError(f"block {h} minted {minted} units; the rules say {d.subsidy(work, bits, h)}")
+        if not blk["tx"][0]["vin"][0]["coinbase"].startswith(d.coinbase_prefix(h).hex()):
+            raise RuntimeError(f"block {h}: its coinbase does not start with the height and this launch's id")
         work += D.work_from_bits(bits)
 
 

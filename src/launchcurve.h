@@ -10,6 +10,7 @@
 #include <consensus/params.h>
 
 #include <cstdint>
+#include <vector>
 
 class CBlockIndex;
 
@@ -47,6 +48,13 @@ CAmount LaunchCreatorFee(CAmount subsidy, const Consensus::Params& params);
 int LaunchGraduationHeight(const CBlockIndex* tip, const Consensus::Params& params);
 /** Total tail subsidy minted in heights [from, to]. */
 CAmount LaunchTailMinted(int from_height, int to_height, const Consensus::Params& params);
+/**
+ * What every coinbase of a launch pushes in its scriptSig right after the block height: the first
+ * 16 bytes of the launch id. No transaction can then exist on two launches (a coinbase names its
+ * launch, and everything else descends from coinbases), so nothing spent on one launch can be
+ * replayed on another, however alike the two are.
+ */
+std::vector<unsigned char> LaunchCoinbaseTag(const Consensus::Params& params);
 /** Hashes per whole coin at relative work w (double, for display). */
 double LaunchHashesPerCoin(const arith_uint256& w, const Consensus::Params& params);
 
