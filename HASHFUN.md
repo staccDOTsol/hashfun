@@ -71,6 +71,8 @@ Every launch has one; there is a single kind of coin. A curve block owes real BT
 | Prove | `OP_RETURN "HFP1"<proof>`: merkle proof of the payment in a relayed Bitcoin block with `btc_confs` confirmations. Invalid proofs and headers are ignored, never block-invalidating |
 | Lock | a curve coinbase cannot be spent until settled (`bad-txns-unsettled-coinbase`, mempool and consensus); unsettled `settle_deadline` blocks after minting, it never can |
 
+`settle_deadline` defaults to 720 blocks in the descriptor format; `hashfun launch new` and the launch form set it to one day of blocks when the sats leg follows real Bitcoin, where a confirmation can take an hour.
+
 HFH1/HFP1/HFY1 outputs are honoured in coinbases too, so a miner with no spendable coins can relay headers and settle from its own next block. RPCs: `getmintobligation <height>` (owed, payee, tag, candidates, script to pay), `getbtcrelay`. State lives in memory (`src/launchyieldstate.cpp`) and is rebuilt from blocks; pruned nodes are not supported with a sats leg.
 
 ## Descriptor

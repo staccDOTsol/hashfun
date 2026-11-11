@@ -492,6 +492,11 @@ def make(name: str, ticker: str, creator_script: bytes, graduation_hashes: int, 
     elif d.btc_regtest:  # anchor at the regtest genesis
         d.btc_anchor_header = REGTEST_GENESIS_HEADER
     d.creator_btc_script = creator_btc_script or (TEST_BTC_SCRIPT if d.btc_regtest else b"")
+    if not d.btc_regtest:
+        # A payment needs a Bitcoin confirmation before its proof counts. An hour of launch blocks
+        # (the parser default) is too tight for real Bitcoin, where one block can take that long
+        # and a low fee longer: give miners a day.
+        d.settle_deadline = max(d.settle_deadline, 86400 // target_spacing)
     if sats_total is not None:
         set_sats_total(d, sats_total)
     elif d.btc_regtest:
