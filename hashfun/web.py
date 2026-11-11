@@ -43,10 +43,14 @@ class CoinIndex:
     """What the site shows about one launch, kept current from its node: recent blocks with what
     each owed and whom it paid, who holds the coins, the price history."""
 
-    def __init__(self, ticker: str, rpc: RPC, d: D.Launch, btc_hrp: str):
+    def __init__(self, ticker: str, rpc: RPC, d: D.Launch, btc_hrp: str, refused: Optional[str] = None):
         self.ticker, self.rpc, self.d, self.btc_hrp = ticker, rpc, d, btc_hrp
         self.lock = threading.RLock()
-        self.info, self.error = None, "starting"
+        # refused: why the site does not serve this launch (its Bitcoin anchor is not what the site's
+        # Bitcoin node has). Nothing is read from its node then; it has no height, so it is on no
+        # board and in no book, and its own page says why, like a launch that is not running.
+        self.refused = refused
+        self.info, self.error = None, refused or "starting"
         try:  # the picture and blurb, only if they are the ones the launch id commits to
             self.meta = M.check(d)
         except M.MetaError as e:
@@ -69,6 +73,8 @@ class CoinIndex:
         self.bal: Dict[str, int] = {}
 
     def poll(self):
+        if self.refused:
+            return
         try:
             info = self.rpc.getlaunchinfo()
             tip = info["height"]
@@ -120,6 +126,21 @@ class CoinIndex:
         row["final"] = tip - h > 60 and (ob["settled"] or not ob["curve"] or ob["owed"] == 0 or
                                          (ob["draw_known"] and ob.get("pay") == 0) or tip >= ob["deadline_height"])
 
+    def _earns_now(self, h: int, coinbase: bool) -> bool:
+        """Is an output created in block h in the holder draw? All are, except a coinbase whose block
+        owes sats and has neither settled nor been told that nothing is due: it earns from then on."""
+        if not coinbase:
+            return True
+        r = self.rows.get(h, {})
+        return (not r.get("curve")) or not r.get("owed") or bool(r.get("settled")) or \
+            bool(r.get("draw_known") and r.get("pay") == 0)
+
+    def _earning_supply(self) -> int:
+        """What the next holder draw is taken over: the node's own figure."""
+        if self.info and "earning" in self.info:
+            return self.info["earning"]
+        return sum(v for (s, v, h, cb) in self.utxo.values() if self._earns_now(h, cb))
+
     # ---- views
     def sats_leg_per_coin(self, hpc: float) -> float:
         """BTC (sats) the miner of one whole coin owes at this point of the curve."""
@@ -147,7 +168,7 @@ class CoinIndex:
                 "sats_total": d.graduation_work * d.sats_num >> d.sats_shift, "paid": paid,
                 "last_block_time": rows[-1]["time"] if rows else d.genesis_time,
                 "hashrate": (recent[-1]["work"] - recent[0]["work"]) / span if span else 0,
-                "target_spacing": d.target_spacing, "creator_fee_bps": d.creator_fee_bps, "earning_supply": sum(self.bal.values()),
+                "target_spacing": d.target_spacing, "creator_fee_bps": d.creator_fee_bps, "earning_supply": self._earning_supply(),
                 "holders": len(self.bal), "error": self.error, **self.meta_json(),
                 "recent": [{"height": r["height"], "time": r["time"], "pay": r["pay"], "pay_to": r.get("pay_to")}
                            for r in rows if r.get("settled") and r.get("pay") and r.get("payee") == "holder"][-6:],
@@ -173,13 +194,35 @@ class CoinIndex:
         with self.lock:
             tip = len(self.hashes) - 1
             utxos = [{"txid": k.split(":")[0], "vout": int(k.split(":")[1]), "value": v, "height": h,
-                      "spendable": not cb or (tip - h >= 99 and self.rows[h].get("spendable", False))}
+                      "spendable": not cb or (tip - h >= 99 and self.rows[h].get("spendable", False)),
+                      "earning": self._earns_now(h, cb)}
                      for k, (s, v, h, cb) in self.utxo.items() if s == script_hex]
-            return {"balance": sum(u["value"] for u in utxos), "utxos": utxos, "earning_supply": sum(self.bal.values()),
+            return {"balance": sum(u["value"] for u in utxos), "utxos": utxos,
+                    "earning": sum(u["value"] for u in utxos if u["earning"]), "earning_supply": self._earning_supply(),
                     "height": tip}
 
     def spendable(self, script_hex: str) -> int:
         return sum(u["value"] for u in self.address(script_hex)["utxos"] if u["spendable"])
+
+
+class _Asked:
+    """A Bitcoin RPC handle that remembers whether a call through it failed. descriptor.check_anchor
+    reports "the anchor is wrong" and "the node did not answer" the same way, and to a site that
+    keeps running only the first is a verdict."""
+
+    def __init__(self, rpc):
+        self._rpc, self.failed = rpc, False
+
+    def __getattr__(self, name):
+        fn = getattr(self._rpc, name)
+
+        def call(*args):
+            try:
+                return fn(*args)
+            except Exception:
+                self.failed = True
+                raise
+        return call
 
 
 class Site:
@@ -194,6 +237,10 @@ class Site:
         self.btc_chain = chain
         self.btc_hrp, self.btc_p2pkh, self.btc_p2sh = BTC_NETS.get(chain, BTC_NETS["main"])
         self.coins: Dict[str, CoinIndex] = {}
+        # Launches whose Bitcoin anchor this site's Bitcoin node could not be asked about yet
+        # (ticker -> when it was last asked): not served until it can, asked again every anchor_retry s.
+        self.anchor_asked: Dict[str, float] = {}
+        self.anchor_retry = 30.0
         self.scan_lock = threading.Lock()
         self.lock = threading.RLock()
         # Sats behind bids: confirmed sats at each bidder's key, from one UTXO-set scan for all of
@@ -260,14 +307,53 @@ class Site:
                 return c.spendable("0014" + hash160(bytes.fromhex(maker)).hex())
         return 0
 
+    def anchor_problem(self, d: D.Launch) -> Optional[str]:
+        """Is the launch's Bitcoin anchor the block at that height on this site's own Bitcoin node,
+        with the right difficulty-period start (descriptor.check_anchor)? None: yes. Text: no, and
+        why. LookupError: the node cannot say now (it does not answer, or has not synced that far).
+
+        The site shows what each block owes and whom it paid on the Bitcoin its own node follows, and
+        tells people how to mine. A launch anchored anywhere else (another network, a made-up header,
+        a wrong period start) cannot be settled from that chain: people who mine it lose their coins."""
+        asked = _Asked(self.btc)
+        try:
+            tip = asked.getblockcount()
+        except Exception as e:  # noqa: BLE001
+            raise LookupError(f"the Bitcoin node does not answer: {e}")
+        if d.btc_anchor_height > tip:
+            raise LookupError(f"the launch is anchored at Bitcoin block {d.btc_anchor_height} and the Bitcoin node is at "
+                              f"{tip} (still syncing, or another network)")
+        try:
+            D.check_anchor(d, asked)
+        except D.DescriptorError as e:
+            if asked.failed:
+                raise LookupError(str(e))
+            return str(e)
+        return None
+
     def refresh(self):
         """Pick up launches registered since the last call, then poll each one."""
         for t in sorted(self.reg.data):
             if t not in self.coins:
+                if time.time() - self.anchor_asked.get(t, -1e18) < self.anchor_retry:
+                    continue  # its Bitcoin anchor could not be checked a moment ago: not yet again
                 rpc = self.reg.rpc(t, timeout=20)
                 if rpc:
+                    d = self.reg.desc(t)
+                    # Once per launch, before it is served: launches the form made here pass by
+                    # construction, one registered from somebody's file (`hashfun node add`) may not.
+                    try:
+                        refused = self.anchor_problem(d)
+                    except LookupError as e:
+                        if t not in self.anchor_asked:
+                            log.warning("%s: not served until its Bitcoin anchor can be checked: %s", t, e)
+                        self.anchor_asked[t] = time.time()
+                        continue
+                    self.anchor_asked.pop(t, None)
+                    if refused:
+                        log.warning("%s: not served: %s", t, refused)
                     with self.lock:
-                        self.coins[t] = CoinIndex(t, rpc, self.reg.desc(t), self.btc_hrp)
+                        self.coins[t] = CoinIndex(t, rpc, d, self.btc_hrp, refused=refused)
         for c in list(self.coins.values()):
             c.poll()
 
@@ -293,7 +379,12 @@ class Site:
 
     # ---- chain access for the browser (same shape for Bitcoin and every launch)
     def chain_rpc(self, chain: str) -> RPC:
-        return self.btc if chain == "btc" else self.coin(chain).rpc
+        if chain == "btc":
+            return self.btc
+        c = self.coin(chain)
+        if c.refused:
+            raise ValueError(f"{chain} is not served here: {c.refused}")
+        return c.rpc
 
     def txout(self, chain: str, txid: str, vout: int):
         o = self.chain_rpc(chain).gettxout(txid, vout, True)
@@ -337,6 +428,8 @@ class Site:
         if not self.maker:
             raise ValueError("no maker is running on this site")
         side, ticker = q.get("side", "buy"), q["ticker"]
+        if ticker in self.coins and self.coins[ticker].refused:
+            raise ValueError(f"{ticker} is not served here: {self.coins[ticker].refused}")
         if ticker not in self.maker.forks:
             raise ValueError(f"the maker on this site does not trade ${ticker} yet")
         if "sats" in q:  # "spend this much BTC": size the order at the current price
@@ -521,7 +614,8 @@ def serve(site: Site, host: str, port: int) -> ThreadingHTTPServer:
 def main(argv=None):
     from .cli import Registry
     ap = argparse.ArgumentParser(prog="hashfun web", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--btc-rpc", required=True, help="Bitcoin Core RPC URL (reads, broadcasts, header anchor for new launches)")
+    ap.add_argument("--btc-rpc", required=True, help="Bitcoin Core RPC URL (reads, broadcasts, header anchor for new launches; "
+                                                     "a registered launch is served only if its Bitcoin anchor is on this node's chain)")
     ap.add_argument("--btc-cookie")
     ap.add_argument("--listen", default="127.0.0.1:8080")
     ap.add_argument("--maker", help="maker config JSON: run a swap maker in this process")

@@ -1,7 +1,9 @@
 """hashfun: one command for the whole stack.
 
   hashfun launch new ...            create a coin (descriptor + genesis); `launch info` to inspect
-  hashfun node add <descriptor>     register a launch on this machine (--peer host:port of a node to join)
+  hashfun node add <descriptor>     register a launch on this machine (--peer host:port of a node to join;
+                                    --btc-rpc URL first asks your Bitcoin node whether the launch's Bitcoin
+                                    anchor is true, as `hashfun mine` does before its first block)
   hashfun node up [TICKER ...]      start a hashfund node per launch (all registered if none named);
                                     --first for the first node of a new launch (it has no peers yet)
   hashfun node ls                   height, curve progress, graduation, peers
@@ -118,6 +120,21 @@ def free_port() -> int:
     return p
 
 
+def check_btc_anchor(d: D.Launch, btc, what: str):
+    """Stop (exit, with the reason) unless the Bitcoin node `btc` says the launch's Bitcoin anchor is
+    true: the header of the block at that height on its chain, with the right difficulty-period start.
+
+    The launch's whole view of Bitcoin grows from that anchor. On a wrong one, payments made on the
+    real chain can never be proven on the launch, and every curve coinbase that owes sats is lost; a
+    wrong period start works for up to two weeks and then fails the same way. So the tools ask before
+    they register a launch from a file (given a Bitcoin node) and before they mine one, and they
+    treat a Bitcoin node that does not answer as not having said yes. Once per launch per run."""
+    try:
+        D.check_anchor(d, btc)
+    except D.DescriptorError as e:
+        sys.exit(f"{what}: {e}")
+
+
 class Registry:
     """launches.json: ticker -> {descriptor, datadir, rpcport}."""
 
@@ -134,13 +151,18 @@ class Registry:
             json.dump(self.data, f, indent=1)
         os.replace(tmp, self.path)
 
-    def add(self, descriptor_path: str, peers=(), p2p_port: Optional[int] = None) -> str:
+    def add(self, descriptor_path: str, peers=(), p2p_port: Optional[int] = None, btc=None) -> str:
+        """Register a launch file. btc: a Bitcoin RPC of the network the launch follows; with it the
+        launch's Bitcoin anchor is checked against that node first (see check_btc_anchor), and a
+        launch that fails is not registered."""
         d = D.load(descriptor_path)
         try:
             from .meta import MetaError, check
             check(d)  # a picture that is not the one the launch id commits to: refuse the file
         except MetaError as e:
             sys.exit(f"{descriptor_path}: {e}")
+        if btc is not None:
+            check_btc_anchor(d, btc, descriptor_path)
         base = os.path.join(home(), "launches", f"{d.ticker}-{d.id_hex[:8]}")
         os.makedirs(base, exist_ok=True)
         dst = os.path.join(base, "descriptor.json")
@@ -240,7 +262,16 @@ class Registry:
 
 def cmd_node(a, reg: Registry):
     if a.node_cmd == "add":
-        t = reg.add(a.descriptor, a.peer, a.p2p_port)
+        btc = None
+        if a.btc_rpc:
+            try:
+                btc = RPC(a.btc_rpc, cookie_file=a.btc_cookie)
+            except Exception as e:  # noqa: BLE001  (a URL that is not one, a cookie file that is not there)
+                sys.exit(f"--btc-rpc: {e}")
+        else:
+            print("note: the launch's Bitcoin anchor was not checked (no --btc-rpc URL of a Bitcoin node). "
+                  "`hashfun mine` checks it before it mines.", file=sys.stderr)
+        t = reg.add(a.descriptor, a.peer, a.p2p_port, btc=btc)
         print(json.dumps({"registered": t, **{k: v for k, v in reg.get(t).items()}}, indent=2))
     elif a.node_cmd == "up":
         extra = list(a.arg) + (["-minewithoutpeers"] if a.first else [])
@@ -494,6 +525,16 @@ def build_source(reg: Registry, ticker: str, payout: Optional[str], btc_rpc: Opt
     rpc = reg.rpc(ticker)
     if not rpc:
         sys.exit(f"{ticker} is not running: hashfun node up {ticker}")
+    # Every curve block owes Bitcoin, so mining always needs a funded Bitcoin wallet.
+    if not btc_rpc:
+        sys.exit("pass --btc-rpc URL of a funded Bitcoin Core wallet (http://user:pass@host:port, plus "
+                 "--btc-wallet NAME): each block mined on the curve owes sats, paid and proven automatically")
+    btc = RPC(btc_rpc, cookie_file=btc_cookie)
+    if btc_wallet:
+        btc = btc.wallet(btc_wallet)
+    # Before the first block, and before anything else is touched: this is the Bitcoin node the
+    # sats will be paid through, so its chain must be the one the launch is anchored in.
+    check_btc_anchor(d, btc, ticker)
     children = {}
     for other in sorted(reg.data):
         if other == ticker:
@@ -510,13 +551,6 @@ def build_source(reg: Registry, ticker: str, payout: Optional[str], btc_rpc: Opt
             addr = None
         if addr:  # merge-mined rewards need somewhere to go on that chain
             children[other] = {"rpc": orpc, "hrp": od.hrp, "payout": addr}
-    # Every curve block owes Bitcoin, so mining always needs a funded Bitcoin wallet.
-    if not btc_rpc:
-        sys.exit("pass --btc-rpc URL of a funded Bitcoin Core wallet (http://user:pass@host:port, plus "
-                 "--btc-wallet NAME): each block mined on the curve owes sats, paid and proven automatically")
-    btc = RPC(btc_rpc, cookie_file=btc_cookie)
-    if btc_wallet:
-        btc = btc.wallet(btc_wallet)
     settler = Settler(rpc, btc, os.path.join(os.path.dirname(reg.get(ticker)["descriptor"]), "settler.json"),
                       max_pay_sats=max_pay_sats, pay_depth=pay_depth)
     return LaunchSource(rpc, d.hrp, d.ticker, default_payout=payout, children=children, settler=settler,
@@ -575,6 +609,9 @@ def main(argv=None):
     p.add_argument("descriptor")
     p.add_argument("--peer", action="append", default=[], help="host:port of a node of this launch to connect to")
     p.add_argument("--p2p-port", type=int, help="listen here instead of the launch's own port")
+    p.add_argument("--btc-rpc", help="Bitcoin Core RPC URL: before registering, check that the launch's Bitcoin anchor is "
+                                     "the block at that height on this node's chain (do this for a launch file you were given)")
+    p.add_argument("--btc-cookie", help="Bitcoin Core .cookie file, if the URL has no user:pass")
     for name in ("up", "down", "ls"):
         p = n.add_parser(name)
         p.add_argument("tickers", nargs="*")
@@ -590,7 +627,8 @@ def main(argv=None):
     p.add_argument("ticker")
     p.add_argument("--payout", required=True, help="launch address that receives the coinbase")
     p.add_argument("--btc-address", help="send this miner's BTC yield here instead of to its launch key")
-    p.add_argument("--btc-rpc", required=True, help="Bitcoin Core RPC URL of a funded wallet (pays the sats each block owes)")
+    p.add_argument("--btc-rpc", required=True, help="Bitcoin Core RPC URL of a funded wallet (pays the sats each block owes); "
+                                                    "mining does not start unless the launch's Bitcoin anchor is on its chain")
     p.add_argument("--btc-cookie", help="Bitcoin Core .cookie file, if the URL has no user:pass")
     p.add_argument("--btc-wallet", help="Bitcoin Core wallet name")
     p.add_argument("--btc-hrp", default="bc")

@@ -319,7 +319,7 @@ function coin(view, ticker) {
   };
   const paintBag = () => {
     if (!W.pub) return bag.replaceChildren(h('div', { class: 'bag pad col' }, h('span', { class: 'lab' }, 'Your bag'), h('p', { class: 'soft' }, 'Connect to see your bag and your odds.'), h('button', { class: 'ghost', type: 'button', onclick: () => connect(true).then(route).catch((e) => toast(e.message, true)) }, 'Connect UniSat')));
-    const bal = me ? me.balance : 0, odds = me && me.earning_supply ? (bal / me.earning_supply) * 0.8 : 0, won = Date.now() - wonAt < 6000;
+    const bal = me ? me.balance : 0, odds = me && me.earning_supply ? ((me.earning ?? bal) / me.earning_supply) * 0.8 : 0, won = Date.now() - wonAt < 6000;
     bag.replaceChildren(h('div', { class: 'bag pad col' + (won ? ' won' : '') }, h('div', { class: 'between lab' }, 'Your bag', h('span', null, short(launchAddr(ticker)))),
       won ? h('div', { class: 'd', style: 'font-size:48px;line-height:.95' }, 'You won') : h('div', null, h('div', { class: 'm muted', style: 'font-size:12px' }, d && d.graduated ? 'Payouts ended at graduation' : 'Your odds, every block'), h('div', { class: 'd l', id: 'odds', style: 'font-size:48px;line-height:.95' }, odds > 0 && !(d && d.graduated) ? '1 in ' + fmt(Math.max(1, Math.round(1 / odds))) : 'none yet')),
       h('div', { class: 'stat' }, 'holding', h('b', { id: 'bal' }, coins(bal) + ' $' + ticker)), h('span', { class: 'muted', style: 'font-size:13px' }, 'Payouts go straight to your key on Bitcoin. Nothing to claim, nothing to stake.')));
