@@ -44,11 +44,23 @@ struct LaunchDescriptor {
     std::vector<unsigned char> creator_script;
     uint16_t creator_fee_bps{0};
     bool test{false};
-    //! Optional anchor: a Bitcoin block that existed when the descriptor was
-    //! made (height + hash as displayed). It is hashed into the launch id, so
-    //! no block of this chain can predate that Bitcoin block. All-zero = none.
+    //! Optional anchor: a Bitcoin block header that existed when the descriptor
+    //! was made. It is hashed into the launch id, so no block of this chain can
+    //! predate that Bitcoin block, and it is the checkpoint the in-chain
+    //! Bitcoin header relay starts from. period_time is the timestamp of the
+    //! first block of the anchor's 2016-block difficulty period. All-zero = none.
     uint32_t btc_anchor_height{0};
-    std::array<unsigned char, 32> btc_anchor_hash{};
+    std::array<unsigned char, 80> btc_anchor_header{};
+    uint32_t btc_anchor_period_time{0};
+    //! Sats leg: a curve block owes (work * sats_num) >> sats_shift satoshis of
+    //! real BTC, paid on Bitcoin to a drawn recipient (80% holders, 10% creator,
+    //! 10% dev) and proven here before settle_deadline blocks. 0 = hash only.
+    uint64_t sats_num{0};
+    uint32_t sats_shift{0};
+    int64_t sats_min_payment{10000};
+    uint32_t settle_deadline{720};
+    uint32_t btc_confs{1};
+    std::vector<unsigned char> creator_btc_script;
 
     // Not part of the launch id.
     uint16_t p2p_port{0};

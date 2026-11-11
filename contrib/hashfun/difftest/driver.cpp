@@ -17,6 +17,7 @@
 #include <kernel/chainparams.h>
 #include <kernel/launch.h>
 #include <launchcurve.h>
+#include <launchyield.h>
 #include <pow.h>
 #include <auxpow.h>
 #include <primitives/block.h>
@@ -203,6 +204,116 @@ UniValue AuxPow(const UniValue& req)
     return r;
 }
 
+uint256 RawHash(const UniValue& v)
+{
+    const auto b = ParseHex(v.get_str());
+    if (b.size() != 32) throw std::runtime_error("expected 32 bytes");
+    uint256 h;
+    std::copy(b.begin(), b.end(), h.begin());
+    return h;
+}
+
+std::string RawHex(const uint256& h) { return HexStr(std::span<const unsigned char>{h.begin(), 32}); }
+
+/** {"op":"yield","work":hex,"num":n,"shift":n,"min":n,"id":raw32,"seed_block":raw32,"mint_block":raw32,"total":hex} */
+UniValue Yield(const UniValue& req)
+{
+    using namespace launchyield;
+    UniValue r(UniValue::VOBJ);
+    const arith_uint256 work = UintToArith256(*uint256::FromHex(req["work"].get_str()));
+    const CAmount owed = Owed(work, req["num"].getInt<uint64_t>(), req["shift"].getInt<uint32_t>());
+    const uint256 id = RawHash(req["id"]);
+    const uint256 seed = DrawSeed(id, RawHash(req["seed_block"]));
+    const Draw d = ComputeDraw(owed, req["min"].getInt<int64_t>(), seed);
+    r.pushKV("owed", owed);
+    r.pushKV("seed", RawHex(seed));
+    r.pushKV("pay", d.pay);
+    r.pushKV("payee", static_cast<int>(d.payee));
+    r.pushKV("tag", HexStr(PayTag(id, RawHash(req["mint_block"]))));
+    const arith_uint256 total = UintToArith256(*uint256::FromHex(req["total"].get_str()));
+    UniValue pts(UniValue::VARR);
+    if (total != 0) {
+        for (int i = 0; i < MAX_CANDIDATES; ++i) pts.push_back(Hex256(CandidatePoint(seed, i, total)));
+    }
+    r.pushKV("points", std::move(pts));
+    return r;
+}
+
+/** {"op":"regouts","tx":hex} */
+UniValue RegOuts(const UniValue& req)
+{
+    UniValue r(UniValue::VOBJ), outs(UniValue::VARR);
+    CMutableTransaction mtx;
+    DataStream ss{ParseHex(req["tx"].get_str())};
+    ss >> TX_WITH_WITNESS(mtx);
+    for (const auto& o : launchyield::RegisteredOutputs(CTransaction{mtx})) {
+        UniValue e(UniValue::VARR);
+        e.push_back(static_cast<int64_t>(o.vout));
+        e.push_back(o.value);
+        e.push_back(HexStr(o.btc_script));
+        outs.push_back(std::move(e));
+    }
+    r.pushKV("outs", std::move(outs));
+    return r;
+}
+
+/** {"op":"proof","payload":hex,"root":raw32,"tag":hex20,"recipient":hex,"pay":n} */
+UniValue Proof(const UniValue& req)
+{
+    UniValue r(UniValue::VOBJ);
+    const auto payload = ParseHex(req["payload"].get_str());
+    const auto proof = launchyield::ParsePaymentProof(payload);
+    r.pushKV("parsed", proof.has_value());
+    if (!proof) return r;
+    std::array<unsigned char, 20> tag;
+    const auto tb = ParseHex(req["tag"].get_str());
+    std::copy(tb.begin(), tb.begin() + 20, tag.begin());
+    std::string err;
+    const bool ok = launchyield::VerifyBtcPayment(*proof, RawHash(req["root"]), tag, ParseHex(req["recipient"].get_str()),
+                                                  req["pay"].getInt<int64_t>(), err);
+    r.pushKV("valid", ok);
+    r.pushKV("error", err);
+    r.pushKV("mint_height", static_cast<int64_t>(proof->mint_height));
+    r.pushKV("btc_block", RawHex(proof->btc_block));
+    r.pushKV("candidate", proof->candidate);
+    return r;
+}
+
+/** {"op":"btc","anchor":hex80,"height":n,"period_time":n,"regtest":bool,"ops":[["add",hex80]|["del",raw32]|["conf",raw32]]} */
+UniValue Btc(const UniValue& req)
+{
+    launchyield::BtcChain chain;
+    CPureBlockHeader anchor;
+    {
+        DataStream ss{ParseHex(req["anchor"].get_str())};
+        ss >> anchor;
+    }
+    chain.Init(anchor, req["height"].getInt<int>(), req["period_time"].getInt<uint32_t>(), req["regtest"].get_bool());
+    UniValue res(UniValue::VARR);
+    for (const UniValue& op : req["ops"].getValues()) {
+        const std::string& kind = op[0].get_str();
+        if (kind == "add") {
+            CPureBlockHeader h;
+            DataStream ss{ParseHex(op[1].get_str())};
+            ss >> h;
+            std::string err;
+            chain.Accept(h, err);
+            res.push_back(err);
+        } else if (kind == "del") {
+            chain.Remove(RawHash(op[1]));
+            res.push_back("");
+        } else {
+            res.push_back(chain.Confirmations(RawHash(op[1])));
+        }
+    }
+    UniValue r(UniValue::VOBJ);
+    r.pushKV("results", std::move(res));
+    r.pushKV("best", RawHex(chain.Best()));
+    r.pushKV("best_height", chain.BestHeight());
+    r.pushKV("size", static_cast<int64_t>(chain.Size()));
+    return r;
+}
+
 } // namespace
 
 int main()
@@ -214,7 +325,8 @@ int main()
             if (!req.read(line)) throw std::runtime_error("bad request json");
             const std::string& op = req["op"].get_str();
             out = op == "desc" ? Desc(req) : op == "chain" ? Chain(req) : op == "tail" ? Tail(req) :
-                  op == "auxpow" ? AuxPow(req) : UniValue{};
+                  op == "auxpow" ? AuxPow(req) : op == "yield" ? Yield(req) : op == "regouts" ? RegOuts(req) :
+                  op == "proof" ? Proof(req) : op == "btc" ? Btc(req) : UniValue{};
             if (out.isNull()) throw std::runtime_error("unknown op " + op);
         } catch (const std::exception& e) {
             out = UniValue(UniValue::VOBJ);

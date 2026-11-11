@@ -22,6 +22,7 @@ COIN = 100_000_000
 SEED = int(os.environ.get("HFDIFF_SEED", "1"))
 N = int(os.environ.get("HFDIFF_N", "40"))
 DELETE = object()
+SATS = {"sats_num": 5, "sats_shift": 3, "btc_anchor_header": "ab" * 80, "creator_btc_script": "0014" + "22" * 20}
 
 
 class Driver:
@@ -62,9 +63,12 @@ def launch(rng, easy=True, **kw):
         ftl=rng.choice([1, 300, 7200]), tail_reward=tail, tail_halving_interval=ihl if tail else rng.choice([0, ihl]),
         creator_script=script, creator_fee_bps=rng.choice([0, 1, 100, 1000]) if script else 0,
         test=rng.random() < 0.5,
-        **rng.choice([{}, {}, {"btc_anchor_height": rng.randrange(1, 2**32),
-                               "btc_anchor_hash": "%064x" % rng.randrange(1, 2**256)},
-                      {"btc_anchor_hash": "%064X" % rng.randrange(1, 2**224)}]),
+        **rng.choice([{}, {}, {"btc_anchor_height": rng.randrange(1, 2**32), "btc_anchor_period_time": rng.randrange(2**32),
+                               "btc_anchor_header": rng.randbytes(80)},
+                      {"btc_anchor_header": rng.randbytes(80), "sats_num": rng.randrange(1, 2**62),
+                       "sats_shift": rng.randrange(129), "sats_min_payment": rng.choice([546, 10_000, 10**8]),
+                       "settle_deadline": rng.choice([110, 720, 10**6]), "btc_confs": rng.choice([1, 6, 100]),
+                       "creator_btc_script": rng.randbytes(rng.choice([1, 22, 34, 80]))}]),
         p2p_port=rng.choice([0, 0, 18444]), rpc_port=rng.choice([0, 0, 18445]),
     )
     base.update(kw)
@@ -179,11 +183,19 @@ class DiffCpp(unittest.TestCase):
             {"test": "yes"}, {"test": 1}, {"test": False},
             {"p2p_port": 65536}, {"p2p_port": -1}, {"p2p_port": 1}, {"seeds": "x"}, {"seeds": ["a:1", "b"]},
             {"foo": 1}, {"secret_prefix": 300},
-            {"btc_anchor_height": 5}, {"btc_anchor_height": 5, "btc_anchor_hash": "00" * 32},
-            {"btc_anchor_height": 5, "btc_anchor_hash": "ab" * 32}, {"btc_anchor_hash": "AB" * 32},
-            {"btc_anchor_hash": "ab" * 31}, {"btc_anchor_hash": "ab" * 33}, {"btc_anchor_hash": "zz" * 32},
-            {"btc_anchor_hash": " " + "ab" * 31 + "a"}, {"btc_anchor_hash": 5}, {"btc_anchor_hash": None},
-            {"btc_anchor_hash": "0x" + "ab" * 31}, {"btc_anchor_height": 2**32}, {"btc_anchor_height": "7"}, {"name": 5}, {"hrp": 5}, {"creator_script": 0},
+            {"btc_anchor_height": 5}, {"btc_anchor_period_time": 5}, {"btc_anchor_height": 5, "btc_anchor_header": "00" * 80},
+            {"btc_anchor_height": 5, "btc_anchor_header": "ab" * 80}, {"btc_anchor_header": "AB" * 80},
+            {"btc_anchor_header": "ab" * 79}, {"btc_anchor_header": "ab" * 81}, {"btc_anchor_header": "zz" * 80},
+            {"btc_anchor_header": " " + "ab" * 79 + "a"}, {"btc_anchor_header": 5}, {"btc_anchor_header": None},
+            {"btc_anchor_header": ""}, {"sats_num": 1}, {"sats_num": 1, "btc_anchor_header": "ab" * 80},
+            {**SATS}, {**SATS, "sats_num": 2**62}, {**SATS, "sats_num": 2**62 + 1}, {**SATS, "sats_shift": 128},
+            {**SATS, "sats_shift": 129}, {**SATS, "sats_min_payment": 545}, {**SATS, "sats_min_payment": 546},
+            {**SATS, "settle_deadline": 109}, {**SATS, "settle_deadline": 110}, {**SATS, "settle_deadline": 10**6 + 1},
+            {**SATS, "btc_confs": 0}, {**SATS, "btc_confs": 100}, {**SATS, "btc_confs": 101},
+            {**SATS, "creator_btc_script": ""}, {**SATS, "creator_btc_script": "5"}, {**SATS, "creator_btc_script": "51" * 81},
+            {**SATS, "creator_btc_script": "51" * 80}, {**SATS, "creator_btc_script": "5 1"}, {**SATS, "creator_btc_script": None},
+            {"sats_min_payment": 1}, {"btc_confs": 0}, {"creator_btc_script": "51"},
+            {"btc_anchor_height": 2**32}, {"btc_anchor_height": "7"}, {"name": 5}, {"hrp": 5}, {"creator_script": 0},
             {"virtual_work": "0x"}, {"virtual_work": "0x" + "0" * 64}, {"virtual_work": "0x" + "0" * 63 + "5"},
             {"virtual_work": "0x" + "0" * 65}, {"virtual_work": ""}, {"virtual_work": "+5"}, {"virtual_work": "5.0"},
             {"genesis_time": "0x"}, {"genesis_time": "0x10"}, {"genesis_time": "0X10"}, {"genesis_time": "+5"},
@@ -358,6 +370,246 @@ class DiffCpp(unittest.TestCase):
             if m in (None, "early_root_no_magic", "nonce"):
                 continue  # "nonce": a wrong nonce lands on the right slot whenever the tree has one leaf
             self.assertNotIn("ok", stages, m)
+
+    # ------------------------------------------------------------ sats leg (launchyield.cpp)
+    def test_yield_draw(self):
+        from hashfun import yieldmodel as Y
+        rng = random.Random(SEED + 6)
+        for i in range(max(200, N * 5)):
+            work = rng.choice([0, 1, 2, rng.randrange(2**40), rng.randrange(2**80), rng.randrange(2**200), 2**256 - 1])
+            num = rng.choice([0, 1, rng.randrange(1, 2**62), 2**62])
+            shift = rng.choice([0, 1, 20, 64, 80, 128])
+            mn = rng.choice([546, 10_000, 10**8])
+            lid, sb, mb = rng.randbytes(32), rng.randbytes(32), rng.randbytes(32)
+            total = rng.choice([0, 1, 7, rng.randrange(1, 2**64), rng.randrange(1, 2**100)])
+            r = self.drv(op="yield", work="%064x" % work, num=num, shift=shift, min=mn, id=lid.hex(), seed_block=sb.hex(),
+                         mint_block=mb.hex(), total="%064x" % total)
+            ow = Y.owed(work, num, shift)
+            seed = Y.draw_seed(lid, sb)
+            pay, payee = Y.compute_draw(ow, mn, seed)
+            self.assertEqual((r["owed"], r["seed"], r["pay"], r["payee"], r["tag"]),
+                             (ow, seed.hex(), pay, payee, Y.pay_tag(lid, mb).hex()), i)
+            self.assertEqual([int(x, 16) for x in r["points"]],
+                             [Y.candidate_point(seed, k, total) for k in range(Y.MAX_CANDIDATES)] if total else [])
+        # The draw is fair: 80/10/10 by class, and small debts pay their expectation.
+        n, cls, paid = 40_000, [0, 0, 0], 0
+        for k in range(n):
+            pay, payee = Y.compute_draw(1234, 10_000, Y.draw_seed(b"\x07" * 32, k.to_bytes(32, "little")))
+            cls[payee] += 1
+            paid += pay
+        self.assertAlmostEqual(cls[0] / n, 0.8, delta=0.01)
+        self.assertAlmostEqual(cls[1] / n, 0.1, delta=0.01)
+        self.assertAlmostEqual(paid / n / 1234, 1.0, delta=0.05)
+
+    def test_registered_outputs(self):
+        from hashfun import yieldmodel as Y
+        from hashfun.ser import Tx, TxIn, TxOut
+        rng = random.Random(SEED + 7)
+        for i in range(max(200, N * 5)):
+            coinbase = rng.random() < 0.3
+            outs = [TxOut(rng.choice([0, 1, 546, 10**8]), rng.choice([b"\x51", b"\x00\x14" + rng.randbytes(20),
+                                                                     b"\x6a\x01\x01", b""]))
+                    for _ in range(rng.randrange(0, 5))]
+            spk = rng.randbytes(rng.choice([1, 22, 34, 80]))
+            tagout = rng.choice([Y.yield_tag_script(spk), Y.yield_tag_script(spk), Y.op_return(b"HFY1"),
+                                 Y.op_return(b"HFY1" + bytes(81)), Y.op_return(b"HFY2" + spk),
+                                 b"\x6a" + Y.push_data(b"HFY1" + spk) + b"\x51", b"\x6a\x4c\x05HFY1\x51",
+                                 b"\x6a\x4d\x05\x00HFY1\x52", b"\x6a", b"\x6a\x05HFY", None])
+            if tagout is not None:
+                outs.insert(rng.randrange(len(outs) + 1), TxOut(0, tagout))
+            if rng.random() < 0.2:
+                outs.append(TxOut(0, Y.yield_tag_script(b"\x99")))  # only the first tag counts
+            vin = [TxIn(b"\0" * 32, 0xFFFFFFFF, b"\x01\x01", 0xFFFFFFFF)] if coinbase else [TxIn(rng.randbytes(32), 0)]
+            tx = Tx(vin=vin, vout=outs or [TxOut(1, b"\x51")])
+            r = self.drv(op="regouts", tx=tx.serialize().hex())
+            self.assertEqual([tuple(x) for x in r["outs"]],
+                             [(v, a, b.hex()) for v, a, b in Y.registered_outputs(tx, coinbase)], (i, tagout))
+
+    def test_btc_payment_proofs(self):
+        from hashfun import yieldmodel as Y
+        from hashfun.crypto import sha256d
+        from hashfun.ser import Tx, TxIn, TxOut, merkle_root
+        rng = random.Random(SEED + 8)
+        mutations = [None] * 6 + ["recipient", "underpay", "tag_pos", "no_tag", "root", "index", "branch", "witness",
+                                  "size64", "truncated", "vout", "tag_other_block", "big_index"]
+        seen = {}
+        for i in range(max(len(mutations) * 4, N)):
+            m = mutations[i % len(mutations)]
+            lid, mint = rng.randbytes(32), rng.randbytes(32)
+            tag = Y.pay_tag(lid, mint)
+            n_pay = rng.randrange(1, 4)
+            k = rng.randrange(n_pay)
+            recips = [rng.choice([b"\x00\x14" + rng.randbytes(20), b"\x51\x20" + rng.randbytes(32)]) for _ in range(n_pay)]
+            pays = [rng.randrange(546, 10**7) for _ in range(n_pay)]
+            tags = [Y.pay_tag(lid, rng.randbytes(32)) for _ in range(n_pay)]
+            tags[k] = tag
+            if m == "tag_pos" and n_pay == 1:
+                tags = [rng.randbytes(20), tag]
+            elif m == "tag_pos":
+                j = (k + 1) % n_pay
+                tags[k], tags[j] = tags[j], tags[k]
+            if m == "tag_other_block":
+                tags[k] = Y.pay_tag(lid, rng.randbytes(32))
+            vout = [TxOut(a, s_) for a, s_ in zip(pays, recips)]
+            if m != "no_tag":
+                vout.append(TxOut(0, Y.payment_outputs_tag(tags)))
+            vout.append(TxOut(rng.randrange(10**6), b"\x00\x14" + rng.randbytes(20)))  # change
+            tx = Tx(version=2, vin=[TxIn(rng.randbytes(32), rng.randrange(4), b"", 0xFFFFFFFD, [rng.randbytes(72), rng.randbytes(33)])],
+                    vout=vout)
+            raw = tx.serialize(witness=(m == "witness"))
+            txid = sha256d(tx.serialize(witness=False))
+            others = [rng.randbytes(32) for _ in range(rng.choice([0, 1, 2, 5, 12]))]
+            pos = rng.randrange(len(others) + 1)
+            txids = others[:pos] + [txid] + others[pos:]
+            # merkle branch for position pos
+            branch, level, idx = [], txids[:], pos
+            while len(level) > 1:
+                if len(level) % 2:
+                    level.append(level[-1])
+                branch.append(level[idx ^ 1])
+                level = [sha256d(level[j] + level[j + 1]) for j in range(0, len(level), 2)]
+                idx >>= 1
+            root = merkle_root(txids)
+            self.assertEqual(level[0], root)
+            recipient, pay = recips[k], pays[k]
+            if m == "recipient":
+                recipient = b"\x00\x14" + rng.randbytes(20)
+            if m == "underpay":
+                pay += 1
+            if m == "root":
+                root = rng.randbytes(32)
+            if m == "branch" and branch:
+                branch[rng.randrange(len(branch))] = rng.randbytes(32)
+            elif m == "branch":
+                branch = [rng.randbytes(32)]
+            proof = Y.PaymentProof(rng.randrange(2**32), rng.randbytes(32), pos, branch, k, rng.randrange(256), raw)
+            if m == "index":
+                proof.tx_index = pos ^ 1 if len(txids) > 1 else 1
+            if m == "big_index":
+                proof.tx_index = pos + (1 << len(branch))
+            if m == "vout":
+                proof.pay_vout = len(vout) + 3
+            if m == "size64":
+                proof.raw_tx = rng.randbytes(64)
+            payload = proof.payload()
+            if m == "truncated":
+                payload = payload[:rng.choice([3, 44, 45, 45 + 32 * len(branch) + 4])]
+            r = self.drv(op="proof", payload=payload.hex(), root=root.hex(), tag=tag.hex(), recipient=recipient.hex(), pay=pay)
+            parsed = Y.PaymentProof.parse(payload)
+            self.assertEqual(r["parsed"], parsed is not None, m)
+            if parsed is None:
+                seen.setdefault(m, set()).add(False)
+                continue
+            ok, why = Y.verify_btc_payment(parsed, root, tag, recipient, pay)
+            self.assertEqual((r["valid"], r["error"]), (ok, why), m)
+            self.assertEqual((r["mint_height"], r["btc_block"], r["candidate"]),
+                             (parsed.mint_height, parsed.btc_block.hex(), parsed.candidate))
+            seen.setdefault(m, set()).add(ok)
+        self.assertEqual(seen[None], {True})
+        for m, v in seen.items():
+            if m is not None and not (m == "index" and True in v):
+                self.assertEqual(v, {False}, m)
+
+    def test_btc_header_chain(self):
+        from hashfun import yieldmodel as Y
+        from hashfun.crypto import sha256d
+        from hashfun.ser import header_bytes
+        import struct
+        rng = random.Random(SEED + 9)
+
+        def mine(prev, time_, bits=0x207FFFFF, valid=True):
+            for n in range(1 << 20):
+                h = header_bytes(0x20000000, prev, rng.randbytes(32), time_, bits, n)
+                if (int.from_bytes(sha256d(h), "little") <= bits_to_target(bits)) == valid:
+                    return h
+
+        for case in range(max(6, N // 10)):
+            anchor = mine(rng.randbytes(32), 1_700_000_000)
+            height = rng.randrange(0, 10**6)
+            model = Y.BtcChain(anchor, height, 0, True)
+            ops, expect, tips = [], [], [sha256d(anchor)]
+            times = {sha256d(anchor): 1_700_000_000}
+            for _ in range(rng.randrange(20, 60)):
+                kind = rng.choice(["add"] * 8 + ["bad_bits", "bad_pow", "bad_time", "orphan", "dup", "del", "conf", "conf"])
+                parent = rng.choice(tips[-4:])
+                if kind == "add":
+                    h = mine(parent, times[parent] + rng.randrange(1, 900))
+                elif kind == "bad_bits":
+                    h = mine(parent, times[parent] + 600, bits=0x207FFFFE)
+                elif kind == "bad_pow":
+                    h = mine(parent, times[parent] + 600, valid=False)
+                elif kind == "bad_time":
+                    h = mine(parent, times[parent] - rng.randrange(0, 5000))
+                elif kind == "orphan":
+                    h = mine(rng.randbytes(32), 1_800_000_000)
+                elif kind == "dup":
+                    h = None
+                if kind in ("del", "conf"):
+                    target = rng.choice(tips)
+                    ops.append([kind, target.hex()])
+                    if kind == "del":
+                        model.remove(target)
+                        expect.append("")
+                        if target not in model.nodes:
+                            tips.remove(target)
+                    else:
+                        expect.append(model.confirmations(target))
+                    continue
+                if kind == "dup":
+                    known = [k for k in tips if k != model.anchor]
+                    if not known:
+                        continue
+                    hh = rng.choice(known)
+                    ops.append(["add", self._hdr_cache[hh].hex()])
+                    expect.append(model.accept(self._hdr_cache[hh])[1])
+                    continue
+                ok, why = model.accept(h)
+                ops.append(["add", h.hex()])
+                expect.append(why)
+                if ok:
+                    tips.append(sha256d(h))
+                    times[sha256d(h)] = struct.unpack("<I", h[68:72])[0]
+                    self._hdr_cache[sha256d(h)] = h
+            r = self.drv(op="btc", anchor=anchor.hex(), height=height, period_time=0, regtest=True, ops=ops)
+            self.assertEqual(r["results"], expect, case)
+            self.assertEqual((r["best"], r["best_height"], r["size"]),
+                             (model.best.hex(), model.nodes[model.best].height, len(model.nodes)))
+            self.assertGreater(len(model.nodes), 5)
+
+    _hdr_cache = {}
+
+    def test_btc_retarget(self):
+        from hashfun import yieldmodel as Y
+        from hashfun.ser import header_bytes
+        from hashfun.crypto import sha256d
+        rng = random.Random(SEED + 10)
+
+        def expected(prev_bits, prev_time, period_time, anchor_height):
+            anchor = header_bytes(1, bytes(32), bytes(32), prev_time, prev_bits, 0)
+            return anchor, Y.BtcChain(anchor, anchor_height, period_time, False)
+
+        # Bitcoin's first retarget (block 32256): 0x1d00ffff -> 0x1d00d86a.
+        anchor, chain = expected(0x1D00FFFF, 1262152739, 1261130161, 32255)
+        self.assertEqual(chain.expected_bits(chain.nodes[chain.anchor]), 0x1D00D86A)
+        for i in range(max(100, N * 2)):
+            bits = rng.choice([0x1D00FFFF, 0x1B0404CB, 0x170331DB, 0x1702C4E4, 0x1C0FFFFF])
+            t1 = rng.randrange(1_300_000_000, 1_900_000_000)
+            t0 = t1 - rng.choice([1, 1209600, 302400, 302399, 4838400, 4838401, rng.randrange(1, 6_000_000), -500])
+            boundary = rng.random() < 0.7
+            height = 2016 * rng.randrange(1, 500) - (1 if boundary else rng.randrange(2, 2016))
+            anchor, chain = expected(bits, t1, t0, height)
+            want = chain.expected_bits(chain.nodes[chain.anchor])
+            if not boundary:
+                self.assertEqual(want, bits)
+            ops = []
+            for cand in (want, want ^ 1, bits):
+                ops.append(["add", header_bytes(1, sha256d(anchor), rng.randbytes(32), t1 + 600, cand, rng.randrange(2**32)).hex()])
+            r = self.drv(op="btc", anchor=anchor.hex(), height=height, period_time=t0 & 0xFFFFFFFF, regtest=False, ops=ops)
+            # Difficulty is checked before proof of work, so an unmined header reveals the expected bits.
+            py = [Y.BtcChain(anchor, height, t0 & 0xFFFFFFFF, False).accept(bytes.fromhex(o[1]))[1] for o in ops]
+            self.assertEqual(r["results"], py, (i, hex(bits), t1 - t0, height))
+            self.assertIn(r["results"][0], ("btc header lacks proof of work", ""))
+            self.assertEqual(r["results"][1], "btc header has wrong difficulty")
 
     def test_tail_minted(self):
         rng = random.Random(SEED + 4)

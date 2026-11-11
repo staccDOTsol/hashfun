@@ -44,8 +44,18 @@ class Launch:
     creator_script: bytes = b""
     creator_fee_bps: int = 0
     test: bool = False
+    # Bitcoin anchor header (hashed into the id: the chain cannot predate it; also the checkpoint
+    # for the in-chain BTC header relay). period_time = time of the first block of its 2016-period.
     btc_anchor_height: int = 0
-    btc_anchor_hash: str = "00" * 32  # as displayed; hashed into the id, so the chain cannot predate it
+    btc_anchor_header: bytes = bytes(80)
+    btc_anchor_period_time: int = 0
+    # Sats leg: a curve block owes (work * sats_num) >> sats_shift sats of real BTC. 0 = hash only.
+    sats_num: int = 0
+    sats_shift: int = 0
+    sats_min_payment: int = 10_000
+    settle_deadline: int = 720
+    btc_confs: int = 1
+    creator_btc_script: bytes = b""
     p2p_port: int = 0
     rpc_port: int = 0
     seeds: List[str] = field(default_factory=list)
@@ -64,7 +74,10 @@ class Launch:
                 u32(self.ftl) + self.virtual_work.to_bytes(32, "big") + struct.pack("<q", self.virtual_tokens) +
                 struct.pack("<q", self.graduation_tokens) + struct.pack("<q", self.tail_reward) +
                 u32(self.tail_halving_interval) + vs(self.creator_script) + struct.pack("<H", self.creator_fee_bps) +
-                bytes([1 if self.test else 0]) + u32(self.btc_anchor_height) + bytes.fromhex(self.btc_anchor_hash))
+                bytes([1 if self.test else 0]) + u32(self.btc_anchor_height) + self.btc_anchor_header +
+                u32(self.btc_anchor_period_time) + struct.pack("<q", self.sats_num) + u32(self.sats_shift) +
+                struct.pack("<q", self.sats_min_payment) + u32(self.settle_deadline) + u32(self.btc_confs) +
+                vs(self.creator_btc_script))
 
     @property
     def id(self) -> bytes:
@@ -232,7 +245,11 @@ class Launch:
             "virtual_tokens": self.virtual_tokens, "graduation_tokens": self.graduation_tokens,
             "tail_reward": self.tail_reward, "tail_halving_interval": self.tail_halving_interval,
             "creator_script": self.creator_script.hex(), "creator_fee_bps": self.creator_fee_bps,
-            "test": self.test, "btc_anchor_height": self.btc_anchor_height, "btc_anchor_hash": self.btc_anchor_hash,
+            "test": self.test, "btc_anchor_height": self.btc_anchor_height,
+            "btc_anchor_header": self.btc_anchor_header.hex(), "btc_anchor_period_time": self.btc_anchor_period_time,
+            "sats_num": self.sats_num, "sats_shift": self.sats_shift, "sats_min_payment": self.sats_min_payment,
+            "settle_deadline": self.settle_deadline, "btc_confs": self.btc_confs,
+            **({"creator_btc_script": self.creator_btc_script.hex()} if self.creator_btc_script else {}),
             **({"p2p_port": self.p2p_port} if self.p2p_port else {}),
             **({"rpc_port": self.rpc_port} if self.rpc_port else {}), "seeds": self.seeds,
         }
@@ -266,6 +283,17 @@ def _int(o: dict, key: str, maxv: int, default: int = 0, required: bool = False)
     if v < 0 or v > maxv:
         raise DescriptorError(f"{key}: out of range")
     return v
+
+
+def _hexbytes(o: dict, key: str, min_len: int, max_len: int, default: bytes) -> bytes:
+    """launch.cpp GetHexBytes: strict hex, min_len..max_len bytes; null/missing keeps the default."""
+    v = o.get(key)
+    if v is None:
+        return default
+    if not isinstance(v, str) or len(v) % 2 or not (2 * min_len <= len(v) <= 2 * max_len) or \
+            not re.fullmatch(r"[0-9a-fA-F]*", v):
+        raise DescriptorError(f"{key}: expected {min_len}..{max_len} bytes of hex")
+    return bytes.fromhex(v)
 
 
 def _str(o: dict, key: str, default: Optional[str] = None) -> str:
@@ -303,11 +331,8 @@ def parse(text_or_obj) -> Launch:
     test = o.get("test")
     if test is not None and not isinstance(test, bool):
         raise DescriptorError("test: expected bool")
-    anchor = o.get("btc_anchor_hash")
-    if anchor is None:
-        anchor = "00" * 32
-    elif not isinstance(anchor, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", anchor):
-        raise DescriptorError("btc_anchor_hash: expected 64 hex characters")
+    anchor = _hexbytes(o, "btc_anchor_header", 80, 80, bytes(80))
+    creator_btc = _hexbytes(o, "creator_btc_script", 1, 80, b"")
     seeds = o.get("seeds")
     if seeds is not None and (not isinstance(seeds, list) or not all(isinstance(x, str) for x in seeds)):
         raise DescriptorError("seeds: expected array of strings")
@@ -329,7 +354,12 @@ def parse(text_or_obj) -> Launch:
         tail_halving_interval=_int(o, "tail_halving_interval", 2**32 - 1),
         creator_script=creator_script,
         creator_fee_bps=_int(o, "creator_fee_bps", 1000),
-        test=bool(test), btc_anchor_height=_int(o, "btc_anchor_height", 2**32 - 1), btc_anchor_hash=anchor.lower(),
+        test=bool(test), btc_anchor_height=_int(o, "btc_anchor_height", 2**32 - 1), btc_anchor_header=anchor,
+        btc_anchor_period_time=_int(o, "btc_anchor_period_time", 2**32 - 1),
+        sats_num=_int(o, "sats_num", 2**62), sats_shift=_int(o, "sats_shift", 128),
+        sats_min_payment=_int(o, "sats_min_payment", MAX_MONEY, 10_000),
+        settle_deadline=_int(o, "settle_deadline", 1_000_000, 720), btc_confs=_int(o, "btc_confs", 100, 1),
+        creator_btc_script=creator_btc,
         p2p_port=_int(o, "p2p_port", 65535), rpc_port=_int(o, "rpc_port", 65535),
         seeds=list(seeds or []),
     )
@@ -338,8 +368,20 @@ def parse(text_or_obj) -> Launch:
 
 
 def validate(d: Launch):
-    if d.btc_anchor_height and not int(d.btc_anchor_hash, 16):
-        raise DescriptorError("btc_anchor_hash: required with btc_anchor_height")
+    has_anchor = any(d.btc_anchor_header)
+    if (d.btc_anchor_height or d.btc_anchor_period_time) and not has_anchor:
+        raise DescriptorError("btc_anchor_header: required with btc_anchor_height / btc_anchor_period_time")
+    if d.sats_num:
+        if not has_anchor:
+            raise DescriptorError("btc_anchor_header: required when sats_num > 0")
+        if not d.creator_btc_script:
+            raise DescriptorError("creator_btc_script: required when sats_num > 0")
+        if d.sats_min_payment < 546:
+            raise DescriptorError("sats_min_payment: at least 546")
+        if d.settle_deadline < 110:
+            raise DescriptorError("settle_deadline: at least 110 blocks")
+        if d.btc_confs < 1:
+            raise DescriptorError("btc_confs: at least 1")
     if d.version != 1:
         raise DescriptorError("unsupported descriptor version")
     try:
@@ -407,7 +449,8 @@ def make(name: str, ticker: str, creator_script: bytes, graduation_hashes: int, 
                ftl=ftl or max(15, lwma_window * target_spacing // 20), tail_reward=tail,
                tail_halving_interval=interval, creator_script=creator_script, creator_fee_bps=creator_fee_bps,
                test=test)
-    if btc_anchor:
-        d.btc_anchor_height, d.btc_anchor_hash = int(btc_anchor[0]), btc_anchor[1].lower()
+    if btc_anchor:  # (height, 80-byte header hex, period start time)
+        d.btc_anchor_height, d.btc_anchor_header = int(btc_anchor[0]), bytes.fromhex(btc_anchor[1])
+        d.btc_anchor_period_time = int(btc_anchor[2]) if len(btc_anchor) > 2 else 0
     validate(d)
     return d

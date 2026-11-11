@@ -146,6 +146,20 @@ bool GetUInt(const UniValue& o, const std::string& key, T& out, std::string& err
     return true;
 }
 
+/** Strict hex bytes: absent/null keeps the default; otherwise a string of min_len..max_len bytes, hex digits only. */
+bool GetHexBytes(const UniValue& o, const std::string& key, std::vector<unsigned char>& out, std::string& error, size_t min_len, size_t max_len)
+{
+    const UniValue& v = o.find_value(key);
+    if (v.isNull()) return true;
+    const std::string s = v.isStr() ? v.get_str() : std::string{"?"};
+    if (s.size() % 2 != 0 || s.size() < 2 * min_len || s.size() > 2 * max_len || (!s.empty() && !IsHex(s))) {
+        error = strprintf("%s: expected %d..%d bytes of hex", key, min_len, max_len);
+        return false;
+    }
+    out = ParseHex(s);
+    return true;
+}
+
 bool GetStr(const UniValue& o, const std::string& key, std::string& out, std::string& error, bool required)
 {
     const UniValue& v = o.find_value(key);
@@ -214,7 +228,14 @@ std::vector<unsigned char> LaunchCanonicalBytes(const LaunchDescriptor& d)
     PutU16(v, d.creator_fee_bps);
     PutU8(v, d.test ? 1 : 0);
     PutU32(v, d.btc_anchor_height);
-    v.insert(v.end(), d.btc_anchor_hash.begin(), d.btc_anchor_hash.end());
+    v.insert(v.end(), d.btc_anchor_header.begin(), d.btc_anchor_header.end());
+    PutU32(v, d.btc_anchor_period_time);
+    PutI64(v, static_cast<int64_t>(d.sats_num));
+    PutU32(v, d.sats_shift);
+    PutI64(v, d.sats_min_payment);
+    PutU32(v, d.settle_deadline);
+    PutU32(v, d.btc_confs);
+    PutBytes(v, d.creator_btc_script.data(), d.creator_btc_script.size());
     return v;
 }
 
@@ -297,20 +318,44 @@ std::optional<LaunchDescriptor> ParseLaunchDescriptor(const std::string& json, s
     if (!GetUInt(o, "rpc_port", d.rpc_port, error, 65535)) return std::nullopt;
     if (!GetUInt(o, "btc_anchor_height", d.btc_anchor_height, error, 0xffffffff)) return std::nullopt;
     {
-        const UniValue& a = o.find_value("btc_anchor_hash");
-        if (!a.isNull()) {
-            const std::string& s = a.isStr() ? a.get_str() : std::string{};
-            if (s.size() != 64 || !IsHex(s)) {
-                error = "btc_anchor_hash: expected 64 hex characters";
+        std::vector<unsigned char> hdr;
+        if (!GetHexBytes(o, "btc_anchor_header", hdr, error, 80, 80)) return std::nullopt;
+        if (!hdr.empty()) std::copy(hdr.begin(), hdr.end(), d.btc_anchor_header.begin());
+    }
+    if (!GetUInt(o, "btc_anchor_period_time", d.btc_anchor_period_time, error, 0xffffffff)) return std::nullopt;
+    if (!GetUInt(o, "sats_num", d.sats_num, error, uint64_t{1} << 62)) return std::nullopt;
+    if (!GetUInt(o, "sats_shift", d.sats_shift, error, 128)) return std::nullopt;
+    if (!GetUInt(o, "sats_min_payment", d.sats_min_payment, error, MAX_MONEY)) return std::nullopt;
+    if (!GetUInt(o, "settle_deadline", d.settle_deadline, error, 1000000)) return std::nullopt;
+    if (!GetUInt(o, "btc_confs", d.btc_confs, error, 100)) return std::nullopt;
+    if (!GetHexBytes(o, "creator_btc_script", d.creator_btc_script, error, 1, 80)) return std::nullopt;
+    {
+        const bool has_anchor = std::any_of(d.btc_anchor_header.begin(), d.btc_anchor_header.end(), [](unsigned char c) { return c != 0; });
+        if ((d.btc_anchor_height != 0 || d.btc_anchor_period_time != 0) && !has_anchor) {
+            error = "btc_anchor_header: required with btc_anchor_height / btc_anchor_period_time";
+            return std::nullopt;
+        }
+        if (d.sats_num != 0) {
+            if (!has_anchor) {
+                error = "btc_anchor_header: required when sats_num > 0";
                 return std::nullopt;
             }
-            const auto bytes = ParseHex(s);
-            std::copy(bytes.begin(), bytes.end(), d.btc_anchor_hash.begin());
-        }
-        const bool has_hash = std::any_of(d.btc_anchor_hash.begin(), d.btc_anchor_hash.end(), [](unsigned char c) { return c != 0; });
-        if (d.btc_anchor_height != 0 && !has_hash) {
-            error = "btc_anchor_hash: required with btc_anchor_height";
-            return std::nullopt;
+            if (d.creator_btc_script.empty()) {
+                error = "creator_btc_script: required when sats_num > 0";
+                return std::nullopt;
+            }
+            if (d.sats_min_payment < 546) {
+                error = "sats_min_payment: at least 546";
+                return std::nullopt;
+            }
+            if (d.settle_deadline < 110) {
+                error = "settle_deadline: at least 110 blocks";
+                return std::nullopt;
+            }
+            if (d.btc_confs < 1) {
+                error = "btc_confs: at least 1";
+                return std::nullopt;
+            }
         }
     }
     {
@@ -447,7 +492,14 @@ std::string LaunchDescriptorToJSON(const LaunchDescriptor& d)
     o.pushKV("creator_fee_bps", static_cast<int64_t>(d.creator_fee_bps));
     o.pushKV("test", d.test);
     o.pushKV("btc_anchor_height", static_cast<int64_t>(d.btc_anchor_height));
-    o.pushKV("btc_anchor_hash", HexStr(d.btc_anchor_hash));
+    o.pushKV("btc_anchor_header", HexStr(d.btc_anchor_header));
+    o.pushKV("btc_anchor_period_time", static_cast<int64_t>(d.btc_anchor_period_time));
+    o.pushKV("sats_num", static_cast<int64_t>(d.sats_num));
+    o.pushKV("sats_shift", static_cast<int64_t>(d.sats_shift));
+    o.pushKV("sats_min_payment", d.sats_min_payment);
+    o.pushKV("settle_deadline", static_cast<int64_t>(d.settle_deadline));
+    o.pushKV("btc_confs", static_cast<int64_t>(d.btc_confs));
+    if (!d.creator_btc_script.empty()) o.pushKV("creator_btc_script", HexStr(d.creator_btc_script));
     o.pushKV("p2p_port", static_cast<int64_t>(LaunchP2PPort(d)));
     o.pushKV("rpc_port", static_cast<int64_t>(LaunchRPCPort(d)));
     UniValue seeds(UniValue::VARR);
