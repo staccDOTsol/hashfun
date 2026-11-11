@@ -74,6 +74,12 @@ def main(argv=None):
     p.add_argument("--window", type=int, default=90)
     p.add_argument("--btc-anchor", metavar="HEIGHT:HEADERHEX[:PERIODTIME]",
                    help="recent Bitcoin block header; proves the launch was not mined before it")
+    p.add_argument("--btc-rpc", help="Bitcoin Core RPC URL: take the anchor from its chain (6 blocks deep)")
+    p.add_argument("--btc-cookie", help="Bitcoin Core .cookie file, if the URL has no user:pass")
+    p.add_argument("--sats-total", type=float, metavar="BTC",
+                   help="sats leg: total BTC the curve owes holders/creator/dev (needs an anchor and --creator-btc-address)")
+    p.add_argument("--creator-btc-address", help="Bitcoin address for the creator's 10% of the sats leg")
+    p.add_argument("--btc-hrp", default="bc", help="bech32 prefix of the Bitcoin network (bc, tb, bcrt)")
     p.add_argument("--pow-limit", default="1e0fffff", help="difficulty floor (compact); LWMA ramps up from here")
     p.add_argument("--tail-years", type=int, default=8)
     p.add_argument("--test", action="store_true", help="test launch: mockable time, nonstandard txs allowed")
@@ -96,6 +102,16 @@ def main(argv=None):
                    tail_years=a.tail_years, pow_limit_bits=int(a.pow_limit, 16), hrp=hrp,
                    btc_anchor=a.btc_anchor.split(":") if a.btc_anchor else None)
         d.seeds = a.seed
+        if a.btc_rpc:
+            from .rpc import RPC
+            h, hdr, period = D.btc_anchor_from_rpc(RPC(a.btc_rpc, cookie_file=a.btc_cookie))
+            d.btc_anchor_height, d.btc_anchor_header, d.btc_anchor_period_time = h, bytes.fromhex(hdr), period
+        if a.sats_total:
+            if not a.creator_btc_address:
+                ap.error("--sats-total needs --creator-btc-address")
+            d.creator_btc_script = address_to_script(a.creator_btc_address, a.btc_hrp)
+            D.set_sats_total(d, int(round(a.sats_total * D.COIN)))
+        D.validate(d)
         t0 = time.time()
         expected = 2**256 / (bits_to_target(d.pow_limit_bits) + 1)
         print(f"mining genesis (~{fmt_hashes(expected)} expected)...", file=sys.stderr)

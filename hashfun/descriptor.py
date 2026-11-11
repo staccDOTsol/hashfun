@@ -431,6 +431,26 @@ PUMP_RATIO_G = 7931
 PUMP_RATIO_T = 10730
 
 
+def set_sats_total(d: Launch, total_sats: int):
+    """Size the sats leg so the whole curve owes ~total_sats of BTC (sum over blocks of
+    (work * num) >> shift, with total work W_g). Picks the largest shift that keeps num precise."""
+    wg = d.graduation_work
+    for shift in range(128, -1, -1):
+        num = (total_sats << shift) // wg
+        if 2**40 <= num <= 2**62 or (shift == 0 and 1 <= num <= 2**62):
+            d.sats_num, d.sats_shift = num, shift
+            return
+    raise DescriptorError("sats total is out of range for this curve")
+
+
+def btc_anchor_from_rpc(rpc, depth: int = 6):
+    """(height, header hex, period start time) of the Bitcoin block `depth` below the tip."""
+    height = max(0, rpc.getblockcount() - depth)
+    header = rpc.getblockheader(rpc.getblockhash(height), False)
+    period = rpc.getblockheader(rpc.getblockhash(height - height % 2016))["time"]
+    return height, header, period
+
+
 def make(name: str, ticker: str, creator_script: bytes, graduation_hashes: int, *, supply_coins=15_000_000,
          creator_fee_bps=100, target_spacing=5, lwma_window=90, ftl=None, test=False, tail_years=8,
          pow_limit_bits=0x1E0FFFFF, genesis_time=None, hrp=None, btc_anchor=None) -> Launch:

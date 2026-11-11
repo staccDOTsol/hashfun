@@ -262,7 +262,7 @@ class BtcChain:
         while n is not None and len(times) < 11:
             times.append(n.time)
             n = self.nodes.get(n.prev)
-        if time_ <= sorted(times)[len(times) // 2]:
+        if len(times) == 11 and time_ <= sorted(times)[5]:  # unknowable within 11 blocks of the anchor
             return False, "btc header time is not past the median"
         work = prev.work + 2**256 // (target + 1)
         b = self.nodes[self.best]

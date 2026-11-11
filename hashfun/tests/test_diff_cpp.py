@@ -580,6 +580,22 @@ class DiffCpp(unittest.TestCase):
             self.assertEqual((r["best"], r["best_height"], r["size"]),
                              (model.best.hex(), model.nodes[model.best].height, len(model.nodes)))
             self.assertGreater(len(model.nodes), 5)
+        # Regression: Bitcoin timestamps are not monotonic. Right after the anchor the median of
+        # 11 cannot be known, so a header no later than the anchor must still connect; once 11
+        # ancestors exist the rule applies.
+        anchor = mine(rng.randbytes(32), 1_700_000_000)
+        model, ops, prev = Y.BtcChain(anchor, 5, 0, True), [], sha256d(anchor)
+        for i in range(14):
+            h = mine(prev, 1_700_000_000 - (i % 3))
+            ops.append(["add", h.hex()])
+            ok, why = model.accept(h)
+            self.assertEqual(ok, i < 10, (i, why))
+            if not ok:
+                break
+            prev = sha256d(h)
+        r = self.drv(op="btc", anchor=anchor.hex(), height=5, period_time=0, regtest=True, ops=ops)
+        self.assertEqual(r["results"], [""] * 10 + ["btc header time is not past the median"])
+        self.assertEqual(r["best_height"], 15)
 
     _hdr_cache = {}
 

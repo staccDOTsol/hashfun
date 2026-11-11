@@ -313,11 +313,13 @@ bool BtcChain::Accept(const CPureBlockHeader& header, std::string& error)
         error = "btc header lacks proof of work";
         return false;
     }
-    // Median of the last 11 timestamps (fewer right after the anchor).
+    // Median of the last 11 timestamps. Within 11 blocks of the anchor the true median is
+    // unknowable (it needs headers below the anchor), and Bitcoin timestamps are not monotonic,
+    // so the rule is only enforced once all 11 are in the tree.
     std::vector<uint32_t> times;
     for (const Node* n = prev; n && times.size() < 11; n = Find(n->prev)) times.push_back(n->time);
     std::sort(times.begin(), times.end());
-    if (header.nTime <= times[times.size() / 2]) {
+    if (times.size() == 11 && header.nTime <= times[5]) {
         error = "btc header time is not past the median";
         return false;
     }
