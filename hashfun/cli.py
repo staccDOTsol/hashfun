@@ -1,14 +1,16 @@
 """hashfun: one command for the whole stack.
 
   hashfun launch new ...            create a coin (descriptor + genesis); `launch info` to inspect
-  hashfun node add <descriptor>     register a launch on this machine
-  hashfun node up [TICKER ...]      start a hashfund node per launch (all registered if none named)
+  hashfun node add <descriptor>     register a launch on this machine (--peer host:port of a node to join)
+  hashfun node up [TICKER ...]      start a hashfund node per launch (all registered if none named);
+                                    --first for the first node of a new launch (it has no peers yet)
   hashfun node ls                   height, curve progress, graduation, peers
   hashfun node rpc TICKER METHOD [ARGS ...]
   hashfun node down [TICKER ...]
   hashfun mine TICKER --payout ADDR start a pool for the launch and (optionally) a CPU miner on it;
                                     merge-mines every other registered launch that has graduated and
                                     pays and proves the Bitcoin each block owes (needs --btc-rpc)
+  hashfun web --btc-rpc URL         the site: board, coin pages, launch form, swaps signed in the browser
   hashfun wallet ... | swap ... | pool ... | proxy ... | electrum ... | board ... | miner ...
                                     the individual tools (same arguments as hashfun-<tool>)
 
@@ -33,7 +35,7 @@ from . import descriptor as D
 from .rpc import RPC, RPCError
 
 TOOLS = {"launch": "launch", "wallet": "wallet", "swap": "swap", "pool": "pool_cli", "proxy": "proxy",
-         "electrum": "electrum", "board": "board", "miner": "miner"}
+         "electrum": "electrum", "board": "board", "miner": "miner", "web": "web"}
 
 
 def home() -> str:
@@ -73,7 +75,7 @@ class Registry:
             json.dump(self.data, f, indent=1)
         os.replace(tmp, self.path)
 
-    def add(self, descriptor_path: str) -> str:
+    def add(self, descriptor_path: str, peers=(), p2p_port: Optional[int] = None) -> str:
         d = D.load(descriptor_path)
         base = os.path.join(home(), "launches", f"{d.ticker}-{d.id_hex[:8]}")
         os.makedirs(base, exist_ok=True)
@@ -83,7 +85,9 @@ class Registry:
         if old and old["id"] != d.id_hex:
             sys.exit(f"{d.ticker} is already registered with a different launch id ({old['id'][:16]}...)")
         self.data[d.ticker] = {"id": d.id_hex, "descriptor": dst, "datadir": os.path.join(base, "node"),
-                               "rpcport": (old or {}).get("rpcport") or free_port()}
+                               "rpcport": (old or {}).get("rpcport") or free_port(),
+                               "peers": sorted(set((old or {}).get("peers", [])) | set(peers)),
+                               "p2pport": p2p_port or (old or {}).get("p2pport")}
         self.save()
         return d.ticker
 
@@ -120,7 +124,8 @@ class Registry:
         os.makedirs(e["datadir"], exist_ok=True)
         args = [hashfund_binary(), f"-datadir={e['datadir']}", f"-launch={e['descriptor']}", "-server=1",
                 f"-rpcport={e['rpcport']}", "-rpcbind=127.0.0.1", "-rpcallowip=127.0.0.1", "-txindex=1",
-                "-printtoconsole=0", *extra]
+                "-printtoconsole=0", *[f"-addnode={x}" for x in e.get("peers", [])],
+                *([f"-port={e['p2pport']}"] if e.get("p2pport") else []), *extra]
         with open(os.path.join(e["datadir"], "stderr.log"), "ab") as err:
             p = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=err, start_new_session=True)
         deadline = time.time() + 120
@@ -171,10 +176,11 @@ class Registry:
 
 def cmd_node(a, reg: Registry):
     if a.node_cmd == "add":
-        t = reg.add(a.descriptor)
+        t = reg.add(a.descriptor, a.peer, a.p2p_port)
         print(json.dumps({"registered": t, **{k: v for k, v in reg.get(t).items()}}, indent=2))
     elif a.node_cmd == "up":
-        print(json.dumps({t: "started" if reg.up(t, a.arg) else "already running" for t in reg.pick(a.tickers)}, indent=2))
+        extra = list(a.arg) + (["-minewithoutpeers"] if a.first else [])
+        print(json.dumps({t: "started" if reg.up(t, extra) else "already running" for t in reg.pick(a.tickers)}, indent=2))
     elif a.node_cmd == "down":
         print(json.dumps({t: "stopped" if reg.down(t) else "not running" for t in reg.pick(a.tickers)}, indent=2))
     elif a.node_cmd == "ls":
@@ -197,7 +203,8 @@ def cmd_node(a, reg: Registry):
 
 
 def build_source(reg: Registry, ticker: str, payout: Optional[str], btc_rpc: Optional[str], btc_hrp: str,
-                 max_pay_sats: Optional[int] = None, btc_cookie: Optional[str] = None, btc_wallet: Optional[str] = None):
+                 max_pay_sats: Optional[int] = None, btc_cookie: Optional[str] = None, btc_wallet: Optional[str] = None,
+                 pay_depth: int = 12):
     """LaunchSource for `ticker`, carrying every other registered, running launch as an aux chain
     (only graduated ones are merge-mined; the pool re-checks each round) and the Settler that pays
     and proves the Bitcoin each curve block owes."""
@@ -231,7 +238,7 @@ def build_source(reg: Registry, ticker: str, payout: Optional[str], btc_rpc: Opt
     if btc_wallet:
         btc = btc.wallet(btc_wallet)
     settler = Settler(rpc, btc, os.path.join(os.path.dirname(reg.get(ticker)["descriptor"]), "settler.json"),
-                      max_pay_sats=max_pay_sats)
+                      max_pay_sats=max_pay_sats, pay_depth=pay_depth)
     return LaunchSource(rpc, d.hrp, d.ticker, default_payout=payout, children=children, settler=settler,
                         yield_hrp=btc_hrp), children, settler
 
@@ -243,7 +250,7 @@ def cmd_mine(a, reg: Registry):
     reg.up(a.ticker)
     src, children, settler = build_source(reg, a.ticker, a.payout, a.btc_rpc, a.btc_hrp,
                                           int(a.max_pay_btc * D.COIN) if a.max_pay_btc else None,
-                                          a.btc_cookie, a.btc_wallet)
+                                          a.btc_cookie, a.btc_wallet, a.pay_depth)
     host, port = a.listen.rsplit(":", 1)
     user = a.payout + (f",{a.btc_address}" if a.btc_address else "")
     print(json.dumps({"stratum": f"stratum+tcp://{host}:{port}", "user": user, "launch": a.ticker,
@@ -281,11 +288,15 @@ def main(argv=None):
     n = sub.add_parser("node", help="run hashfund nodes for registered launches").add_subparsers(dest="node_cmd", required=True)
     p = n.add_parser("add")
     p.add_argument("descriptor")
+    p.add_argument("--peer", action="append", default=[], help="host:port of a node of this launch to connect to")
+    p.add_argument("--p2p-port", type=int, help="listen here instead of the launch's own port")
     for name in ("up", "down", "ls"):
         p = n.add_parser(name)
         p.add_argument("tickers", nargs="*")
         if name == "up":
             p.add_argument("--arg", action="append", default=[], help="extra hashfund argument, e.g. --arg=-addnode=host:port")
+            p.add_argument("--first", action="store_true",
+                           help="first node of a new launch: serve mining work with no peers connected")
     p = n.add_parser("rpc")
     p.add_argument("ticker")
     p.add_argument("method")
@@ -299,6 +310,8 @@ def main(argv=None):
     p.add_argument("--btc-wallet", help="Bitcoin Core wallet name")
     p.add_argument("--btc-hrp", default="bc")
     p.add_argument("--max-pay-btc", type=float, help="never pay more than this for one block's sats")
+    p.add_argument("--pay-depth", type=int, default=12,
+                   help="pay a block's sats once it is this many blocks deep (reorgs deeper than depth-6 can cost a payment)")
     p.add_argument("--listen", default="127.0.0.1:3333")
     p.add_argument("--difficulty", type=float, default=1.0, help="share difficulty")
     p.add_argument("--no-cpu", action="store_true", help="only serve stratum (point ASICs or rented hash at it)")

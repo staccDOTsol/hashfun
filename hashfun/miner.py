@@ -46,7 +46,9 @@ class StratumMiner:
             if msg.get("method"):
                 self._on_notification(msg["method"], msg.get("params") or [])
             elif msg.get("id") in self._pending:
-                self._pending.pop(msg["id"]).set_result(msg)
+                fut = self._pending.pop(msg["id"])
+                if not fut.done():  # cancelled while the reply was in flight
+                    fut.set_result(msg)
 
     def _on_notification(self, method, p):
         if method == "mining.set_difficulty":

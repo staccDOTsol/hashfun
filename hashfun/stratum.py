@@ -211,7 +211,12 @@ class LaunchSource(JobSource):
         self.blocks_found = []
 
     async def refresh(self) -> bool:
-        best = await asyncio.to_thread(self.rpc.getbestblockhash)
+        info = await asyncio.to_thread(self.rpc.getblockchaininfo)
+        if info["headers"] > info["blocks"] + 1:
+            # Launch chains never report "initial block download" (an old tip is normal for them),
+            # so check here: hashing on a tip the node already knows is stale only burns sats.
+            raise RuntimeError(f"node is still syncing ({info['blocks']}/{info['headers']})")
+        best = info["bestblockhash"]
         now = time.time()
         aux_changed = await self.auxset.collect()
         if aux_changed:

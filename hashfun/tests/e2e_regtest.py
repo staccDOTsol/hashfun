@@ -279,7 +279,8 @@ class E2E:
         """Every launch has a sats leg, so curve coinbases are locked until their Bitcoin payment
         is proven. Run the Settler for all of this chain's curve blocks, carrying its headers and
         proofs in hand-built blocks, until every one of them is spendable."""
-        settler = Settler(node.rpc, self.wb, os.path.join(self.dir, f"settler-{d.ticker}-{int(time.time())}.json"))
+        settler = Settler(node.rpc, self.wb, os.path.join(self.dir, f"settler-{d.ticker}-{int(time.time())}.json"),
+                          pay_depth=0)
         grad = node.rpc.getlaunchinfo()["graduation_height"]
         last = grad if grad > 0 else node.rpc.getblockcount()
         for h in range(1, last + 1):
@@ -799,7 +800,7 @@ class E2E:
         self.nodes.append(n4)
         w4 = open_wallet(n4.rpc)
         miner_addr = w4.getnewaddress("", "bech32")
-        settler = Settler(n4.rpc, wb, os.path.join(self.dir, f"settler-{tag}.json"), max_pay_sats=COIN)
+        settler = Settler(n4.rpc, wb, os.path.join(self.dir, f"settler-{tag}.json"), max_pay_sats=COIN, pay_depth=0)
         src = LaunchSource(n4.rpc, d.hrp, d.ticker, settler=settler, yield_hrp="bcrt")
         port = free_port()
         asyncio.run_coroutine_threadsafe(StratumServer(src, "127.0.0.1", port, difficulty=1e-6,

@@ -455,7 +455,8 @@ def r_getblockheader(c, h, verbose=True):
 
 
 def r_getblockchaininfo(c):
-    return {"chain": "sim", "blocks": c.height, "bestblockhash": c.blocks[-1].hash_hex, "mediantime": c.mtp()}
+    return {"chain": "sim", "blocks": c.height, "headers": c.height, "bestblockhash": c.blocks[-1].hash_hex,
+            "mediantime": c.mtp()}
 
 
 def r_getblocktemplate(c, req=None):

@@ -16,8 +16,8 @@ Base: Bitcoin Core master (32.99) + Namecoin's `auxpow` branch (AuxPoW only, no 
 | Tail | after graduation: `tail_reward >> (height / tail_halving_interval)` per block |
 | Creator fee | coinbase must pay `floor(subsidy * creator_fee_bps / 10000)` to `creator_script` (`bad-cb-creator-fee`) |
 | AuxPoW | valid only if the parent block's `W >= W_g` (`auxpow-before-graduation`); chain ID from the launch id, kept in `[1, 0x1FFE]` so a BIP9/version-rolled BTC parent never collides |
-| Difficulty | LWMA-1 every block, window N, solvetimes capped at 6T, monotonic-forced timestamps, overflow-guarded |
-| Stall relief | the target doubles for every full 6T a block's own timestamp sits past its parent's, up to the pow limit, so an abandoned chain decays to CPU-minable in minutes. Safe because issuance is priced by work. nBits is a function of (ancestors, own nTime): no nTime rolling, templates refresh every few seconds |
+| Difficulty | LWMA-1 every block, window N, solvetimes capped at 6T, monotonic-forced timestamps, overflow-guarded. Block times are whole seconds and every solvetime counts as at least 1 s, so `target_spacing >= 2` (with T = 1 difficulty could never rise). A hash surge raises difficulty a few percent per block; until it catches up blocks arrive as fast as timestamps allow (about 6 per second, pinned at the future limit), each minting only what its work is worth |
+| Stall relief | the target doubles for every full 6T a block's own timestamp sits past its parent's, up to the pow limit, so an abandoned chain decays to CPU-minable in minutes. Safe because issuance is priced by work. nBits is a function of (ancestors, own nTime): no nTime rolling. `getblocktemplate` and `createauxblock` rebuild their cached template when the clock enters the next relief step (a cached one would be invalid, or would keep a stalled chain stalled) |
 | BTC anchor | optional `btc_anchor_height` / `btc_anchor_hash` in the descriptor, hashed into the launch id: no block of the launch can predate that Bitcoin block |
 | FTL | per-descriptor future time limit (default 60 s with the 5 s / N=90 defaults) |
 | Genesis | coinbase `scriptSig = PUSH32(launch_id)`, one zero-value `OP_RETURN` output, `nVersion=1`, must meet `pow_limit_bits` |
@@ -40,6 +40,22 @@ hashfun wallet buy|sell ..., hashfun swap ..., hashfun electrum ..., hashfun boa
 ```
 
 `hashfun mine` merge-mines every other registered launch that has graduated and runs the settler (relay Bitcoin headers, pay the drawn payee, publish the proof). `contrib/hashfun/cli_smoke.sh` drives all of this against real binaries.
+
+## Running more than one node
+
+Launch chains are production chains: `test: false` descriptors cannot mock the clock and gate mining on peers. What differs from Bitcoin Core:
+
+| Behaviour | Why |
+|---|---|
+| An old tip is not "initial block download" (`-maxtipage` defaults to 100 years) | a launch only gets blocks while minting pays; a quiet chain must still relay transactions and let anyone mine the block that revives it |
+| `getblocktemplate` / `createauxblock` need a peer, or `-minewithoutpeers` | the first node of a launch has nobody to connect to; any other miner cut off from the network would mint, and pay Bitcoin for, blocks nobody sees |
+| The pool refuses to hand out work while the node's headers are ahead of its blocks | with no IBD flag, this is what stops hashing on a stale tip |
+| `-prune` is refused | sats-leg state is rebuilt from full blocks |
+| `btc_regtest` in the descriptor (part of the launch id) | which Bitcoin the sats leg follows, independent of `test`: a production-mode launch can run against a regtest Bitcoin for fleet tests |
+
+`hashfun node add x.json --peer host:port [--p2p-port N]`, `hashfun node up X --first` (the first node: `-minewithoutpeers`).
+
+The settler (`hashfun mine`) pays a block only once it is `--pay-depth` deep (default 12, so its draw block is 6 deep), writes the signed payment to disk before broadcasting it, republishes a proof whose block was reorged out, and reports a payment as lost only if a reorg changed the draw after it was made. `python -m hashfun.tests.fleet_regtest` runs all of this with four nodes, two pools and two Bitcoin wallets.
 
 ## Sats leg
 
@@ -121,9 +137,10 @@ python -m unittest hashfun.tests.test_core      # vectors (BIP32/39/143/173), cu
 python -m unittest hashfun.tests.test_stack     # pool+miner, merged mining gate, proxy split, electrum+wallet+reorg, swaps buy/sell/refund (simulator)
 bash contrib/hashfun/difftest/build.sh build/hfdiff && HFDIFF=build/hfdiff python -m unittest hashfun.tests.test_diff_cpp
 python -m hashfun.tests.e2e_regtest --hashfund build/bin/hashfund --bitcoind /path/to/stock/bitcoind
+python -m hashfun.tests.fleet_regtest --hashfund build/bin/hashfund --bitcoind /path/to/stock/bitcoind   # ~4.5 min, real time
 ```
 
-`test_stack` runs against an in-process simulator whose consensus is the Python model, not the C++ node. `test_diff_cpp` compiles the node's own consensus sources (descriptor parser and identity, `CLaunchParams` + genesis, curve, LWMA, tail) without the rest of the node, in ~20 s, and compares them value by value with the Python model on random descriptors and adversarial header sequences (zero, negative and >6T solvetimes, off-schedule nBits, graduation crossings); it also requires both parsers to accept and reject exactly the same descriptor JSON. `e2e_regtest` covers what needs a running node: block acceptance (creator output, excess coinbase, nBits), the auxpow gate, GBT, merged mining against stock bitcoind and a swap over real nodes. With `--workdir` its phases can run in separate processes (`--phases 1-6`, `7-8`, `9`).
+`test_stack` runs against an in-process simulator whose consensus is the Python model, not the C++ node. `test_diff_cpp` compiles the node's own consensus sources (descriptor parser and identity, `CLaunchParams` + genesis, curve, LWMA, tail) without the rest of the node, in ~20 s, and compares them value by value with the Python model on random descriptors and adversarial header sequences (zero, negative and >6T solvetimes, off-schedule nBits, graduation crossings); it also requires both parsers to accept and reject exactly the same descriptor JSON. `e2e_regtest` covers what needs a running node: block acceptance (creator output, excess coinbase, nBits), the auxpow gate, GBT, merged mining against stock bitcoind and a swap over real nodes. With `--workdir` its phases can run in separate processes (`--phases 1-6`, `7-8`, `9`). `fleet_regtest` is the multi-node test: production-mode launches, P2P on localhost, real time; gating, state agreement (tip, UTXO set, Bitcoin relay, every obligation) across nodes, late joiner, restarts, partitions and reorgs in both directions including a forged Bitcoin header branch, two competing pools, AuxPoW blocks over P2P, the settlement lock in the mempool, transaction relay, `verifychain`, stall relief against the wall clock.
 
 ## Files changed in the node
 

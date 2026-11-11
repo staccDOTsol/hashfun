@@ -249,7 +249,13 @@ class Order:
 
 
 class Maker:
-    """Quotes off the consensus curve: price = hashes_per_coin x hashprice x (1 +/- spread)."""
+    """Quotes off the consensus curve. Minting a coin costs hash plus the sats its block owes, so
+    price = hashes_per_coin x (hashprice + sats owed per hash) x (1 +/- spread).
+
+    Per-chain config (cfg["defaults"], cfg["chains"][ticker]): hashprice_sats_per_th, spread,
+    btc_confs, fork_confs, init_lock_seconds, part_lock_seconds, lock_margin_seconds, safety,
+    quote_ttl, and instant_max_sats: buys up to this many sats are filled on the unconfirmed
+    Bitcoin lock (the maker carries the double-spend risk; 0, the default, turns it off)."""
 
     def __init__(self, btc: NodeChain, forks: dict, ks: KeyStore, cfg: dict, state_path: str):
         self.btc, self.forks, self.ks, self.cfg = btc, forks, ks, cfg
@@ -276,7 +282,16 @@ class Maker:
         """BTC sats per whole coin at the current curve price."""
         info = self.forks[ticker].rpc.getlaunchinfo()
         cc = self.chain_cfg(ticker)
-        return info["hashes_per_coin"] * float(cc["hashprice_sats_per_th"]) / 1e12
+        d = info.get("descriptor") or {}
+        sats_per_hash = int(d.get("sats_num", 0)) / 2 ** int(d.get("sats_shift", 0))
+        return info["hashes_per_coin"] * (float(cc["hashprice_sats_per_th"]) / 1e12 + sats_per_hash)
+
+    def init_confs(self, ticker: str, side: str, btc_amount: int) -> int:
+        """Confirmations the taker's lock needs before the maker locks its side."""
+        cc = self.chain_cfg(ticker)
+        if side != "buy":
+            return int(cc["fork_confs"])
+        return 0 if btc_amount <= int(cc.get("instant_max_sats", 0)) else int(cc["btc_confs"])
 
     def max_order_sats(self, ticker: str) -> int:
         """Cap: cost to rent enough hash to reorg N_fork blocks at current difficulty."""
@@ -297,7 +312,9 @@ class Maker:
              "fair": fair, "maker_pub": (self.maker_btc_pub if side == "buy" else self.maker_fork_pub).hex(),
              "init_chain": "BTC" if side == "buy" else ticker,
              "min_init_locktime": (now_btc if side == "buy" else now_fork) + int(cc["init_lock_seconds"]),
-             "part_lock_seconds": int(cc["part_lock_seconds"]), "btc_confs": cc["btc_confs"],
+             "part_lock_seconds": int(cc["part_lock_seconds"]),
+             "btc_confs": self.init_confs(ticker, side, btc_amount) if side == "buy" else cc["btc_confs"],
+             "instant": side == "buy" and self.init_confs(ticker, side, btc_amount) == 0,
              "fork_confs": cc["fork_confs"], "max_btc": self.max_order_sats(ticker),
              "quote_id": uuid.uuid4().hex[:16], "expires": time.time() + float(cc.get("quote_ttl", 300))}
         with self.lock:
@@ -335,7 +352,7 @@ class Maker:
     def step(self, o: Order):
         cc = self.chain_cfg(o.ticker)
         init_chain, part_chain, init_amount, part_amount, maker_pub = self._legs(o)
-        init_confs = cc["btc_confs"] if o.side == "buy" else cc["fork_confs"]
+        init_confs = self.init_confs(o.ticker, o.side, o.btc_amount)
         part_confs_for_taker = cc["fork_confs"] if o.side == "buy" else cc["btc_confs"]
         if o.state == "new":
             a = audit(init_chain, o.init_contract, o.init_txid, o.init_vout)

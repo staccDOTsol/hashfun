@@ -27,3 +27,6 @@ target/
 /guix-build-*
 
 /ci/scratch/
+hashfun/web/node_modules/
+hashfun.egg-info/
+__pycache__/
