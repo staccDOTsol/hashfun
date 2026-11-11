@@ -24,4 +24,4 @@ hashfun-board = "hashfun.board:main"
 packages = ["hashfun", "hashfun.tests"]
 
 [tool.setuptools.package-data]
-hashfun = ["bip39_english.txt", "board.html", "web/static/*"]
+hashfun = ["bip39_english.txt", "board.html", "web/static/*", "web/maker.cjs"]
