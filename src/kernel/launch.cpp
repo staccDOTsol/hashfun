@@ -237,6 +237,9 @@ std::vector<unsigned char> LaunchCanonicalBytes(const LaunchDescriptor& d)
     PutU32(v, d.btc_confs);
     PutBytes(v, d.creator_btc_script.data(), d.creator_btc_script.size());
     PutU8(v, d.btc_regtest ? 1 : 0);
+    if (std::any_of(d.meta.begin(), d.meta.end(), [](unsigned char c) { return c != 0; })) {
+        v.insert(v.end(), d.meta.begin(), d.meta.end());
+    }
     return v;
 }
 
@@ -339,6 +342,11 @@ std::optional<LaunchDescriptor> ParseLaunchDescriptor(const std::string& json, s
             }
             d.btc_regtest = t.get_bool();
         }
+    }
+    {
+        std::vector<unsigned char> meta;
+        if (!GetHexBytes(o, "meta", meta, error, 32, 32)) return std::nullopt;
+        if (!meta.empty()) std::copy(meta.begin(), meta.end(), d.meta.begin());
     }
     {
         const bool has_anchor = std::any_of(d.btc_anchor_header.begin(), d.btc_anchor_header.end(), [](unsigned char c) { return c != 0; });
@@ -519,6 +527,7 @@ std::string LaunchDescriptorToJSON(const LaunchDescriptor& d)
     o.pushKV("btc_confs", static_cast<int64_t>(d.btc_confs));
     if (!d.creator_btc_script.empty()) o.pushKV("creator_btc_script", HexStr(d.creator_btc_script));
     o.pushKV("btc_regtest", d.btc_regtest);
+    if (std::any_of(d.meta.begin(), d.meta.end(), [](unsigned char c) { return c != 0; })) o.pushKV("meta", HexStr(d.meta));
     o.pushKV("p2p_port", static_cast<int64_t>(LaunchP2PPort(d)));
     o.pushKV("rpc_port", static_cast<int64_t>(LaunchRPCPort(d)));
     UniValue seeds(UniValue::VARR);

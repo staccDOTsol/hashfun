@@ -64,6 +64,11 @@ struct LaunchDescriptor {
     //! Which Bitcoin the sats leg follows: mainnet rules (false) or regtest (true, for
     //! test fleets). Independent of `test`, which only relaxes mining RPC checks.
     bool btc_regtest{false};
+    //! SHA256 of the launch's metadata (image, description, links; see hashfun/meta.py). The
+    //! bytes themselves ride in the launch file under "metadata" and are not read by the node.
+    //! All zero = none. Appended to the canonical bytes only when set, so a launch without
+    //! metadata hashes exactly as it did before this field existed.
+    std::array<unsigned char, 32> meta{};
 
     // Not part of the launch id.
     uint16_t p2p_port{0};

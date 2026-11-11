@@ -69,6 +69,7 @@ def launch(rng, easy=True, **kw):
         sats_min_payment=rng.choice([546, 10_000, 10**8]), settle_deadline=rng.choice([110, 720, 10**6]),
         btc_confs=rng.choice([1, 6, 100]), creator_btc_script=rng.randbytes(rng.choice([1, 22, 34, 80])),
         btc_regtest=rng.random() < 0.5,
+        meta=rng.choice([bytes(32), rng.randbytes(32), bytes(31) + b"\x01"]),
     )
     base.update(kw)
     d = D.Launch(**base)
@@ -189,6 +190,10 @@ class DiffCpp(unittest.TestCase):
             {"btc_anchor_header": ""}, {"sats_num": 0}, {"sats_num": DELETE}, {"creator_btc_script": DELETE},
             {"btc_anchor_header": DELETE}, {"btc_anchor_header": "00" * 80},
             {"btc_regtest": True}, {"btc_regtest": False}, {"btc_regtest": 1}, {"btc_regtest": "true"}, {"btc_regtest": None},
+            {"meta": "ab" * 32}, {"meta": "00" * 32}, {"meta": "AB" * 32}, {"meta": "ab" * 31}, {"meta": "ab" * 33},
+            {"meta": "zz" * 32}, {"meta": ""}, {"meta": 5}, {"meta": None}, {"meta": DELETE}, {"meta": " " + "ab" * 31 + "a"},
+            {"metadata": {"description": "x"}}, {"metadata": "junk"}, {"metadata": None},
+            {"meta": "ab" * 32, "metadata": {"image": "!!"}},
             {**SATS}, {**SATS, "sats_num": 2**62}, {**SATS, "sats_num": 2**62 + 1}, {**SATS, "sats_shift": 128},
             {**SATS, "sats_shift": 129}, {**SATS, "sats_min_payment": 545}, {**SATS, "sats_min_payment": 546},
             {**SATS, "settle_deadline": 109}, {**SATS, "settle_deadline": 110}, {**SATS, "settle_deadline": 10**6 + 1},

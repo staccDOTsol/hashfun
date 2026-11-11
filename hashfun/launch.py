@@ -7,6 +7,7 @@ import sys
 import time
 
 from . import descriptor as D
+from . import meta as M
 from .ser import address_to_script, bits_to_target, work_from_bits
 
 COIN = D.COIN
@@ -44,7 +45,22 @@ def info(d: D.Launch) -> dict:
         "creator": {"script": d.creator_script.hex(), "fee_bps": d.creator_fee_bps},
         "difficulty": {"pow_limit_bits": f"{d.pow_limit_bits:08x}", "target_spacing": d.target_spacing,
                        "lwma_window": d.lwma_window, "ftl": d.ftl},
+        "meta": _meta_info(d),
     }
+
+
+def _meta_info(d: D.Launch) -> dict:
+    """What the launch commits to, and whether this file carries the matching bytes."""
+    if not any(d.meta):
+        return {"hash": None}
+    try:
+        m = M.check(d)
+    except M.MetaError as e:
+        return {"hash": d.meta.hex(), "verified": False, "error": str(e)}
+    if m is None:
+        return {"hash": d.meta.hex(), "verified": False, "error": "this file does not carry the metadata"}
+    return {"hash": d.meta.hex(), "verified": True, "description": m.description, "image_type": m.image_type,
+            "image_bytes": len(m.image), **{k: getattr(m, k) for k in M.LINKS if getattr(m, k)}}
 
 
 def node_conf(d: D.Launch, descriptor_path: str, rpcuser="hashfun", rpcpassword=None, extra=None) -> str:
@@ -85,6 +101,12 @@ def main(argv=None):
     p.add_argument("--tail-years", type=int, default=8)
     p.add_argument("--test", action="store_true", help="test launch: mockable time, nonstandard txs allowed")
     p.add_argument("--seed", action="append", default=[])
+    p.add_argument("--image", metavar="FILE", help="the coin's picture: PNG, JPEG, GIF or WebP, at most 64 KB. "
+                                                   "Its hash goes into the launch id; it can never be changed")
+    p.add_argument("--description", default="", help="a line or two about the coin (at most 500 bytes)")
+    p.add_argument("--website", default="", help="https:// link")
+    p.add_argument("--x", default="", help="https:// link to the coin's X account")
+    p.add_argument("--telegram", default="", help="https:// link")
     p.add_argument("-o", "--out", required=True)
     p = sub.add_parser("info")
     p.add_argument("descriptor")
@@ -105,6 +127,11 @@ def main(argv=None):
                    tail_years=a.tail_years, pow_limit_bits=int(a.pow_limit, 16), hrp=hrp,
                    btc_anchor=a.btc_anchor.split(":") if a.btc_anchor else None, btc_regtest=regtest)
         d.seeds = a.seed
+        try:
+            image = open(a.image, "rb").read() if a.image else b""
+            M.attach(d, M.from_image(image, description=a.description, website=a.website, x=a.x, telegram=a.telegram))
+        except (OSError, M.MetaError) as e:
+            ap.error(str(e))
         if a.btc_rpc:
             from .rpc import RPC
             h, hdr, period = D.btc_anchor_from_rpc(RPC(a.btc_rpc, cookie_file=a.btc_cookie))

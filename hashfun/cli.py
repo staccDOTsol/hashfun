@@ -77,6 +77,11 @@ class Registry:
 
     def add(self, descriptor_path: str, peers=(), p2p_port: Optional[int] = None) -> str:
         d = D.load(descriptor_path)
+        try:
+            from .meta import MetaError, check
+            check(d)  # a picture that is not the one the launch id commits to: refuse the file
+        except MetaError as e:
+            sys.exit(f"{descriptor_path}: {e}")
         base = os.path.join(home(), "launches", f"{d.ticker}-{d.id_hex[:8]}")
         os.makedirs(base, exist_ok=True)
         dst = os.path.join(base, "descriptor.json")

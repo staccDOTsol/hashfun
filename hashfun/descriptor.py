@@ -57,9 +57,14 @@ class Launch:
     btc_confs: int = 1
     creator_btc_script: bytes = b""
     btc_regtest: bool = False  # sats leg follows regtest Bitcoin (test fleets); independent of `test`
+    # SHA256 of the launch's metadata (picture, blurb, links: see meta.py). Hashed into the id only
+    # when set, so a launch without metadata keeps the id it always had. The bytes ride in the
+    # launch file as `metadata`; they are not consensus data and the node never reads them.
+    meta: bytes = bytes(32)
     p2p_port: int = 0
     rpc_port: int = 0
     seeds: List[str] = field(default_factory=list)
+    metadata: Optional[dict] = None  # not part of the id; verified against `meta` by meta.check()
 
     # ------------------------------------------------------------ identity
     def canonical_bytes(self) -> bytes:
@@ -78,7 +83,8 @@ class Launch:
                 bytes([1 if self.test else 0]) + u32(self.btc_anchor_height) + self.btc_anchor_header +
                 u32(self.btc_anchor_period_time) + struct.pack("<q", self.sats_num) + u32(self.sats_shift) +
                 struct.pack("<q", self.sats_min_payment) + u32(self.settle_deadline) + u32(self.btc_confs) +
-                vs(self.creator_btc_script) + bytes([1 if self.btc_regtest else 0]))
+                vs(self.creator_btc_script) + bytes([1 if self.btc_regtest else 0]) +
+                (self.meta if any(self.meta) else b""))
 
     @property
     def id(self) -> bytes:
@@ -252,8 +258,10 @@ class Launch:
             "settle_deadline": self.settle_deadline, "btc_confs": self.btc_confs,
             **({"creator_btc_script": self.creator_btc_script.hex()} if self.creator_btc_script else {}),
             "btc_regtest": self.btc_regtest,
+            **({"meta": self.meta.hex()} if any(self.meta) else {}),
             **({"p2p_port": self.p2p_port} if self.p2p_port else {}),
             **({"rpc_port": self.rpc_port} if self.rpc_port else {}), "seeds": self.seeds,
+            **({"metadata": self.metadata} if self.metadata else {}),
         }
 
     def dumps(self) -> str:
@@ -338,6 +346,8 @@ def parse(text_or_obj) -> Launch:
     btc_regtest = o.get("btc_regtest")
     if btc_regtest is not None and not isinstance(btc_regtest, bool):
         raise DescriptorError("btc_regtest: expected bool")
+    meta = _hexbytes(o, "meta", 32, 32, bytes(32))
+    metadata = o.get("metadata")  # carried, never judged here: the node ignores it too
     seeds = o.get("seeds")
     if seeds is not None and (not isinstance(seeds, list) or not all(isinstance(x, str) for x in seeds)):
         raise DescriptorError("seeds: expected array of strings")
@@ -364,9 +374,9 @@ def parse(text_or_obj) -> Launch:
         sats_num=_int(o, "sats_num", 2**62), sats_shift=_int(o, "sats_shift", 128),
         sats_min_payment=_int(o, "sats_min_payment", MAX_MONEY, 10_000),
         settle_deadline=_int(o, "settle_deadline", 1_000_000, 720), btc_confs=_int(o, "btc_confs", 100, 1),
-        creator_btc_script=creator_btc, btc_regtest=bool(btc_regtest),
+        creator_btc_script=creator_btc, btc_regtest=bool(btc_regtest), meta=meta,
         p2p_port=_int(o, "p2p_port", 65535), rpc_port=_int(o, "rpc_port", 65535),
-        seeds=list(seeds or []),
+        seeds=list(seeds or []), metadata=metadata if isinstance(metadata, dict) else None,
     )
     validate(d)
     return d
@@ -423,6 +433,8 @@ def validate(d: Launch):
         raise DescriptorError("tail_halving_interval: required when tail_reward > 0")
     if d.graduation_tokens + d.tail_reward * d.tail_halving_interval * 2 > MAX_MONEY:
         raise DescriptorError("graduation_tokens + total tail emission exceeds MAX_MONEY")
+    if len(d.meta) != 32:
+        raise DescriptorError("meta: expected 32..32 bytes of hex")
     if len(d.creator_script) > 100:
         raise DescriptorError("creator_script: at most 100 bytes")
     if d.creator_fee_bps > 0 and not d.creator_script:
@@ -470,7 +482,7 @@ def btc_anchor_from_rpc(rpc, depth: int = 6):
 def make(name: str, ticker: str, creator_script: bytes, graduation_hashes: int, *, supply_coins=15_000_000,
          creator_fee_bps=100, target_spacing=5, lwma_window=90, ftl=None, test=False, tail_years=8,
          pow_limit_bits=0x1E0FFFFF, genesis_time=None, hrp=None, btc_anchor=None, sats_total=None,
-         creator_btc_script=None, btc_regtest=None, _validate=True) -> Launch:
+         creator_btc_script=None, btc_regtest=None, metadata=None, _validate=True) -> Launch:
     """Build a descriptor with pump.fun-proportioned curve and a tail that emits
     the rest of the supply over `tail_years` with 4 halvings-ish."""
     t0 = supply_coins * COIN
@@ -486,6 +498,9 @@ def make(name: str, ticker: str, creator_script: bytes, graduation_hashes: int, 
                ftl=ftl or max(15, lwma_window * target_spacing // 20), tail_reward=tail,
                tail_halving_interval=interval, creator_script=creator_script, creator_fee_bps=creator_fee_bps,
                test=test, btc_regtest=test if btc_regtest is None else btc_regtest)
+    if metadata is not None:  # a meta.Meta: commit to it before the id is used for anything
+        from .meta import attach
+        attach(d, metadata)
     if btc_anchor:  # (height, 80-byte header hex, period start time)
         d.btc_anchor_height, d.btc_anchor_header = int(btc_anchor[0]), bytes.fromhex(btc_anchor[1])
         d.btc_anchor_period_time = int(btc_anchor[2]) if len(btc_anchor) > 2 else 0
