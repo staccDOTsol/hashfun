@@ -13,6 +13,13 @@ mkdir -p "$(dirname "$OUT")"
 OBJ="$OUT-obj"
 CXX="${CXX:-g++}"
 mkdir -p "$OBJ"
+# Objects of another compiler do not link with this one's (libstdc++ against libc++): start over
+# when the compiler is not the one that made what is here.
+stamp="$CXX | $("$CXX" --version 2>/dev/null | head -1)"
+if [ "$(cat "$OBJ/.compiler" 2>/dev/null)" != "$stamp" ]; then
+  rm -f "$OBJ"/*.o
+  printf '%s\n' "$stamp" > "$OBJ/.compiler"
+fi
 SRCS=(src/kernel/launch.cpp src/launchcurve.cpp src/launchyield.cpp src/pow.cpp src/chain.cpp src/kernel/chainparams.cpp
       src/primitives/block.cpp src/primitives/pureheader.cpp src/primitives/transaction.cpp src/auxpow.cpp
       src/consensus/merkle.cpp src/script/script.cpp src/hash.cpp src/crypto/sha256.cpp src/crypto/ripemd160.cpp
