@@ -8,6 +8,7 @@ import time
 
 from . import descriptor as D
 from . import meta as M
+from .crypto import sha256d
 from .ser import address_to_script, bits_to_target, work_from_bits
 
 COIN = D.COIN
@@ -45,6 +46,10 @@ def info(d: D.Launch) -> dict:
         "creator": {"script": d.creator_script.hex(), "fee_bps": d.creator_fee_bps},
         "difficulty": {"pow_limit_bits": f"{d.pow_limit_bits:08x}", "target_spacing": d.target_spacing,
                        "lwma_window": d.lwma_window, "ftl": d.ftl},
+        # The Bitcoin block the launch is anchored to. A launch file can say anything here that looks like a
+        # Bitcoin header: `info --btc-rpc` asks a Bitcoin node whether it is true (descriptor.check_anchor).
+        "btc_anchor": {"height": d.btc_anchor_height, "block": sha256d(d.btc_anchor_header)[::-1].hex(),
+                       "period_time": d.btc_anchor_period_time, "regtest": d.btc_regtest},
         "meta": _meta_info(d),
     }
 
@@ -75,6 +80,24 @@ def node_conf(d: D.Launch, descriptor_path: str, rpcuser="hashfun", rpcpassword=
     return "\n".join(lines) + "\n"
 
 
+def _load(ap, path: str) -> D.Launch:
+    """The launch file at `path`, or the tool's usual error exit saying what is wrong with it."""
+    try:
+        return D.load(path)
+    except OSError as e:
+        ap.error(f"{path}: {e.strerror or e}")
+    except D.DescriptorError as e:
+        ap.error(f"{path}: {e}")
+
+
+def _btc_rpc(ap, a):
+    from .rpc import RPC
+    try:
+        return RPC(a.btc_rpc, cookie_file=a.btc_cookie)
+    except (OSError, ValueError) as e:  # the cookie file, or a URL that is not one
+        ap.error(f"--btc-rpc: {e}")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="hashfun-launch", description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -89,8 +112,14 @@ def main(argv=None):
     p.add_argument("--spacing", type=int, default=5)
     p.add_argument("--window", type=int, default=90)
     p.add_argument("--btc-anchor", metavar="HEIGHT:HEADERHEX[:PERIODTIME]",
-                   help="recent Bitcoin block header; proves the launch was not mined before it")
-    p.add_argument("--btc-rpc", help="Bitcoin Core RPC URL: take the anchor from its chain (6 blocks deep)")
+                   help="the recent Bitcoin block the launch is anchored to (it proves the launch was not mined before "
+                        "that block): its height, its 80-byte header in hex, and the time of the first block of its "
+                        "2016-block difficulty period, which is block HEIGHT - HEIGHT %% 2016. PERIODTIME may be left "
+                        "out only when HEIGHT is a multiple of 2016 (that block opens its period, so the time is its "
+                        "own); anywhere else leaving it out is an error. --btc-rpc alone takes all three from a "
+                        "Bitcoin node, which is the easy way; given with --btc-anchor it checks the anchor against the node")
+    p.add_argument("--btc-rpc", help="Bitcoin Core RPC URL: take the anchor from its chain (6 blocks deep), or, with "
+                                     "--btc-anchor, check that anchor against its chain")
     p.add_argument("--btc-cookie", help="Bitcoin Core .cookie file, if the URL has no user:pass")
     p.add_argument("--sats-total", type=float, metavar="BTC",
                    help="sats leg: total BTC the curve owes holders/creator/dev (needs an anchor and --creator-btc-address)")
@@ -111,6 +140,9 @@ def main(argv=None):
     p = sub.add_parser("info")
     p.add_argument("descriptor")
     p.add_argument("--curve", action="store_true")
+    p.add_argument("--btc-rpc", help="Bitcoin Core RPC URL: check the launch's Bitcoin anchor against its chain (do this "
+                                     "before mining or joining a launch whose file came from someone else)")
+    p.add_argument("--btc-cookie", help="Bitcoin Core .cookie file, if the URL has no user:pass")
     p = sub.add_parser("conf")
     p.add_argument("descriptor")
     p.add_argument("--rpcuser", default="hashfun")
@@ -122,10 +154,13 @@ def main(argv=None):
         creator = address_to_script(a.creator_address, hrp)
         regtest = a.test or a.btc_regtest
         need_late = not regtest  # sats leg and anchor are filled in below, then validated
-        d = D.make(a.name, a.ticker, creator, int(a.graduation_hashes), supply_coins=a.supply, _validate=not need_late,
-                   creator_fee_bps=a.fee_bps, target_spacing=a.spacing, lwma_window=a.window, test=a.test,
-                   tail_years=a.tail_years, pow_limit_bits=int(a.pow_limit, 16), hrp=hrp,
-                   btc_anchor=a.btc_anchor.split(":") if a.btc_anchor else None, btc_regtest=regtest)
+        try:
+            d = D.make(a.name, a.ticker, creator, int(a.graduation_hashes), supply_coins=a.supply, _validate=not need_late,
+                       creator_fee_bps=a.fee_bps, target_spacing=a.spacing, lwma_window=a.window, test=a.test,
+                       tail_years=a.tail_years, pow_limit_bits=int(a.pow_limit, 16), hrp=hrp,
+                       btc_anchor=a.btc_anchor.split(":") if a.btc_anchor else None, btc_regtest=regtest)
+        except D.DescriptorError as e:
+            ap.error(f"--btc-anchor HEIGHT:HEADERHEX[:PERIODTIME]: {e}" if str(e).startswith("btc anchor") else str(e))
         d.seeds = a.seed
         try:
             image = open(a.image, "rb").read() if a.image else b""
@@ -133,9 +168,21 @@ def main(argv=None):
         except (OSError, M.MetaError) as e:
             ap.error(str(e))
         if a.btc_rpc:
-            from .rpc import RPC
-            h, hdr, period = D.btc_anchor_from_rpc(RPC(a.btc_rpc, cookie_file=a.btc_cookie))
-            d.btc_anchor_height, d.btc_anchor_header, d.btc_anchor_period_time = h, bytes.fromhex(hdr), period
+            btc = _btc_rpc(ap, a)
+            try:
+                if a.btc_anchor:  # an anchor was given: ask the node whether it is true
+                    D.check_anchor(d, btc)
+                else:
+                    h, hdr, period = D.btc_anchor_from_rpc(btc)
+                    d.btc_anchor_height, d.btc_anchor_header, d.btc_anchor_period_time = h, bytes.fromhex(hdr), period
+            except D.DescriptorError as e:
+                ap.error(str(e))
+            except Exception as e:  # the node did not answer, or not with a block
+                ap.error(f"--btc-rpc: could not read the anchor from the Bitcoin node: {e}")
+        elif a.btc_anchor and not regtest:
+            print("note: the Bitcoin anchor was taken as given. Add --btc-rpc URL to check it against a Bitcoin node: with "
+                  "a wrong height or period start the launch stops accepting Bitcoin headers at the next retarget, and "
+                  "nothing on it can settle after that.", file=sys.stderr)
         if a.creator_btc_address:
             d.creator_btc_script = address_to_script(a.creator_btc_address, a.btc_hrp)
         if a.sats_total:
@@ -143,8 +190,9 @@ def main(argv=None):
         try:
             D.validate(d)
         except D.DescriptorError as e:
+            missing = str(e).startswith(("sats_num", "btc_anchor_header: required", "creator_btc_script: required"))
             ap.error(f"{e}. Every launch needs --sats-total, --creator-btc-address and a Bitcoin anchor "
-                     "(--btc-rpc or --btc-anchor); --test fills regtest defaults.")
+                     "(--btc-rpc or --btc-anchor); --test fills regtest defaults." if missing else str(e))
         t0 = time.time()
         expected = 2**256 / (bits_to_target(d.pow_limit_bits) + 1)
         print(f"mining genesis (~{fmt_hashes(expected)} expected)...", file=sys.stderr)
@@ -154,13 +202,19 @@ def main(argv=None):
             f.write(d.dumps())
         print(json.dumps(info(d), indent=2))
     elif a.cmd == "info":
-        d = D.load(a.descriptor)
+        d = _load(ap, a.descriptor)
         out = info(d)
+        if a.btc_rpc:
+            try:
+                D.check_anchor(d, _btc_rpc(ap, a))
+            except D.DescriptorError as e:
+                ap.error(f"{a.descriptor}: {e}")
+            out["btc_anchor"]["checked"] = True  # it is the block at that height on the node's chain, period start and all
         if a.curve:
             out["curve_table"] = curve_table(d)
         print(json.dumps(out, indent=2))
     elif a.cmd == "conf":
-        d = D.load(a.descriptor)
+        d = _load(ap, a.descriptor)
         sys.stdout.write(node_conf(d, a.descriptor, a.rpcuser, a.rpcpassword))
 
 

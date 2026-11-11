@@ -3,6 +3,7 @@ tail, LWMA), descriptor identity + genesis, HTLC scripts, AuxPoW construction.
 Run: python -m unittest discover -s hashfun/tests -v"""
 import random
 import os
+import struct
 import unittest
 
 from hashfun import descriptor as D
@@ -261,12 +262,494 @@ class Descriptor(unittest.TestCase):
 
     def test_make_pump_shape(self):
         d = D.make("Pumpish", "PMP", bytes.fromhex("0014" + "22" * 20), 10**22,
-                   btc_anchor=(0, D.REGTEST_GENESIS_HEADER.hex()), sats_total=70_000_000,
+                   btc_anchor=(0, D.MAINNET_GENESIS_HEADER.hex()), sats_total=70_000_000,
                    creator_btc_script=D.TEST_BTC_SCRIPT)
         self.assertAlmostEqual(d.graduation_tokens / d.virtual_tokens, 0.7391, places=3)
         self.assertAlmostEqual(d.graduation_work / 10**22, 1.0, places=3)
         # pump.fun: price at graduation / price at start = (T0/(T0-G))^2 ~ 14.7
         self.assertAlmostEqual(d.hashes_per_coin(d.graduation_work) / d.hashes_per_coin(0), 14.7, delta=0.1)
+        # a production launch: 5 s blocks, a 90-block window, and the ftl that follows from the two
+        self.assertEqual((d.version, d.target_spacing, d.lwma_window, d.ftl, d.test, d.btc_regtest), (2, 5, 90, 22, False, False))
+        self.assertEqual(d.btc_anchor_period_time, 1231006505)  # the anchor opens its period: Bitcoin's first block time
+
+    # ---- the rules that came with descriptor version 2. test_diff_cpp runs the same cases, and many
+    # more, against the node's own parser; these run everywhere, with no node built.
+    def test_version_2_and_what_becomes_of_1(self):
+        import json
+        d = test_launch()
+        self.assertEqual((d.version, D.VERSION), (2, 2))
+        self.assertEqual(d.canonical_bytes()[:18], b"hashfun-launch\x02\x00\x00\x00")
+        j = d.to_json()
+        self.assertEqual(j["version"], 2)
+        self.assertEqual(D.parse(json.dumps({k: v for k, v in j.items() if k != "version"})).id, d.id)
+        for v, why in ((1, "pre-release rule set. This launch file must be created again"),
+                       (0, "unsupported descriptor version"), (3, "unsupported descriptor version")):
+            with self.assertRaisesRegex(D.DescriptorError, why):
+                D.parse(json.dumps(dict(j, version=v)))
+            with self.assertRaisesRegex(D.DescriptorError, why):
+                test_launch(version=v)
+        old = test_launch()
+        old.version = 1  # the version is hashed into the id: the same launch under the old rules was another chain
+        self.assertNotEqual(old.id, d.id)
+
+    def test_fields_left_out_take_their_defaults(self):
+        import json
+        genesis = D.MAINNET_GENESIS_HEADER
+        minimal = {"name": "Minimal", "ticker": "MIN", "genesis_time": 1_700_000_000, "virtual_work": "1000000",
+                   "virtual_tokens": 1000 * COIN, "graduation_tokens": 500 * COIN, "sats_num": 1,
+                   "btc_anchor_header": genesis.hex(), "btc_anchor_period_time": header_time(genesis),
+                   "creator_btc_script": "0014" + "22" * 20}
+        d = D.parse(json.dumps(minimal))
+        self.assertEqual((d.version, d.hrp, d.target_spacing, d.lwma_window, d.ftl, d.pow_limit_bits, d.test, d.btc_regtest,
+                          d.btc_anchor_height, d.sats_min_payment, d.settle_deadline, d.btc_confs),
+                         (2, "min", 5, 90, 22, 0x1D00FFFF, False, False, 0, 10_000, 720, 1))
+        for same in (dict(minimal, target_spacing=5, lwma_window=90, ftl=22), dict(minimal, ftl=None),
+                     dict(minimal, target_spacing=None, lwma_window=None, version=2)):
+            self.assertEqual(D.parse(json.dumps(same)).id, d.id)
+        for k in minimal:  # and none of those few can go
+            with self.assertRaises(D.DescriptorError):
+                D.parse(json.dumps({x: v for x, v in minimal.items() if x != k}))
+        # The ftl of a launch that names none follows its block time and its window, and always passes
+        # the rule a launch has to pass.
+        self.assertEqual([D.default_ftl(T, N) for T, N in ((5, 90), (2, 15), (10, 10), (60, 45), (3600, 1000), (2, 1000))],
+                         [22, 10, 10, 135, 7200, 11])
+        for T in range(2, 3601):
+            for N in (3, 4, 19, 20, 21, 45, 90, 144, 999, 1000):
+                f = D.default_ftl(T, N)
+                self.assertTrue(D.MIN_FTL <= f < 6 * T and f <= D.MAX_FTL, (T, N, f))
+        for T, N in ((2, 3), (2, 15), (5, 90), (10, 10), (60, 45), (600, 144), (3600, 1000)):
+            self.assertEqual(D.parse(json.dumps(dict(minimal, target_spacing=T, lwma_window=N))).ftl, D.default_ftl(T, N))
+            made = D.make("Defaults", "DFT", b"", 10**12, creator_fee_bps=0, target_spacing=T, lwma_window=N,
+                          btc_anchor=(0, genesis.hex()), sats_total=10**6, creator_btc_script=D.TEST_BTC_SCRIPT)
+            self.assertEqual((made.ftl, made.test, made.btc_regtest), (D.default_ftl(T, N), False, False))
+            self.assertEqual(D.make("Named", "NMD", b"", 10**12, creator_fee_bps=0, target_spacing=T, lwma_window=N, ftl=10,
+                                    btc_anchor=(0, genesis.hex()), sats_total=10**6, creator_btc_script=D.TEST_BTC_SCRIPT).ftl, 10)
+
+    def test_ftl_stays_below_a_stall_relief_step(self):
+        rule = r"ftl: at least 10 and less than 6 \* target_spacing"
+        for T, ftl, ok in ((10, 9, False), (10, 10, True), (10, 59, True), (10, 60, False), (2, 9, False), (2, 10, True),
+                           (2, 11, True), (2, 12, False), (60, 359, True), (60, 360, False), (1200, 7199, True),
+                           (1200, 7200, False), (1201, 7200, True), (3600, 7200, True)):
+            if ok:
+                self.assertEqual(production_launch(target_spacing=T, ftl=ftl).ftl, ftl)
+            else:
+                with self.assertRaisesRegex(D.DescriptorError, rule, msg=(T, ftl)):
+                    production_launch(target_spacing=T, ftl=ftl)
+        # A test launch stamps blocks far from the clock on purpose: it keeps the whole range.
+        for ftl in (1, 9, 60, 360, 7200):
+            test_launch(ftl=ftl)
+            production_launch(test=True, ftl=ftl)
+        for ftl in (0, 7201):
+            for make in (test_launch, production_launch):
+                with self.assertRaisesRegex(D.DescriptorError, r"ftl: 1\.\.7200"):
+                    make(ftl=ftl)
+
+    def test_fields_the_node_holds_as_an_int(self):
+        import json
+        top, j = 2**31 - 1, production_launch().to_json()
+        production_launch(tail_halving_interval=top)
+        production_launch(tail_reward=1, tail_halving_interval=top)
+        production_launch(btc_anchor_height=top)
+        for field in ("tail_halving_interval", "btc_anchor_height"):
+            self.assertEqual(getattr(D.parse(json.dumps(dict(j, **{field: top}))), field), top)
+            for v in (2**31, 2**32 - 1, 2**32, -1):
+                with self.assertRaisesRegex(D.DescriptorError, field + ": out of range", msg=v):
+                    production_launch(**{field: v})
+                with self.assertRaisesRegex(D.DescriptorError, field + ": out of range", msg=v):
+                    D.parse(json.dumps(dict(j, **{field: v})))
+
+    def test_anchor_has_to_be_a_bitcoin_header(self):
+        hdrs = mainnet_headers()
+        t0, own, own2016 = header_time(hdrs[0]), header_time(hdrs[1500]), header_time(hdrs[2016])
+        self.assertEqual(sha256d(hdrs[0]), sha256d(D.MAINNET_GENESIS_HEADER))
+
+        def with_bits(bits):
+            return hdrs[1500][:72] + struct.pack("<I", bits) + hdrs[1500][76:]
+
+        # the stored header with another nonce: difficulty 1 on its face, and a hash nowhere near
+        missed = next(h for h in (hdrs[1500][:76] + struct.pack("<I", n) for n in range(1, 50))
+                      if int.from_bytes(sha256d(h), "little") > bits_to_target(0x1D00FFFF))
+        good = [(1500, hdrs[1500], t0), (1500, hdrs[1500], own), (1500, hdrs[1500], own + 7200), (1500, hdrs[1500], 1),
+                (0, hdrs[0], t0), (4032, hdrs[0], t0), (2016, hdrs[2016], own2016),
+                (2017, hdrs[2016], t0)]  # a wrong height that no parser can see: check_anchor asks a Bitcoin node
+        bad = [((1500, hdrs[1500], 0), "btc_anchor_period_time: required"),
+               ((1500, hdrs[1500], own + 7201), "btc_anchor_period_time: later than the anchor block itself"),
+               ((1500, missed, t0), "its hash does not meet its own difficulty"),
+               ((0, missed, header_time(missed)), "its hash does not meet its own difficulty"),
+               ((2016, hdrs[2016], t0), "the anchor opens a difficulty period"),
+               ((2016, hdrs[2016], own2016 + 1), "the anchor opens a difficulty period"),
+               ((0, hdrs[0], t0 - 1), "the anchor opens a difficulty period"),
+               ((0, D.REGTEST_GENESIS_HEADER, header_time(D.REGTEST_GENESIS_HEADER)), "easier than Bitcoin's minimum difficulty"),
+               ((1500, with_bits(0x1D010000), t0), "easier than Bitcoin's minimum difficulty"),
+               ((1500, with_bits(0x2100FFFF), t0), "easier than Bitcoin's minimum difficulty"),
+               ((1500, with_bits(0x1B0404CB), t0), "its hash does not meet its own difficulty")]
+        bad += [((1500, with_bits(bits), t0), "its difficulty bits are not a valid target")
+                for bits in (0, 0x1D80FFFF, 0x1D000000, 0x01003456, 0x2200FFFF, 0xFF000001, 0x04800001)]
+        for height, header, period in good:
+            production_launch(btc_anchor_height=height, btc_anchor_header=header, btc_anchor_period_time=period)
+        for (height, header, period), why in bad:
+            with self.assertRaisesRegex(D.DescriptorError, why, msg=(height, header.hex(), period)):
+                production_launch(btc_anchor_height=height, btc_anchor_header=header, btc_anchor_period_time=period)
+            # with btc_regtest none of it is asked: regtest has no difficulty to speak of
+            production_launch(btc_anchor_height=height, btc_anchor_header=header, btc_anchor_period_time=period, btc_regtest=True)
+        for regtest in (False, True):
+            with self.assertRaisesRegex(D.DescriptorError, "btc_anchor_header: required"):
+                production_launch(btc_anchor_header=bytes(80), btc_regtest=regtest)
+
+    def test_creator_btc_script_has_to_earn(self):
+        from hashfun import yieldmodel as Y
+        rng = random.Random(5)
+        earning = [b"\x76\xa9\x14" + rng.randbytes(20) + b"\x88\xac", b"\xa9\x14" + rng.randbytes(20) + b"\x87",
+                   b"\x00\x14" + rng.randbytes(20), b"\x00\x20" + rng.randbytes(32), b"\x51\x20" + rng.randbytes(32),
+                   b"\x51\x02" + rng.randbytes(2), b"\x60\x28" + rng.randbytes(40)]
+        others = [b"\x51", b"\x51\x01\xaa", b"\x00\x00", b"\x51\x29" + rng.randbytes(41), b"\x6a\x14" + rng.randbytes(20),
+                  b"\x61\x02\xaa\xbb", b"\x50\x02\xaa\xbb", b"\x00\x13" + rng.randbytes(20), b"\x00\x15" + rng.randbytes(20),
+                  b"\x76\xa9\x14" + rng.randbytes(20) + b"\x88\xad", b"\xa9\x14" + rng.randbytes(20) + b"\x88",
+                  b"\x21" + rng.randbytes(33) + b"\xac", b"\x51" * 80]
+        for s in earning:
+            self.assertEqual(production_launch(creator_btc_script=s).creator_btc_script, s)
+            test_launch(creator_btc_script=s)
+        for s in others:
+            for make in (production_launch, test_launch):  # a test launch is not let off: its miners are paid in BTC too
+                with self.assertRaisesRegex(D.DescriptorError, "creator_btc_script: must be a P2PKH, P2SH or witness-program"):
+                    make(creator_btc_script=s)
+        with self.assertRaisesRegex(D.DescriptorError, "creator_btc_script: required"):
+            production_launch(creator_btc_script=b"")
+        # One rule, written down where a launch file is read and where the sats leg is run.
+        scripts = set(earning + others)
+        for s in earning:
+            scripts.update(s[:i] + bytes([b]) + s[i + 1:] for i in (0, 1, 2, len(s) - 2, len(s) - 1)
+                           for b in (0, 0x14, 0x20, 0x4f, 0x50, 0x51, 0x60, 0x61, 0x87, 0x88, 0xac, len(s) - 2, len(s) - 1))
+            scripts.update([s + b"\x00", s[:-1], s[1:], b"\x00" + s])
+        scripts.update(rng.randbytes(rng.randrange(1, 60)) for _ in range(500))
+        self.assertGreater(len(scripts), 800)
+        self.assertEqual([s for s in sorted(scripts) if D._earns_yield(s)], [s for s in sorted(scripts) if Y.earns_yield(s)])
+        self.assertGreater(sum(map(D._earns_yield, scripts)), 20)
+
+    def test_the_text_of_a_launch_file(self):
+        """Where JSON readers disagree, a launch file is refused (so is it by the node): no file is one
+        launch to one reader and another launch, or none, to the next."""
+        import json
+        import tempfile
+        base = production_launch().to_json()
+        text = json.dumps(base)
+        d = D.parse(text)
+
+        def more(extra):
+            return text[:-1] + "," + extra + "}"
+
+        self.assertEqual(D.parse(text.encode()).id, d.id)
+        refused = [
+            (more('"ticker":"RULE"'), "ticker: the key appears twice"), (more('"ticker":"ZZZ"'), "ticker: the key appears twice"),
+            ('{"ticker":"ZZZ",' + text[1:], "ticker: the key appears twice"), (more('"foo":1,"foo":2'), "foo: the key appears twice"),
+            (more('"metadata":{"a":1,"a":2}'), "a: the key appears twice"), (more('"x":[{"a":1,"a":1}]'), "a: the key appears twice"),
+            (more('"tick\\u0065r":"ZZZ"'), "ticker: the key appears twice"),
+            (more('"x":NaN'), "NaN is not a JSON value"), (more('"x":Infinity'), "Infinity is not a JSON value"),
+            (more('"x":-Infinity'), "-Infinity is not a JSON value"), (text.replace('"sats_shift": 3', '"sats_shift": NaN'), "NaN"),
+            (more('"x":' + "[" * 64 + "]" * 64), "nested more than 64 levels"),
+            (more('"x":' + "[" * 100_000 + "]" * 100_000), "nested more than 64 levels"),
+            (more('"x":' + "1" * 41), "a number of more than 40 characters"), (more('"x":1.' + "1" * 39), "more than 40 characters"),
+            (more('"x":"\\ud800"'), "not valid UTF-8"), (more('"\\udc00":1'), "not valid UTF-8"),
+            (text.replace('"name": "', '"name": "\\ud83d', 1), "not valid UTF-8"),
+            (text.encode().replace(b"Rules", b"R\xe9gles"), "descriptor is not valid UTF-8"),
+            (text.encode().replace(b"Rules", b"\xc1\x81"), "descriptor is not valid UTF-8"),
+            (text.encode().replace(b"Rules", b"\xed\xa0\x80"), "descriptor is not valid UTF-8"),
+            (text.encode("utf-16"), "descriptor is not valid UTF-8"), (b"\xef\xbb\xbf" + text.encode(), "not a JSON object"),
+            (text + text, "not a JSON object"), ("[" + text + "]", "not a JSON object"), ("", "not a JSON object"),
+            (json.dumps(dict(base, genesis_time="9" * 5000)), "genesis_time: out of range"),
+            (json.dumps(dict(base, virtual_work="9" * 5000)), "virtual_work: must be in"),
+        ]
+        for bad, why in refused:
+            with self.assertRaisesRegex(D.DescriptorError, why, msg=bad[:80]):
+                D.parse(bad)
+        same = [more('"x":' + "[" * 63 + "]" * 63), more('"x":' + "1" * 40), more('"x":{"a":1},"y":{"a":1}'),
+                more('"x":"\\ud83d\\ude00"'), " \r\n" + text + "\n", text.encode().replace(b", ", b",\r\n"),
+                json.dumps(dict(base, btc_anchor_height="0" * 5000 + "1500")),
+                json.dumps(dict(base, virtual_work="0" * 5000 + str(10**12)))]
+        for good in same:
+            self.assertEqual(D.parse(good).id, d.id, good[:80])
+        self.assertEqual(D.parse(text.encode().replace(b"Rules", "Règles".encode())).name, "Règles")
+        # A dict that was already read (a web form, a test) is taken as it is.
+        self.assertEqual(D.parse(base).id, d.id)
+        # A file is read as bytes: UTF-8, whatever the locale would make of it.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "launch.json")
+            with open(path, "wb") as f:
+                f.write(text.encode().replace(b"Rules", "Règles".encode()))
+            self.assertEqual(D.load(path).name, "Règles")
+            with open(path, "wb") as f:
+                f.write(text.encode().replace(b"Rules", b"R\xe8gles"))  # Latin-1
+            with self.assertRaisesRegex(D.DescriptorError, "descriptor is not valid UTF-8"):
+                D.load(path)
+
+    def test_make_takes_a_boundary_anchors_own_time(self):
+        hdrs = mainnet_headers()
+        t0 = header_time(hdrs[0])
+
+        def make(anchor, **kw):
+            return D.make("Anchored", "ANC", b"", 10**12, creator_fee_bps=0, btc_anchor=anchor, sats_total=10**6,
+                          creator_btc_script=D.TEST_BTC_SCRIPT, **kw)
+
+        for height, header in ((0, hdrs[0]), (2016, hdrs[2016]), (4032, hdrs[0])):  # the period starts with the anchor
+            d = make((height, header.hex()))
+            self.assertEqual((d.btc_anchor_height, d.btc_anchor_header, d.btc_anchor_period_time),
+                             (height, header, header_time(header)))
+            as_text = make([str(height), header.hex(), str(header_time(header))])  # strings, as a command line has them
+            self.assertEqual((as_text.btc_anchor_height, as_text.btc_anchor_period_time), (height, header_time(header)))
+        d = make((1500, hdrs[1500].hex(), t0))
+        self.assertEqual(d.btc_anchor_period_time, t0)
+        with self.assertRaisesRegex(D.DescriptorError, "left out only when the height is a multiple of 2016; block 1500 is inside "
+                                                       "a period, which starts at block 0"):
+            make((1500, hdrs[1500].hex()))
+        with self.assertRaisesRegex(D.DescriptorError, "block 4031 is inside a period, which starts at block 2016"):
+            make((4031, hdrs[1500].hex()))
+        with self.assertRaisesRegex(D.DescriptorError, "the anchor opens a difficulty period"):
+            make((2016, hdrs[2016].hex(), t0))  # given, and wrong
+        # Regtest Bitcoin never retargets: no period start to ask for.
+        d = make((1500, D.REGTEST_GENESIS_HEADER.hex()), test=True)
+        self.assertEqual((d.btc_anchor_height, d.btc_anchor_period_time, d.btc_regtest), (1500, 0, True))
+        self.assertEqual(make(None, test=True).btc_anchor_header, D.REGTEST_GENESIS_HEADER)
+        for anchor, why in (((1500, "zz" * 80, t0), "btc anchor: expected a height"), (("x", hdrs[0].hex()), "btc anchor: expected"),
+                            ((0, hdrs[0].hex(), "soon"), "btc anchor: expected"), ((0,), "btc anchor: expected"),
+                            ((0, hdrs[0].hex(), t0, 1), "btc anchor: expected"), ((0, hdrs[0].hex()[:-2]), "the header is 80 bytes"),
+                            ((0, hdrs[0]), "btc anchor: expected"), ((2**31, hdrs[1500].hex(), t0), "btc_anchor_height: out of range"),
+                            ((1500, hdrs[1500].hex(), 2**32), "btc_anchor_period_time: out of range"),
+                            ((1500, hdrs[1500].hex(), -1), "btc_anchor_period_time: out of range")):
+            with self.assertRaisesRegex(D.DescriptorError, why, msg=str(anchor)[:60]):
+                make(anchor)
+
+    def test_check_anchor_asks_a_bitcoin_node(self):
+        hdrs = mainnet_headers()
+        t0, node = header_time(hdrs[0]), FakeBitcoin(mainnet_headers())
+
+        def anchored(height, header, period, **kw):
+            return production_launch(btc_anchor_height=height, btc_anchor_header=header, btc_anchor_period_time=period, **kw)
+
+        for d in (anchored(1500, hdrs[1500], t0), anchored(0, hdrs[0], t0), anchored(2015, hdrs[2015], t0),
+                  anchored(2016, hdrs[2016], header_time(hdrs[2016])), production_launch()):
+            self.assertIsNone(D.check_anchor(d, node))
+        self.assertEqual(node.asked[:4], [("getblockcount",), ("getblockhash", 1500), ("getblockheader", node.hash(1500), False),
+                                          ("getblockhash", 0)])
+        # Each of these is a launch file both parsers accept. Only a Bitcoin node can tell.
+        for d, why in ((anchored(1499, hdrs[1500], t0), "block 1499 on this Bitcoin node's chain is " + node.hash(1499)),
+                       (anchored(2017, hdrs[2016], t0), "this Bitcoin node is only at 2016"),
+                       (anchored(1500, hdrs[1500], t0 + 1), f"btc_anchor_period_time is {t0 + 1}, but the difficulty period of "
+                                                            f"block 1500 starts at block 0, whose time is {t0}"),
+                       (anchored(1500, hdrs[1500], 1), "btc_anchor_period_time is 1, but"),
+                       (anchored(4032, hdrs[0], t0), "this Bitcoin node is only at 2016")):
+            with self.assertRaisesRegex(D.DescriptorError, "btc anchor: .*" + why):
+                D.check_anchor(d, node)
+        with self.assertRaisesRegex(D.DescriptorError, "the launch's anchor header is block " + node.hash(1500) + ", but block 1500"):
+            D.check_anchor(anchored(1500, hdrs[1500], t0), FakeBitcoin(hdrs[:1500] + [hdrs[1499]] + hdrs[1501:]))
+        # A launch on regtest Bitcoin has no period start to check, the block itself it has.
+        on_regtest = anchored(1500, hdrs[1500], 0, btc_regtest=True)
+        self.assertIsNone(D.check_anchor(on_regtest, node))
+        with self.assertRaisesRegex(D.DescriptorError, "btc anchor: .*block 1500 on this Bitcoin node's chain is"):
+            D.check_anchor(anchored(1500, hdrs[1499], 0, btc_regtest=True), node)
+        # A node that does not answer has not said yes.
+        for failure in (OSError("connection refused"), KeyError("time"), ValueError("not JSON")):
+            with self.assertRaisesRegex(D.DescriptorError, "btc anchor: could not ask the Bitcoin node"):
+                D.check_anchor(production_launch(), FakeBitcoin(hdrs, fail=failure))
+        with self.assertRaisesRegex(D.DescriptorError, "the header in the launch is not the header of Bitcoin block 1500"):
+            D.check_anchor(production_launch(), FakeBitcoin(hdrs, lie=hdrs[1499]))
+        # What btc_anchor_from_rpc takes from a node is an anchor that passes.
+        height, header, period = D.btc_anchor_from_rpc(node)
+        self.assertEqual((height, header, period), (2010, hdrs[2010].hex(), t0))
+        self.assertIsNone(D.check_anchor(anchored(height, bytes.fromhex(header), period), node))
+
+
+def production_launch(**kw):
+    """A launch on production rules (not a test launch, Bitcoin's mainnet rules), anchored in the middle
+    of the stored difficulty period."""
+    hdrs = mainnet_headers()
+    fields = dict(name="Rules", ticker="RULE", hrp="rule", genesis_time=1_700_000_000, virtual_work=10**12,
+                  virtual_tokens=15_000_000 * COIN, graduation_tokens=11_086_000 * COIN, pow_limit_bits=0x207FFFFF,
+                  target_spacing=60, lwma_window=45, ftl=135, btc_anchor_height=1500, btc_anchor_header=hdrs[1500],
+                  btc_anchor_period_time=header_time(hdrs[0]), sats_num=5, sats_shift=3,
+                  creator_btc_script=bytes.fromhex("0014" + "22" * 20))
+    fields.update(kw)
+    d = D.Launch(**fields)
+    D.validate(d)
+    return d
+
+
+_MAINNET_HEADERS = []
+
+
+def mainnet_headers():
+    """Bitcoin's genesis block and 2,016 blocks Bitcoin Core mined on it under mainnet rules: one whole
+    difficulty period and the first block of the next (data/mainnet_alt_headers.hex)."""
+    if not _MAINNET_HEADERS:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "mainnet_alt_headers.hex")) as f:
+            _MAINNET_HEADERS.extend(bytes.fromhex(x) for x in f.read().split())
+    return _MAINNET_HEADERS
+
+
+def header_time(header: bytes) -> int:
+    return struct.unpack("<I", header[68:72])[0]
+
+
+class FakeBitcoin:
+    """The three calls check_anchor makes, answered from a list of headers (height = position)."""
+
+    def __init__(self, headers, fail=None, lie=None):
+        self.headers, self.fail, self.lie, self.asked = list(headers), fail, lie, []
+        self.by_hash = {sha256d(h)[::-1].hex(): h for h in self.headers}
+
+    def hash(self, height):
+        return sha256d(self.headers[height])[::-1].hex()
+
+    def getblockcount(self):
+        self.asked.append(("getblockcount",))
+        if self.fail:
+            raise self.fail
+        return len(self.headers) - 1
+
+    def getblockhash(self, height):
+        self.asked.append(("getblockhash", height))
+        return self.hash(height)
+
+    def getblockheader(self, block_hash, verbose=True):
+        self.asked.append(("getblockheader", block_hash, verbose))
+        header = self.lie or self.by_hash[block_hash]
+        return {"hash": block_hash, "time": header_time(header)} if verbose else header.hex()
+
+
+class LaunchTool(unittest.TestCase):
+    """hashfun launch new / info (hashfun/launch.py): the Bitcoin anchor a launch is given."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.mkdtemp(prefix="hashfun-launch-test-")
+        self.addCleanup(__import__("shutil").rmtree, self.tmp, ignore_errors=True)
+        self.out = os.path.join(self.tmp, "launch.json")
+        self.hdrs = mainnet_headers()
+        self.t0 = header_time(self.hdrs[0])
+
+    def run_tool(self, *argv, node=None):
+        """(exit code, stdout, stderr) of the launch tool; `node` stands in for the Bitcoin node of --btc-rpc."""
+        import contextlib
+        import io
+        from unittest import mock
+        from hashfun import launch
+        out, err, code = io.StringIO(), io.StringIO(), 0
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), \
+                mock.patch("hashfun.rpc.RPC", lambda url, cookie_file=None: node):
+            try:
+                launch.main(list(argv))
+            except SystemExit as e:
+                code = e.code
+        return code, out.getvalue(), err.getvalue()
+
+    def new(self, *more, node=None):
+        return self.run_tool("new", "--name", "Tool", "--ticker", "TOOL", "--creator-address", segwit_encode("tool", 0, bytes(20)),
+                             "--graduation-hashes", "1e6", "--pow-limit", "207fffff", "--sats-total", "0.01",
+                             "--creator-btc-address", "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4", "-o", self.out, *more, node=node)
+
+    def test_anchor_without_its_period_start(self):
+        # in the middle of a difficulty period the start time has to be given: the tool says so and writes nothing
+        code, _, err = self.new("--btc-anchor", f"1500:{self.hdrs[1500].hex()}")
+        self.assertEqual(code, 2)
+        self.assertIn("--btc-anchor HEIGHT:HEADERHEX[:PERIODTIME]", err)
+        self.assertIn("may be left out only when the height is a multiple of 2016", err)
+        self.assertIn("block 1500 is inside a period, which starts at block 0", err)
+        self.assertFalse(os.path.exists(self.out))
+        # at a retarget boundary it is the header's own time
+        code, out, err = self.new("--btc-anchor", f"2016:{self.hdrs[2016].hex()}")
+        self.assertEqual(code, 0, err)
+        d = D.load(self.out)
+        self.assertEqual((d.btc_anchor_height, d.btc_anchor_header, d.btc_anchor_period_time, d.btc_regtest, d.test),
+                         (2016, self.hdrs[2016], header_time(self.hdrs[2016]), False, False))
+        self.assertEqual((d.version, d.ftl), (2, D.default_ftl(5, 90)))
+        self.assertTrue(d.genesis_valid())
+        self.assertIn("Add --btc-rpc URL to check it against a Bitcoin node", err)  # taken as given, and said so
+        import json
+        self.assertEqual(json.loads(out)["btc_anchor"], {"height": 2016, "block": sha256d(self.hdrs[2016])[::-1].hex(),
+                                                         "period_time": header_time(self.hdrs[2016]), "regtest": False})
+
+    def test_anchor_with_its_period_start(self):
+        code, _, err = self.new("--btc-anchor", f"1500:{self.hdrs[1500].hex()}:{self.t0}")
+        self.assertEqual(code, 0, err)
+        d = D.load(self.out)
+        self.assertEqual((d.btc_anchor_height, d.btc_anchor_period_time), (1500, self.t0))
+        for anchor, why in ((f"1500:{self.hdrs[1500].hex()}:0", "btc_anchor_period_time: required"),
+                            (f"2016:{self.hdrs[2016].hex()}:{self.t0}", "the anchor opens a difficulty period"),
+                            (f"1500:{self.hdrs[1500].hex()[:-8]}00000001:{self.t0}", "does not meet its own difficulty"),
+                            (f"0:{D.REGTEST_GENESIS_HEADER.hex()}", "easier than Bitcoin's minimum difficulty"),
+                            ("1500", "btc anchor: expected a height"), (f"x:{self.hdrs[0].hex()}", "btc anchor: expected a height"),
+                            (f"0:{self.hdrs[0].hex()[:-2]}", "the header is 80 bytes")):
+            code, _, err = self.new("--btc-anchor", anchor)
+            self.assertEqual(code, 2, anchor[:20])
+            self.assertIn(why, err)
+            self.assertNotIn("Traceback", err)
+        # --help says which is which
+        code, out, _ = self.run_tool("new", "--help")
+        self.assertEqual(code, 0)
+        self.assertIn("PERIODTIME may be left out only when HEIGHT is a multiple of 2016", " ".join(out.split()))
+
+    def test_test_launches_need_no_period_start(self):
+        code, _, err = self.new("--test", "--btc-anchor", f"1500:{D.REGTEST_GENESIS_HEADER.hex()}")
+        self.assertEqual(code, 0, err)
+        d = D.load(self.out)
+        self.assertEqual((d.btc_anchor_height, d.btc_anchor_period_time, d.btc_regtest, d.test), (1500, 0, True, True))
+        code, _, err = self.new("--test")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(D.load(self.out).btc_anchor_header, D.REGTEST_GENESIS_HEADER)
+
+    def test_btc_rpc_gives_the_anchor_or_checks_the_one_given(self):
+        node = FakeBitcoin(self.hdrs)
+        code, _, err = self.new("--btc-rpc", "http://127.0.0.1:1", node=node)  # six blocks below the node's tip
+        self.assertEqual(code, 0, err)
+        d = D.load(self.out)
+        self.assertEqual((d.btc_anchor_height, d.btc_anchor_header, d.btc_anchor_period_time), (2010, self.hdrs[2010], self.t0))
+        self.assertNotIn("taken as given", err)
+        os.remove(self.out)
+        # an anchor given by hand is checked against the node, not replaced by the node's
+        code, _, err = self.new("--btc-anchor", f"1500:{self.hdrs[1500].hex()}:{self.t0}", "--btc-rpc", "http://127.0.0.1:1", node=node)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(D.load(self.out).btc_anchor_height, 1500)
+        os.remove(self.out)
+        for anchor, why in ((f"1500:{self.hdrs[1500].hex()}:{self.t0 + 60}", f"btc_anchor_period_time is {self.t0 + 60}, but"),
+                            (f"1499:{self.hdrs[1500].hex()}:{self.t0}", "block 1499 on this Bitcoin node's chain is")):
+            code, _, err = self.new("--btc-anchor", anchor, "--btc-rpc", "http://127.0.0.1:1", node=node)
+            self.assertEqual(code, 2)
+            self.assertIn(why, err)
+            self.assertFalse(os.path.exists(self.out))
+        code, _, err = self.new("--btc-rpc", "http://127.0.0.1:1", node=FakeBitcoin(self.hdrs, fail=OSError("connection refused")))
+        self.assertEqual(code, 2)
+        self.assertIn("could not read the anchor from the Bitcoin node: connection refused", err)
+
+    def test_info_reads_and_checks_a_launch_file(self):
+        import json
+        node = FakeBitcoin(self.hdrs)
+        d = production_launch()
+        with open(self.out, "w") as f:
+            f.write(d.dumps())
+        code, out, err = self.run_tool("info", self.out)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)["btc_anchor"], {"height": 1500, "block": node.hash(1500), "period_time": self.t0,
+                                                         "regtest": False})
+        code, out, err = self.run_tool("info", self.out, "--btc-rpc", "http://127.0.0.1:1", node=node)
+        self.assertEqual(code, 0, err)
+        self.assertTrue(json.loads(out)["btc_anchor"]["checked"])
+        wrong = production_launch(btc_anchor_period_time=self.t0 + 1)  # a file both parsers accept
+        with open(self.out, "w") as f:
+            f.write(wrong.dumps())
+        self.assertEqual(self.run_tool("info", self.out)[0], 0)
+        code, out, err = self.run_tool("info", self.out, "--btc-rpc", "http://127.0.0.1:1", node=node)
+        self.assertEqual((code, out), (2, ""))
+        self.assertIn(f"btc_anchor_period_time is {self.t0 + 1}, but the difficulty period of block 1500 starts at block 0", err)
+        # a file made for the rules before these, and one that is no launch file at all
+        with open(self.out, "w") as f:
+            f.write(json.dumps(dict(d.to_json(), version=1)))
+        for cmd in ("info", "conf"):
+            code, out, err = self.run_tool(cmd, self.out)
+            self.assertEqual((code, out), (2, ""))
+            self.assertIn("version: 1 is the earlier, pre-release rule set. This launch file must be created again", err)
+            self.assertNotIn("Traceback", err)
+        code, _, err = self.run_tool("info", os.path.join(self.tmp, "none.json"))
+        self.assertEqual(code, 2)
+        self.assertIn("No such file", err)
 
 
 class Htlc(unittest.TestCase):

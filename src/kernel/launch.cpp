@@ -12,6 +12,7 @@
 #include <univalue.h>
 #include <util/strencodings.h>
 
+#include <algorithm>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -175,6 +176,141 @@ bool GetStr(const UniValue& o, const std::string& key, std::string& out, std::st
     return true;
 }
 
+/**
+ * Strict UTF-8, as Python and browsers decode it: shortest forms only, no surrogates, nothing past
+ * U+10FFFF. UniValue by itself is looser inside strings (it reads an overlong form as the
+ * character it spells and joins two surrogates written as bytes), so the same bytes would be one
+ * name to the node and another, or no launch at all, to everything else.
+ */
+bool StrictUtf8(const std::string& s)
+{
+    const size_t n = s.size();
+    size_t i = 0;
+    while (i < n) {
+        const unsigned char c = s[i];
+        if (c < 0x80) {
+            ++i;
+            continue;
+        }
+        size_t len{0};
+        uint32_t cp{0}, smallest{0}; // the code point, and the smallest one this many bytes may spell
+        if (c >= 0xc2 && c <= 0xdf) {
+            len = 2;
+            cp = c & 0x1f;
+            smallest = 0x80;
+        } else if (c >= 0xe0 && c <= 0xef) {
+            len = 3;
+            cp = c & 0x0f;
+            smallest = 0x800;
+        } else if (c >= 0xf0 && c <= 0xf4) {
+            len = 4;
+            cp = c & 0x07;
+            smallest = 0x10000;
+        } else {
+            return false; // a continuation byte first, an overlong 2-byte form (c0, c1), or f5..ff
+        }
+        if (n - i < len) return false;
+        for (size_t k = 1; k < len; ++k) {
+            const unsigned char t = s[i + k];
+            if ((t & 0xc0) != 0x80) return false;
+            cp = (cp << 6) | (t & 0x3f);
+        }
+        if (cp < smallest || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) return false;
+        i += len;
+    }
+    return true;
+}
+
+/**
+ * Something, anywhere in the document, that JSON readers do not agree about; the file is refused
+ * rather than left to mean one launch to the node and another to the tools around it.
+ *  - A key twice in one object: UniValue takes the first, Python and JavaScript the last.
+ *  - A number of more than 40 characters: no field of a launch file is that long, UniValue keeps
+ *    any length as text, and other readers give up on long ones at different lengths.
+ *  - Objects and arrays more than 64 deep (the outer object counted): UniValue reads 512, other
+ *    readers stop wherever their stack does.
+ * hashfun/descriptor.py _loads applies the same three rules, and the ones UniValue applies by
+ * itself (no NaN or Infinity, no unpaired surrogate escapes).
+ */
+std::optional<std::string> DocumentProblem(const UniValue& v, size_t depth = 1)
+{
+    if (v.isNum() && v.getValStr().size() > 40) return std::string{"descriptor: a number of more than 40 characters"};
+    if (!v.isObject() && !v.isArray()) return std::nullopt;
+    if (depth > 64) return std::string{"descriptor: nested more than 64 levels"};
+    if (v.isObject()) {
+        std::set<std::string> seen;
+        for (const std::string& k : v.getKeys()) {
+            if (!seen.insert(k).second) return strprintf("%s: the key appears twice in one object", k);
+        }
+    }
+    for (const UniValue& e : v.getValues()) {
+        if (auto problem = DocumentProblem(e, depth + 1)) return problem;
+    }
+    return std::nullopt;
+}
+
+/**
+ * The script forms that earn on a launch chain: P2PKH, P2SH or a witness program. This is
+ * launchyield::EarnsYield (src/launchyield.cpp) on raw bytes; hashfun/descriptor.py _earns_yield
+ * and hashfun/yieldmodel.py earns_yield are the same rule. Kept here on bytes so that the
+ * descriptor parser depends on nothing but itself; test_diff_cpp holds all of them together.
+ */
+bool EarningScript(const std::vector<unsigned char>& s)
+{
+    const size_t n = s.size();
+    if (n == 25 && s[0] == 0x76 && s[1] == 0xa9 && s[2] == 20 && s[23] == 0x88 && s[24] == 0xac) return true;
+    if (n == 23 && s[0] == 0xa9 && s[1] == 20 && s[22] == 0x87) return true;
+    return n >= 4 && n <= 42 && (s[0] == 0x00 || (s[0] >= 0x51 && s[0] <= 0x60)) && s[1] == n - 2;
+}
+
+/**
+ * What can be said about a Bitcoin anchor without a Bitcoin chain to look at. Enough to refuse a
+ * made-up header (anyone could extend a difficulty-1-or-easier fake chain cheaply and "prove"
+ * payments on it) and a period start that would make the relay compute a wrong difficulty at the
+ * first retarget, after which no real Bitcoin header connects and nothing settles again.
+ */
+bool CheckBtcAnchor(const LaunchDescriptor& d, std::string& error)
+{
+    const auto& h = d.btc_anchor_header;
+    const auto le32 = [&](size_t at) {
+        return uint32_t{h[at]} | (uint32_t{h[at + 1]} << 8) | (uint32_t{h[at + 2]} << 16) | (uint32_t{h[at + 3]} << 24);
+    };
+    const uint32_t anchor_time = le32(68), bits = le32(72);
+    arith_uint256 target, limit;
+    bool neg, ovf;
+    target.SetCompact(bits, &neg, &ovf);
+    if (neg || ovf || target == 0) {
+        error = "btc_anchor_header: its difficulty bits are not a valid target";
+        return false;
+    }
+    limit.SetCompact(0x1d00ffff); // Bitcoin's proof-of-work limit
+    if (target > limit) {
+        error = "btc_anchor_header: easier than Bitcoin's minimum difficulty (not a Bitcoin mainnet header; a regtest anchor needs btc_regtest)";
+        return false;
+    }
+    std::array<unsigned char, 32> hash;
+    CSHA256().Write(h.data(), h.size()).Finalize(hash.data());
+    CSHA256().Write(hash.data(), hash.size()).Finalize(hash.data());
+    if (UintToArith256(uint256{std::span<const unsigned char>{hash.data(), hash.size()}}) > target) {
+        error = "btc_anchor_header: its hash does not meet its own difficulty (not a Bitcoin block header)";
+        return false;
+    }
+    if (d.btc_anchor_period_time == 0) {
+        error = "btc_anchor_period_time: required (the time of the first block of the anchor's 2016-block difficulty period)";
+        return false;
+    }
+    if (d.btc_anchor_height % 2016 == 0) {
+        if (d.btc_anchor_period_time != anchor_time) {
+            error = "btc_anchor_period_time: the anchor opens a difficulty period (height is a multiple of 2016), so it must be the anchor header's own time";
+            return false;
+        }
+    } else if (uint64_t{d.btc_anchor_period_time} > uint64_t{anchor_time} + 7200) {
+        error = "btc_anchor_period_time: later than the anchor block itself";
+        return false;
+    }
+    return true;
+}
+
 bool ParseUint256Decimal(const std::string& s, arith_uint256& out)
 {
     out = 0;
@@ -201,6 +337,14 @@ bool ParseUint256Decimal(const std::string& s, arith_uint256& out)
 }
 
 } // namespace
+
+uint32_t LaunchDefaultFtl(uint32_t target_spacing, uint32_t lwma_window)
+{
+    // 64-bit: the inputs come from a file and are range-checked only after this runs.
+    const uint64_t lwma_share = uint64_t{lwma_window} * target_spacing / 20; // what LWMA tolerates: 1/20 of its window
+    const uint64_t below_relief = uint64_t{6} * target_spacing - (target_spacing > 0 ? 1 : 0);
+    return static_cast<uint32_t>(std::min({below_relief, uint64_t{LAUNCH_MAX_FTL}, std::max<uint64_t>(LAUNCH_MIN_FTL, lwma_share)}));
+}
 
 std::vector<unsigned char> LaunchCanonicalBytes(const LaunchDescriptor& d)
 {
@@ -256,14 +400,26 @@ std::string LaunchIdHex(const LaunchDescriptor& d)
 
 std::optional<LaunchDescriptor> ParseLaunchDescriptor(const std::string& json, std::string& error)
 {
+    if (!StrictUtf8(json)) {
+        error = "descriptor is not valid UTF-8";
+        return std::nullopt;
+    }
     UniValue o;
     if (!o.read(json) || !o.isObject()) {
         error = "descriptor is not a JSON object";
         return std::nullopt;
     }
+    if (const auto problem = DocumentProblem(o)) {
+        error = *problem;
+        return std::nullopt;
+    }
     LaunchDescriptor d;
     if (!GetUInt(o, "version", d.version, error, 0xffffffff)) return std::nullopt;
-    if (d.version != 1) {
+    if (d.version == 1) {
+        error = "version: 1 is the earlier, pre-release rule set. This launch file must be created again (hashfun launch new)";
+        return std::nullopt;
+    }
+    if (d.version != LAUNCH_DESCRIPTOR_VERSION) {
         error = "unsupported descriptor version";
         return std::nullopt;
     }
@@ -283,7 +439,8 @@ std::optional<LaunchDescriptor> ParseLaunchDescriptor(const std::string& json, s
     if (!GetUInt(o, "pow_limit_bits", d.pow_limit_bits, error, 0xffffffff)) return std::nullopt;
     if (!GetUInt(o, "target_spacing", d.target_spacing, error, 3600)) return std::nullopt;
     if (!GetUInt(o, "lwma_window", d.lwma_window, error, 1000)) return std::nullopt;
-    if (!GetUInt(o, "ftl", d.ftl, error, 7200)) return std::nullopt;
+    if (!GetUInt(o, "ftl", d.ftl, error, LAUNCH_MAX_FTL)) return std::nullopt;
+    if (o.find_value("ftl").isNull()) d.ftl = LaunchDefaultFtl(d.target_spacing, d.lwma_window);
 
     std::string vw;
     if (!GetStr(o, "virtual_work", vw, error, true)) return std::nullopt;
@@ -298,7 +455,9 @@ std::optional<LaunchDescriptor> ParseLaunchDescriptor(const std::string& json, s
     if (!GetUInt(o, "virtual_tokens", d.virtual_tokens, error, MAX_MONEY)) return std::nullopt;
     if (!GetUInt(o, "graduation_tokens", d.graduation_tokens, error, MAX_MONEY)) return std::nullopt;
     if (!GetUInt(o, "tail_reward", d.tail_reward, error, MAX_MONEY)) return std::nullopt;
-    if (!GetUInt(o, "tail_halving_interval", d.tail_halving_interval, error, 0xffffffff)) return std::nullopt;
+    // Below 2^31: the chain parameters hold it as an int (a larger value would turn negative there
+    // and the tail would pay nothing, while a 64-bit reader would pay it in full).
+    if (!GetUInt(o, "tail_halving_interval", d.tail_halving_interval, error, 0x7fffffff)) return std::nullopt;
     std::string cs;
     if (!GetStr(o, "creator_script", cs, error, false)) return std::nullopt;
     auto csb = TryParseHex<unsigned char>(cs);
@@ -320,7 +479,7 @@ std::optional<LaunchDescriptor> ParseLaunchDescriptor(const std::string& json, s
     }
     if (!GetUInt(o, "p2p_port", d.p2p_port, error, 65535)) return std::nullopt;
     if (!GetUInt(o, "rpc_port", d.rpc_port, error, 65535)) return std::nullopt;
-    if (!GetUInt(o, "btc_anchor_height", d.btc_anchor_height, error, 0xffffffff)) return std::nullopt;
+    if (!GetUInt(o, "btc_anchor_height", d.btc_anchor_height, error, 0x7fffffff)) return std::nullopt; // an int in the chain parameters
     {
         std::vector<unsigned char> hdr;
         if (!GetHexBytes(o, "btc_anchor_header", hdr, error, 80, 80)) return std::nullopt;
@@ -364,8 +523,13 @@ std::optional<LaunchDescriptor> ParseLaunchDescriptor(const std::string& json, s
                 error = "btc_anchor_header: required";
                 return std::nullopt;
             }
+            if (!d.btc_regtest && !CheckBtcAnchor(d, error)) return std::nullopt;
             if (d.creator_btc_script.empty()) {
                 error = "creator_btc_script: required";
+                return std::nullopt;
+            }
+            if (!EarningScript(d.creator_btc_script)) {
+                error = "creator_btc_script: must be a P2PKH, P2SH or witness-program script (one a Bitcoin node relays a payment to)";
                 return std::nullopt;
             }
             if (d.sats_min_payment < 546) {
@@ -439,6 +603,12 @@ std::optional<LaunchDescriptor> ParseLaunchDescriptor(const std::string& json, s
     }
     if (d.ftl < 1) {
         error = "ftl: 1..7200";
+        return std::nullopt;
+    }
+    // See LAUNCH_MIN_FTL in launch.h. A test launch keeps the whole range: its tests stamp blocks
+    // far from the clock on purpose.
+    if (!d.test && (d.ftl < LAUNCH_MIN_FTL || uint64_t{d.ftl} >= uint64_t{6} * d.target_spacing)) {
+        error = "ftl: at least 10 and less than 6 * target_spacing (only a test launch may be outside that)";
         return std::nullopt;
     }
     if (v0 == 0 || v0 > (arith_uint256{1} << 160)) {

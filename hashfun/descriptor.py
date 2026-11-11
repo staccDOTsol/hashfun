@@ -9,16 +9,34 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 
 from .crypto import sha256, sha256d
-from .ser import Tx, TxIn, TxOut, header_bytes, push, bits_to_target, work_from_bits, OP_RETURN
+from .ser import Tx, TxIn, TxOut, header_bytes, push, push_int, bits_to_target, work_from_bits, OP_RETURN
 
 COIN = 100_000_000
 MAX_MONEY = 21_000_000 * COIN
 RESERVED_HRPS = {"bc", "tb", "bcrt", "ltc", "tltc", "rltc", "nc", "tn", "ncrt"}
 BTC_PREFIXES = {0, 5, 111, 196}
+# The descriptor format (LAUNCH_DESCRIPTOR_VERSION in src/kernel/launch.h). It is hashed into the
+# launch id and names the rule set: 1 = the pre-release rules, 2 = the sats leg drawn over live coins.
+VERSION = 2
+# A launch that is not a test launch: MIN_FTL <= ftl < 6 * target_spacing (why: launch.h).
+MIN_FTL = 10
+MAX_FTL = 7200
+BTC_POW_LIMIT_BITS = 0x1D00FFFF  # Bitcoin's easiest difficulty: no mainnet header is easier
+INT_MAX = 2**31 - 1              # fields the node holds as a C++ int
+# Two limits on the file itself that the node applies as well (DocumentProblem in src/kernel/launch.cpp):
+# no launch file comes near either, and past them JSON readers stop agreeing with each other.
+MAX_NESTING = 64                 # objects and arrays inside each other, the outer object counted
+MAX_NUMBER_CHARS = 40            # characters of one number
 
 
 class DescriptorError(ValueError):
     pass
+
+
+def default_ftl(target_spacing: int, lwma_window: int) -> int:
+    """The ftl of a launch that names none (LaunchDefaultFtl in src/kernel/launch.cpp): what LWMA
+    tolerates (1/20 of its window), at least MIN_FTL, below one stall-relief step (6T) and MAX_FTL."""
+    return min(max(0, 6 * target_spacing - 1), MAX_FTL, max(MIN_FTL, lwma_window * target_spacing // 20))
 
 
 @dataclass
@@ -29,7 +47,7 @@ class Launch:
     virtual_work: int
     virtual_tokens: int
     graduation_tokens: int
-    version: int = 1
+    version: int = VERSION
     hrp: str = ""
     pubkey_prefix: int = 40
     script_prefix: int = 100
@@ -38,7 +56,7 @@ class Launch:
     pow_limit_bits: int = 0x1D00FFFF
     target_spacing: int = 5
     lwma_window: int = 90
-    ftl: int = 60
+    ftl: int = 22  # default_ftl(5, 90)
     tail_reward: int = 0
     tail_halving_interval: int = 0
     creator_script: bytes = b""
@@ -273,6 +291,16 @@ _HEX = re.compile(r"0x[0-9a-fA-F]+")
 _V0 = re.compile(r"0[xX][0-9a-fA-F]{1,64}|[0-9]+")
 
 
+def _decimal(s: str) -> int:
+    """int(s) for a string of decimal digits of any length, with an optional '-'. int() itself gives up
+    past 4300 digits, zeros in front included, while the node reads such a string digit by digit:
+    zeros in front mean nothing there, and a value this long is out of every field's range."""
+    neg, digits = s.startswith("-"), s.lstrip("-").lstrip("0")
+    if len(digits) > 100:
+        return -(10**100) if neg else 10**100  # the caller refuses it as out of range
+    return -int(digits or "0") if neg else int(digits or "0")
+
+
 def _int(o: dict, key: str, maxv: int, default: int = 0, required: bool = False) -> int:
     """launch.cpp GetUInt: a JSON integer, or a string of decimal digits (std::from_chars,
     so an optional '-' and nothing else) or lowercase-0x hex. null/missing keeps the default."""
@@ -285,7 +313,7 @@ def _int(o: dict, key: str, maxv: int, default: int = 0, required: bool = False)
         if _HEX.fullmatch(v):
             v = int(v, 16)
         elif _DEC.fullmatch(v):
-            v = int(v)
+            v = _decimal(v)
         else:
             raise DescriptorError(f"{key}: not an integer")
     if isinstance(v, bool) or not isinstance(v, int):
@@ -318,17 +346,120 @@ def _str(o: dict, key: str, default: Optional[str] = None) -> str:
     return v
 
 
-def parse(text_or_obj) -> Launch:
-    """Accepts exactly what ParseLaunchDescriptor accepts (test_diff_cpp checks this)."""
+def _pairs(pairs):
+    """Python keeps the last of two equal keys, the node's reader the first: one file, two launches.
+    Refuse the file, as ParseLaunchDescriptor does (DocumentProblem in launch.cpp)."""
+    out = {}
+    for k, v in pairs:
+        if k in out:
+            raise DescriptorError(f"{k}: the key appears twice in one object")
+        out[k] = v
+    return out
+
+
+def _constant(token):
+    # NaN, Infinity, -Infinity: Python's json reads them, JSON has no such thing and the node refuses them
+    raise DescriptorError(f"descriptor is not a JSON object: {token} is not a JSON value")
+
+
+def _number(convert):
+    def read(literal: str):
+        if len(literal) > MAX_NUMBER_CHARS:
+            raise DescriptorError(f"descriptor: a number of more than {MAX_NUMBER_CHARS} characters")
+        return convert(literal)
+    return read
+
+
+def _loads(text):
+    """JSON as the node reads it (ParseLaunchDescriptor: strict UTF-8, UniValue, DocumentProblem).
+    Python's json is more forgiving than that in ways that would let one file mean two things, or be
+    a launch here and garbage there: duplicate keys, NaN and Infinity, unpaired surrogates in
+    strings, numbers and nesting of any size. `text` is a str, or the bytes of a file."""
+    if isinstance(text, (bytes, bytearray)):
+        try:
+            text = bytes(text).decode("utf-8")  # strict: shortest forms, no surrogates, nothing past U+10FFFF
+        except UnicodeDecodeError:
+            raise DescriptorError("descriptor is not valid UTF-8")
     try:
-        o = json.loads(text_or_obj) if isinstance(text_or_obj, str) else dict(text_or_obj)
+        o = json.loads(text, object_pairs_hook=_pairs, parse_constant=_constant,
+                       parse_int=_number(int), parse_float=_number(float))
+    except DescriptorError:
+        raise
+    except RecursionError:
+        raise DescriptorError(f"descriptor: nested more than {MAX_NESTING} levels")
     except ValueError as e:
         raise DescriptorError(f"descriptor is not a JSON object: {e}")
+    todo = [(o, 1)]
+    while todo:  # no recursion here: how deep to go is the file's choice
+        v, depth = todo.pop()
+        if isinstance(v, str):
+            try:
+                v.encode("utf-8")
+            except UnicodeEncodeError:  # half of a surrogate pair, written as a \u escape
+                raise DescriptorError("descriptor is not a JSON object: a string is not valid UTF-8")
+        elif isinstance(v, (dict, list)):
+            if depth > MAX_NESTING:
+                raise DescriptorError(f"descriptor: nested more than {MAX_NESTING} levels")
+            if isinstance(v, dict):
+                todo.extend((k, depth + 1) for k in v)
+            todo.extend((x, depth + 1) for x in (v.values() if isinstance(v, dict) else v))
+    return o
+
+
+def _earns_yield(script: bytes) -> bool:
+    """P2PKH, P2SH or a witness program. The same rule as launchyield::EarnsYield (src/launchyield.cpp),
+    EarningScript in src/kernel/launch.cpp and yieldmodel.earns_yield; kept here too so that reading a
+    launch file depends on nothing else (the tests hold the four together)."""
+    n = len(script)
+    if n == 25 and script[:3] == b"\x76\xa9\x14" and script[23:] == b"\x88\xac":
+        return True
+    if n == 23 and script[:2] == b"\xa9\x14" and script[22] == 0x87:
+        return True
+    return 4 <= n <= 42 and (script[0] == 0 or 0x51 <= script[0] <= 0x60) and script[1] == n - 2
+
+
+def _check_version(version: int):
+    if version == 1:
+        raise DescriptorError("version: 1 is the earlier, pre-release rule set. This launch file must be created "
+                              "again (hashfun launch new)")
+    if version != VERSION:
+        raise DescriptorError("unsupported descriptor version")
+
+
+def _check_btc_anchor(d: "Launch"):
+    """CheckBtcAnchor in launch.cpp: what can be said about a Bitcoin anchor without a Bitcoin chain to
+    look at. check_anchor() below asks a Bitcoin node for the rest."""
+    h = d.btc_anchor_header
+    time_, bits = struct.unpack("<II", h[68:76])
+    mant, exp = bits & 0x7FFFFF, bits >> 24
+    target = mant >> (8 * (3 - exp)) if exp <= 3 else mant << (8 * (exp - 3))
+    if (mant and bits & 0x800000) or target >= 2**256 or target == 0:
+        raise DescriptorError("btc_anchor_header: its difficulty bits are not a valid target")
+    if target > bits_to_target(BTC_POW_LIMIT_BITS):
+        raise DescriptorError("btc_anchor_header: easier than Bitcoin's minimum difficulty (not a Bitcoin mainnet "
+                              "header; a regtest anchor needs btc_regtest)")
+    if int.from_bytes(sha256d(h), "little") > target:
+        raise DescriptorError("btc_anchor_header: its hash does not meet its own difficulty (not a Bitcoin block header)")
+    if d.btc_anchor_period_time == 0:
+        raise DescriptorError("btc_anchor_period_time: required (the time of the first block of the anchor's "
+                              "2016-block difficulty period)")
+    if d.btc_anchor_height % 2016 == 0:
+        if d.btc_anchor_period_time != time_:
+            raise DescriptorError("btc_anchor_period_time: the anchor opens a difficulty period (height is a multiple "
+                                  "of 2016), so it must be the anchor header's own time")
+    elif d.btc_anchor_period_time > time_ + 7200:
+        raise DescriptorError("btc_anchor_period_time: later than the anchor block itself")
+
+
+def parse(text_or_obj) -> Launch:
+    """Accepts exactly what ParseLaunchDescriptor accepts (test_diff_cpp checks this): the text of a
+    launch file as a str, or the bytes of one. A dict that was already read from JSON is taken as it is
+    (what the rules about the text guard against cannot be seen in it any more)."""
+    o = _loads(text_or_obj) if isinstance(text_or_obj, (str, bytes, bytearray)) else dict(text_or_obj)
     if not isinstance(o, dict):
         raise DescriptorError("descriptor is not a JSON object")
-    version = _int(o, "version", 2**32 - 1, default=1)
-    if version != 1:
-        raise DescriptorError("unsupported descriptor version")
+    version = _int(o, "version", 2**32 - 1, default=VERSION)
+    _check_version(version)
     name, ticker = _str(o, "name"), _str(o, "ticker")
     hrp = _str(o, "hrp", default=ticker.lower())
     vw = _str(o, "virtual_work")
@@ -354,7 +485,7 @@ def parse(text_or_obj) -> Launch:
     d = Launch(
         name=name, ticker=ticker, hrp=hrp, version=version,
         genesis_time=_int(o, "genesis_time", 2**32 - 1, required=True),
-        virtual_work=int(vw, 16) if vw[:2] in ("0x", "0X") else int(vw),
+        virtual_work=int(vw, 16) if vw[:2] in ("0x", "0X") else _decimal(vw),
         virtual_tokens=_int(o, "virtual_tokens", MAX_MONEY),
         graduation_tokens=_int(o, "graduation_tokens", MAX_MONEY),
         pubkey_prefix=_int(o, "pubkey_prefix", 255, 40),
@@ -362,14 +493,14 @@ def parse(text_or_obj) -> Launch:
         secret_prefix=_int(o, "secret_prefix", 255, 168),
         genesis_nonce=_int(o, "genesis_nonce", 2**32 - 1),
         pow_limit_bits=_int(o, "pow_limit_bits", 2**32 - 1, 0x1D00FFFF),
-        target_spacing=_int(o, "target_spacing", 3600, 60),
-        lwma_window=_int(o, "lwma_window", 1000, 45),
-        ftl=_int(o, "ftl", 7200, 300),
+        target_spacing=_int(o, "target_spacing", 3600, 5),
+        lwma_window=_int(o, "lwma_window", 1000, 90),
+        ftl=_int(o, "ftl", MAX_FTL, -1),  # -1: not named; filled in below from the two above
         tail_reward=_int(o, "tail_reward", MAX_MONEY),
-        tail_halving_interval=_int(o, "tail_halving_interval", 2**32 - 1),
+        tail_halving_interval=_int(o, "tail_halving_interval", INT_MAX),
         creator_script=creator_script,
         creator_fee_bps=_int(o, "creator_fee_bps", 1000),
-        test=bool(test), btc_anchor_height=_int(o, "btc_anchor_height", 2**32 - 1), btc_anchor_header=anchor,
+        test=bool(test), btc_anchor_height=_int(o, "btc_anchor_height", INT_MAX), btc_anchor_header=anchor,
         btc_anchor_period_time=_int(o, "btc_anchor_period_time", 2**32 - 1),
         sats_num=_int(o, "sats_num", 2**62), sats_shift=_int(o, "sats_shift", 128),
         sats_min_payment=_int(o, "sats_min_payment", MAX_MONEY, 10_000),
@@ -378,6 +509,8 @@ def parse(text_or_obj) -> Launch:
         p2p_port=_int(o, "p2p_port", 65535), rpc_port=_int(o, "rpc_port", 65535),
         seeds=list(seeds or []), metadata=metadata if isinstance(metadata, dict) else None,
     )
+    if d.ftl < 0:
+        d.ftl = default_ftl(d.target_spacing, d.lwma_window)
     validate(d)
     return d
 
@@ -391,16 +524,26 @@ def validate(d: Launch):
         raise DescriptorError("sats_num: required (every launch has a sats leg)")
     if not has_anchor:
         raise DescriptorError("btc_anchor_header: required")
+    if len(d.btc_anchor_header) != 80:
+        raise DescriptorError("btc_anchor_header: expected 80..80 bytes of hex")
+    if not 0 <= d.btc_anchor_height <= INT_MAX:
+        raise DescriptorError("btc_anchor_height: out of range")
+    if not 0 <= d.btc_anchor_period_time < 2**32:
+        raise DescriptorError("btc_anchor_period_time: out of range")
+    if not d.btc_regtest:
+        _check_btc_anchor(d)
     if not d.creator_btc_script:
         raise DescriptorError("creator_btc_script: required")
+    if not _earns_yield(d.creator_btc_script):
+        raise DescriptorError("creator_btc_script: must be a P2PKH, P2SH or witness-program script (one a Bitcoin "
+                              "node relays a payment to)")
     if d.sats_min_payment < 546:
         raise DescriptorError("sats_min_payment: at least 546")
     if d.settle_deadline < 110:
         raise DescriptorError("settle_deadline: at least 110 blocks")
     if d.btc_confs < 1:
         raise DescriptorError("btc_confs: at least 1")
-    if d.version != 1:
-        raise DescriptorError("unsupported descriptor version")
+    _check_version(d.version)
     try:
         name_bytes = len(d.name.encode("utf-8"))
     except UnicodeEncodeError:
@@ -421,14 +564,20 @@ def validate(d: Launch):
         raise DescriptorError("target_spacing: 2..3600")
     if d.lwma_window < 3:
         raise DescriptorError("lwma_window: 3..1000")
-    if d.ftl < 1:
+    if not 1 <= d.ftl <= MAX_FTL:
         raise DescriptorError("ftl: 1..7200")
+    # See LAUNCH_MIN_FTL in src/kernel/launch.h. A test launch keeps the whole range: its tests stamp
+    # blocks far from the clock on purpose.
+    if not d.test and not MIN_FTL <= d.ftl < 6 * d.target_spacing:
+        raise DescriptorError("ftl: at least 10 and less than 6 * target_spacing (only a test launch may be outside that)")
     if not (0 < d.virtual_work <= 2**160):
         raise DescriptorError("virtual_work: must be in (0, 2^160]")
     if not (0 < d.graduation_tokens < d.virtual_tokens):
         raise DescriptorError("need 0 < graduation_tokens < virtual_tokens")
     if d.virtual_tokens - d.graduation_tokens < d.virtual_tokens // 1000:
         raise DescriptorError("graduation_tokens may be at most 99.9% of virtual_tokens")
+    if not 0 <= d.tail_halving_interval <= INT_MAX:
+        raise DescriptorError("tail_halving_interval: out of range")
     if d.tail_reward > 0 and d.tail_halving_interval == 0:
         raise DescriptorError("tail_halving_interval: required when tail_reward > 0")
     if d.graduation_tokens + d.tail_reward * d.tail_halving_interval * 2 > MAX_MONEY:
@@ -442,7 +591,7 @@ def validate(d: Launch):
 
 
 def load(path: str) -> Launch:
-    with open(path) as f:
+    with open(path, "rb") as f:  # bytes, as the node reads it: UTF-8 whatever the locale says
         return parse(f.read())
 
 
@@ -456,6 +605,12 @@ PUMP_RATIO_T = 10730
 REGTEST_GENESIS_HEADER = bytes.fromhex(
     "0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f"
     "617fc81bc3888a51323a9fb8aa4b1e5e4adae5494dffff7f2002000000")
+# Bitcoin's own genesis header: the one mainnet anchor everybody can check by eye (height 0, and
+# since it opens a difficulty period its period start is its own time). For tests and examples;
+# a real launch anchors a few blocks below the tip (btc_anchor_from_rpc).
+MAINNET_GENESIS_HEADER = bytes.fromhex(
+    "0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f"
+    "617fc81bc3888a51323a9fb8aa4b1e5e4a29ab5f49ffff001d1dac2b7c")
 TEST_BTC_SCRIPT = bytes.fromhex("0014" + "c1" * 20)  # creator payout of test launches (nobody's key)
 
 
@@ -479,6 +634,47 @@ def btc_anchor_from_rpc(rpc, depth: int = 6):
     return height, header, period
 
 
+def check_anchor(d: Launch, btc_rpc) -> None:
+    """Ask a Bitcoin node whether the launch's anchor is what the launch file says it is: the header
+    of the block at btc_anchor_height on the node's best chain, and (unless btc_regtest, where
+    difficulty never retargets) btc_anchor_period_time the time of the first block of that block's
+    2016-block difficulty period.
+
+    The parser can only tell that the header is a Bitcoin header at all; it has no chain to look at.
+    A real header at a wrong height, or a wrong period start, passes it, and such a launch refuses
+    real Bitcoin headers at the first retarget after the anchor (two weeks at most): from then on no
+    payment can be proven and every curve coinbase that owes sats is lost. So check before mining a
+    launch, before joining one, and before taking a launch file from someone else.
+
+    btc_rpc: a hashfun.rpc.RPC (or anything with getblockcount / getblockhash / getblockheader) for
+    the Bitcoin network the launch follows. Raises DescriptorError with what is wrong."""
+    height = d.btc_anchor_height
+    ours = sha256d(d.btc_anchor_header)[::-1].hex()
+    try:
+        tip = btc_rpc.getblockcount()
+        if height > tip:
+            raise DescriptorError(f"btc anchor: the launch names Bitcoin block {height}, and this Bitcoin node is only at "
+                                  f"{tip} (still syncing, or another network)")
+        theirs = btc_rpc.getblockhash(height)
+        if theirs != ours:
+            raise DescriptorError(f"btc anchor: the launch's anchor header is block {ours}, but block {height} on this "
+                                  f"Bitcoin node's chain is {theirs} (wrong height, another network, or a made-up header)")
+        if bytes.fromhex(btc_rpc.getblockheader(theirs, False)) != d.btc_anchor_header:
+            raise DescriptorError(f"btc anchor: the header in the launch is not the header of Bitcoin block {height}")
+        if not d.btc_regtest:
+            first = height - height % 2016
+            start = btc_rpc.getblockheader(btc_rpc.getblockhash(first))["time"]
+            if d.btc_anchor_period_time != start:
+                raise DescriptorError(f"btc anchor: btc_anchor_period_time is {d.btc_anchor_period_time}, but the difficulty "
+                                      f"period of block {height} starts at block {first}, whose time is {start}. With the "
+                                      "wrong start this launch would refuse real Bitcoin headers at the next retarget "
+                                      "and nothing on it could settle after that")
+    except DescriptorError:
+        raise
+    except Exception as e:  # RPCError, OSError, a malformed answer: the question was not answered
+        raise DescriptorError(f"btc anchor: could not ask the Bitcoin node: {e}")
+
+
 def make(name: str, ticker: str, creator_script: bytes, graduation_hashes: int, *, supply_coins=15_000_000,
          creator_fee_bps=100, target_spacing=5, lwma_window=90, ftl=None, test=False, tail_years=8,
          pow_limit_bits=0x1E0FFFFF, genesis_time=None, hrp=None, btc_anchor=None, sats_total=None,
@@ -495,15 +691,35 @@ def make(name: str, ticker: str, creator_script: bytes, graduation_hashes: int, 
     d = Launch(name=name, ticker=ticker, hrp=hrp or ticker.lower(), genesis_time=genesis_time or int(time.time()),
                virtual_work=v0, virtual_tokens=t0, graduation_tokens=g, pow_limit_bits=pow_limit_bits,
                target_spacing=target_spacing, lwma_window=lwma_window,
-               ftl=ftl or max(15, lwma_window * target_spacing // 20), tail_reward=tail,
+               ftl=ftl or default_ftl(target_spacing, lwma_window), tail_reward=tail,
                tail_halving_interval=interval, creator_script=creator_script, creator_fee_bps=creator_fee_bps,
                test=test, btc_regtest=test if btc_regtest is None else btc_regtest)
     if metadata is not None:  # a meta.Meta: commit to it before the id is used for anything
         from .meta import attach
         attach(d, metadata)
-    if btc_anchor:  # (height, 80-byte header hex, period start time)
-        d.btc_anchor_height, d.btc_anchor_header = int(btc_anchor[0]), bytes.fromhex(btc_anchor[1])
-        d.btc_anchor_period_time = int(btc_anchor[2]) if len(btc_anchor) > 2 else 0
+    if btc_anchor:  # (height, 80-byte header in hex, period start time): what btc_anchor_from_rpc returns
+        try:
+            if not 2 <= len(btc_anchor) <= 3:
+                raise ValueError
+            d.btc_anchor_height, d.btc_anchor_header = int(btc_anchor[0]), bytes.fromhex(btc_anchor[1])
+            period = int(btc_anchor[2]) if len(btc_anchor) == 3 else None
+        except (ValueError, TypeError):
+            raise DescriptorError("btc anchor: expected a height, the block's 80-byte header in hex, and the start time "
+                                  "of its difficulty period")
+        if len(d.btc_anchor_header) != 80:
+            raise DescriptorError("btc anchor: the header is 80 bytes (160 hex digits)")
+        if period is not None:
+            d.btc_anchor_period_time = period
+        elif d.btc_anchor_height % 2016 == 0:  # the anchor opens its difficulty period: the start is its own time
+            d.btc_anchor_period_time = struct.unpack("<I", d.btc_anchor_header[68:72])[0]
+        elif not d.btc_regtest:
+            first = d.btc_anchor_height - d.btc_anchor_height % 2016
+            raise DescriptorError(
+                "btc anchor: the start time of the difficulty period is missing. It may be left out only when the "
+                f"height is a multiple of 2016; block {d.btc_anchor_height} is inside a period, which starts at block "
+                f"{first}: give that block's time (bitcoin-cli getblockheader $(bitcoin-cli getblockhash {first}) shows "
+                "it), or take the whole anchor from a Bitcoin node (--btc-rpc, btc_anchor_from_rpc). Without it the "
+                "launch would stop accepting Bitcoin headers at the next retarget")
     elif d.btc_regtest:  # anchor at the regtest genesis
         d.btc_anchor_header = REGTEST_GENESIS_HEADER
     d.creator_btc_script = creator_btc_script or (TEST_BTC_SCRIPT if d.btc_regtest else b"")

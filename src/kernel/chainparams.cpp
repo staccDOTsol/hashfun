@@ -30,6 +30,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <span>
 #include <stdexcept>
@@ -784,6 +785,20 @@ static arith_uint256 WorkForBits(uint32_t nBits)
 static const std::vector<unsigned char> HASHFUN_DEV_BTC_SCRIPT{ParseHex("5120c2cc659454f102e1b1ae85697405163154acc4a8946f6065f7821913ea29aa53")};
 
 /**
+ * A descriptor field that the consensus parameters hold as an int. The parser bounds every one of
+ * them (tail_halving_interval and btc_anchor_height below 2^31, settle_deadline <= 1,000,000,
+ * lwma_window <= 1000, btc_confs <= 100), so this never throws for a parsed descriptor; it is here
+ * so that a descriptor built any other way cannot turn into a negative number either.
+ */
+static int LaunchInt(uint32_t v, const char* field)
+{
+    if (v > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
+        throw std::runtime_error(strprintf("launch descriptor: %s is out of range", field));
+    }
+    return static_cast<int>(v);
+}
+
+/**
  * hashfun launch chain: every parameter comes from the descriptor.
  */
 class CLaunchParams : public CChainParams
@@ -797,7 +812,7 @@ public:
 
         consensus.signet_blocks = false;
         consensus.signet_challenge.clear();
-        consensus.nSubsidyHalvingInterval = d.tail_halving_interval > 0 ? static_cast<int>(d.tail_halving_interval) : 210000;
+        consensus.nSubsidyHalvingInterval = d.tail_halving_interval > 0 ? LaunchInt(d.tail_halving_interval, "tail_halving_interval") : 210000;
         consensus.BIP16Height = 0;
         consensus.BIP34Height = 1;
         consensus.BIP34Hash = uint256{};
@@ -815,7 +830,7 @@ public:
         consensus.fPowAllowMinDifficultyBlocks = false;
         consensus.enforce_BIP94 = false;
         consensus.fPowNoRetargeting = false;
-        consensus.lwma_window = d.lwma_window;
+        consensus.lwma_window = LaunchInt(d.lwma_window, "lwma_window");
         consensus.max_future_block_time = d.ftl;
 
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].bit = 28;
@@ -862,19 +877,19 @@ public:
             consensus.launch_graduation_work = ArithToUint256(wg);
         }
         consensus.launch_tail_reward = d.tail_reward;
-        consensus.launch_tail_halving_interval = static_cast<int>(d.tail_halving_interval);
+        consensus.launch_tail_halving_interval = LaunchInt(d.tail_halving_interval, "tail_halving_interval");
         consensus.launch_creator_script = d.creator_script;
         consensus.launch_creator_fee_bps = d.creator_fee_bps;
         consensus.launch_sats_num = d.sats_num;
         consensus.launch_sats_shift = d.sats_shift;
         consensus.launch_sats_min_payment = d.sats_min_payment;
-        consensus.launch_settle_deadline = d.settle_deadline;
-        consensus.launch_btc_confs = d.btc_confs;
+        consensus.launch_settle_deadline = LaunchInt(d.settle_deadline, "settle_deadline");
+        consensus.launch_btc_confs = LaunchInt(d.btc_confs, "btc_confs");
         consensus.launch_creator_btc_script = d.creator_btc_script;
         // The dev's 10% of the sats leg.
         consensus.launch_dev_btc_script = HASHFUN_DEV_BTC_SCRIPT;
         consensus.launch_btc_anchor_header.assign(d.btc_anchor_header.begin(), d.btc_anchor_header.end());
-        consensus.launch_btc_anchor_height = d.btc_anchor_height;
+        consensus.launch_btc_anchor_height = LaunchInt(d.btc_anchor_height, "btc_anchor_height");
         consensus.launch_btc_anchor_period_time = d.btc_anchor_period_time;
         consensus.launch_btc_regtest = d.btc_regtest;
 
