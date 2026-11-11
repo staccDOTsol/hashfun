@@ -138,6 +138,21 @@ class ChainAccount:
             nxt[change] = last_used + 1
         return utxos, nxt[0], nxt[1]
 
+    def used_keys(self) -> List[XPriv]:
+        """Keys of this account that have ever received coins on its chain."""
+        keys = []
+        for change in (0, 1):
+            i, gap = 0, 0
+            while gap < GAP:
+                k = self.key(change, i)
+                if self.ec.call("blockchain.scripthash.get_history", sha256(p2wpkh_script(k.pub()))[::-1].hex()):
+                    keys.append(k)
+                    gap = 0
+                else:
+                    gap += 1
+                i += 1
+        return keys
+
     def receive_address(self) -> str:
         _, r, _ = self.scan()
         return self.address(0, r)
@@ -267,6 +282,43 @@ class Wallet:
         self.data["chains"][name] = {"electrum": electrum, "hrp": hrp, "coin_type": coin_type, "kind": kind}
         self.save()
         self.chains[name] = ChainAccount(self, name, self.data["chains"][name])
+
+    # ---- BTC yield ----
+    # Holding launch coins earns BTC from later buyers, paid on Bitcoin at the holder's own launch
+    # script. A launch is a Bitcoin fork, so the same key spends it there.
+    def yield_utxos(self, btc: str = "BTC") -> List[dict]:
+        """Bitcoin UTXOs sitting at this wallet's launch keys."""
+        b, out = self.chains[btc], []
+        for name, c in self.chains.items():
+            if c.cfg.get("kind") != "launch":
+                continue
+            for k in c.used_keys():
+                spk = p2wpkh_script(k.pub())
+                for u in b.ec.call("blockchain.scripthash.listunspent", sha256(spk)[::-1].hex()):
+                    out.append({**u, "key": k, "spk": spk, "launch": name})
+        return out
+
+    def yield_balance(self, btc: str = "BTC") -> Dict[str, int]:
+        by = {}
+        for u in self.yield_utxos(btc):
+            by[u["launch"]] = by.get(u["launch"], 0) + u["value"]
+        return by
+
+    def claim_yield(self, btc: str = "BTC", feerate: Optional[int] = None) -> Optional[str]:
+        """Sweep all earned BTC into the wallet's Bitcoin account. None if there is nothing worth moving."""
+        b = self.chains[btc]
+        utxos = self.yield_utxos(btc)
+        total = sum(u["value"] for u in utxos)
+        fee = (11 + 68 * len(utxos) + 31) * (feerate or b.feerate())
+        if not utxos or total - fee <= 546:
+            return None
+        tx = Tx(version=2, vin=[TxIn(bytes.fromhex(u["tx_hash"])[::-1], u["tx_pos"], b"", 0xFFFFFFFD) for u in utxos],
+                vout=[TxOut(total - fee, b.dest_script())], locktime=0)
+        for idx, u in enumerate(utxos):
+            k = u["key"]
+            sig = der_sig(*ecdsa_sign(k.key, bip143_sighash(tx, idx, p2wpkh_script_code(k.pub()), u["value"]))) + b"\x01"
+            tx.vin[idx].witness = [sig, k.pub()]
+        return b.broadcast(tx)
 
     def next_htlc_key(self, chain: str) -> XPriv:
         i = self.data.setdefault("htlc_next", {}).get(chain, 0)
@@ -406,6 +458,8 @@ def main(argv=None):
         p.add_argument("amount")
         p.add_argument("--relay", required=True)
     p = sub.add_parser("swaps")
+    sub.add_parser("yield", help="BTC earned by holding launch coins (paid at your launch keys on Bitcoin)")
+    sub.add_parser("claim-yield", help="sweep earned BTC into the wallet's Bitcoin account")
     a = ap.parse_args(argv)
     if a.cmd == "init":
         w = Wallet.create(a.wallet, a.mnemonic)
@@ -430,6 +484,10 @@ def main(argv=None):
     elif a.cmd in ("buy", "sell"):
         rec = w.swap(a.relay.rstrip("/"), a.ticker, a.cmd, sats(a.amount))
         print(json.dumps({k: v for k, v in rec.items() if k != "secret"}, indent=2))
+    elif a.cmd == "yield":
+        print(json.dumps({k: coins(v) for k, v in w.yield_balance().items()}, indent=2))
+    elif a.cmd == "claim-yield":
+        print(json.dumps({"txid": w.claim_yield()}))
     elif a.cmd == "swaps":
         print(json.dumps({k: {kk: vv for kk, vv in v.items() if kk != "secret"} for k, v in w.data.get("swaps", {}).items()},
                          indent=2))

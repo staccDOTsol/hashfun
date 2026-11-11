@@ -294,6 +294,29 @@ class WalletSwapTests(unittest.TestCase):
         t.join(5)
         return out.get("rec")
 
+    def test_1b_btc_yield_lands_on_launch_keys_and_is_claimable(self):
+        # The sats leg pays holders on Bitcoin at their launch scriptPubKey. The wallet holds
+        # launch coins at SWP key 0/0, so BTC sent to that same script is its yield.
+        launch_key = self.w.chains["SWP"].key(0, 0)
+        launch_spk = address_to_script(self.w.chains["SWP"].address(0, 0), self.fd.hrp)
+        self.assertEqual(launch_spk, address_to_script(segwit_encode("bcrt", 0, launch_spk[2:]), "bcrt"))
+        self.assertEqual(self.w.yield_balance(), {})
+        self.btc.mine(2, launch_spk)  # two "yield payments"
+        self.btc.mine(1)
+        self.sync()
+        paid = sum(self.btc.blocks[h].txs[0].vout[0].value for h in (self.btc.height - 2, self.btc.height - 1))
+        self.assertEqual(self.w.yield_balance(), {"SWP": paid})
+        self.assertNotIn(launch_key.pub(), [k.pub() for k in self.w.chains["BTC"].used_keys()])
+        before = self.w.chains["BTC"].balance()["confirmed"]
+        txid = self.w.claim_yield(feerate=2)
+        self.assertIn(bytes.fromhex(txid)[::-1], self.btc.mempool)
+        self.btc.mine(1)
+        self.sync()
+        after = self.w.chains["BTC"].balance()["confirmed"]
+        self.assertTrue(paid - 1000 < after - before <= paid, (before, after, paid))
+        self.assertEqual(self.w.yield_balance(), {})
+        self.assertIsNone(self.w.claim_yield())
+
     def test_2_swap_buy(self):
         mk, relay, srv = self._maker()
         before = self.w.chains["SWP"].balance()["confirmed"]
