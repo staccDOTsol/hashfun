@@ -3767,6 +3767,8 @@ return RPCMethod{
 }
 
 
+static LaunchYieldState& SyncedYieldState(ChainstateManager& chainman) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+
 static RPCMethod getlaunchinfo()
 {
     return RPCMethod{
@@ -3865,6 +3867,10 @@ static RPCMethod getlaunchinfo()
     ret.pushKV("graduated", graduated);
     ret.pushKV("graduation_height", grad_height);
     ret.pushKV("hashes_per_coin", LaunchHashesPerCoin(w, consensus));
+    if (LaunchYieldState::Enabled(consensus)) {
+        // What the next holder draw is taken over: the value of the coins that are live (unspent) now.
+        ret.pushKV("earning", SyncedYieldState(chainman).Earning(consensus));
+    }
 
     UniValue curve(UniValue::VOBJ);
     curve.pushKV("virtual_work", consensus.launch_virtual_work.GetHex());
@@ -3903,7 +3909,9 @@ static LaunchYieldState& SyncedYieldState(ChainstateManager& chainman) EXCLUSIVE
     const Consensus::Params& consensus = chainman.GetConsensus();
     if (!LaunchYieldState::Enabled(consensus)) throw JSONRPCError(RPC_MISC_ERROR, "this chain has no sats leg");
     LaunchYieldState& ys = GetLaunchYieldState();
-    ys.Sync(chainman.ActiveChain().Tip(), consensus, chainman.m_blockman);
+    if (!ys.Sync(chainman.ActiveChain().Tip(), consensus, chainman.m_blockman)) {
+        throw JSONRPCError(RPC_INTERNAL_ERROR, "a block needed to rebuild the sats-leg state could not be read");
+    }
     return ys;
 }
 
@@ -3935,7 +3943,8 @@ static RPCMethod getmintobligation()
 {
     return RPCMethod{
         "getmintobligation",
-        "Returns what the curve block at a height owes on Bitcoin (the sats leg): amount, drawn payee, the tag the\n"
+        "Returns what the curve block at a height owes on Bitcoin (the sats leg): amount, the drawn payee and the\n"
+        "Bitcoin script to pay (fixed when the draw is made: for a holder, the coin that won it), the tag the\n"
         "payment must carry, and whether it has been settled.\n",
         {{"height", RPCArg::Type::NUM, RPCArg::Optional::NO, "block height"}},
         RPCResult{RPCResult::Type::ANY, "", ""},
@@ -3947,12 +3956,16 @@ static RPCMethod getmintobligation()
     LOCK(cs_main);
     const LaunchYieldState& ys = SyncedYieldState(chainman);
     const int height = request.params[0].getInt<int>();
+    const CBlockIndex* index = chainman.ActiveChain()[height];
+    if (!index) throw JSONRPCError(RPC_INVALID_PARAMETER, "height out of range");
+    // A block past the end of the sats leg is not tracked: it owes nothing and never did.
+    static const LaunchYieldState::Info untracked;
     const LaunchYieldState::Info* info = ys.At(height);
-    if (!info) throw JSONRPCError(RPC_INVALID_PARAMETER, "height out of range");
-    const CCoinsViewCache& view = chainman.ActiveChainstate().CoinsTip();
+    if (!info) info = &untracked;
+    const uint256 hash = index->GetBlockHash();
     UniValue r(UniValue::VOBJ);
     r.pushKV("height", height);
-    r.pushKV("hash", info->hash.GetHex());
+    r.pushKV("hash", hash.GetHex());
     r.pushKV("curve", info->curve);
     r.pushKV("owed", info->owed);
     r.pushKV("draw_known", info->draw_known);
@@ -3960,36 +3973,20 @@ static RPCMethod getmintobligation()
     r.pushKV("settled", info->settled);
     r.pushKV("spendable", ys.Spendable(height));
     r.pushKV("deadline_height", height + consensus.launch_settle_deadline);
-    r.pushKV("tag", HexStr(launchyield::PayTag(consensus.launch_id, info->hash)));
+    r.pushKV("tag", HexStr(launchyield::PayTag(consensus.launch_id, hash)));
     if (info->draw_known) {
+        // The draw fixed all of this when it was made; nothing later changes it.
         r.pushKV("pay", info->pay);
         r.pushKV("payee", info->payee == launchyield::Payee::HOLDER ? "holder" : info->payee == launchyield::Payee::CREATOR ? "creator" : "dev");
-        // The candidate a payment made now must name, and the script it must pay.
-        int choice = 0;
-        UniValue cands(UniValue::VARR);
-        if (info->payee == launchyield::Payee::HOLDER) {
-            choice = launchyield::MAX_CANDIDATES;
-            for (int i = 0; i < launchyield::MAX_CANDIDATES; ++i) {
-                const auto c = ys.Candidate(height, i);
-                if (!c) break;
-                const bool unspent = view.HaveCoin(c->out);
-                UniValue e(UniValue::VOBJ);
-                e.pushKV("index", i);
-                e.pushKV("txid", c->out.hash.GetHex());
-                e.pushKV("vout", static_cast<int64_t>(c->out.n));
-                e.pushKV("value", c->value);
-                e.pushKV("btc_script", HexStr(c->script));
-                e.pushKV("unspent", unspent);
-                cands.push_back(std::move(e));
-                if (unspent && choice == launchyield::MAX_CANDIDATES) choice = i;
-            }
+        if (info->pay > 0) r.pushKV("pay_script", HexStr(info->pay_script));
+        r.pushKV("earning", info->earning);
+        if (info->has_coin) {
+            UniValue coin(UniValue::VOBJ);
+            coin.pushKV("txid", info->coin.hash.GetHex());
+            coin.pushKV("vout", static_cast<int64_t>(info->coin.n));
+            coin.pushKV("value", info->coin_value);
+            r.pushKV("coin", std::move(coin));
         }
-        std::vector<unsigned char> script;
-        if (ys.Recipient(height, choice, &view, consensus, script)) {
-            r.pushKV("candidate", choice);
-            r.pushKV("pay_script", HexStr(script));
-        }
-        r.pushKV("candidates", std::move(cands));
     }
     return r;
 },

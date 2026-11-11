@@ -343,6 +343,8 @@ void Chainstate::MaybeUpdateMempoolForReorg(
     // If true, the tx would be invalid in the next block; remove this entry and all of its descendants.
     // Note that TRUC rules are not applied here, so reorgs may cause violations of TRUC inheritance or
     // topology restrictions.
+    const bool sats_leg{LaunchYieldState::Enabled(m_chainman.GetConsensus())};
+    const bool sats_leg_known{sats_leg && GetLaunchYieldState().Sync(m_chain.Tip(), m_chainman.GetConsensus(), m_blockman)};
     const auto filter_final_and_mature = [&](CTxMemPool::txiter it)
         EXCLUSIVE_LOCKS_REQUIRED(m_mempool->cs, ::cs_main) {
         AssertLockHeld(m_mempool->cs);
@@ -378,6 +380,12 @@ void Chainstate::MaybeUpdateMempoolForReorg(
                 assert(!coin.IsSpent());
                 const auto mempool_spend_height{m_chain.Tip()->nHeight + 1};
                 if (coin.IsCoinBase() && mempool_spend_height - coin.nHeight < COINBASE_MATURITY) {
+                    return true;
+                }
+                // hashfun: and settled. A reorg can take away the block that carried the payment
+                // proof; a spend of that coinbase left in the mempool would make every block
+                // template invalid until the proof is mined again.
+                if (coin.IsCoinBase() && sats_leg && (!sats_leg_known || !GetLaunchYieldState().Spendable(coin.nHeight))) {
                     return true;
                 }
             }
@@ -884,10 +892,10 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
     // hashfun: a curve coinbase stays locked until its sats were paid on Bitcoin.
     if (const auto& consensus = m_active_chainstate.m_chainman.GetConsensus(); LaunchYieldState::Enabled(consensus)) {
         LaunchYieldState& ys = GetLaunchYieldState();
-        ys.Sync(m_active_chainstate.m_chain.Tip(), consensus, m_active_chainstate.m_blockman);
+        const bool known{ys.Sync(m_active_chainstate.m_chain.Tip(), consensus, m_active_chainstate.m_blockman)};
         for (const CTxIn& in : tx.vin) {
             const Coin& coin = m_view.AccessCoin(in.prevout);
-            if (coin.IsCoinBase() && !ys.Spendable(coin.nHeight)) {
+            if (coin.IsCoinBase() && (!known || !ys.Spendable(coin.nHeight))) {
                 return state.Invalid(TxValidationResult::TX_PREMATURE_SPEND, "bad-txns-unsettled-coinbase",
                                      strprintf("coinbase of block %d has not settled its sats", coin.nHeight));
             }
@@ -2680,7 +2688,10 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
     int64_t nSigOpsCost = 0;
     blockundo.vtxundo.reserve(block.vtx.size() - 1);
     const bool sats_leg{LaunchYieldState::Enabled(params.GetConsensus())};
-    if (sats_leg) GetLaunchYieldState().Sync(pindex->pprev, params.GetConsensus(), m_blockman);
+    if (sats_leg && !GetLaunchYieldState().Sync(pindex->pprev, params.GetConsensus(), m_blockman)) {
+        // Guessing which coinbases are settled would have this node follow blocks its peers reject.
+        return FatalError(m_chainman.GetNotifications(), state, _("A block needed to rebuild the sats-leg state could not be read."));
+    }
     for (unsigned int i = 0; i < block.vtx.size(); i++)
     {
         if (!state.IsValid()) break;
@@ -2859,11 +2870,15 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
         Ticks<std::chrono::nanoseconds>(time_5 - time_start)
     );
 
-    // hashfun: record this block's Bitcoin headers, payment proofs, registrations and draw.
+    // hashfun: record this block's Bitcoin headers, payment proofs, coins and draw. The sats-leg
+    // state is given the block and nothing else (no UTXO view): it has to come out the same
+    // when a node replays the chain at start.
     if (sats_leg) {
         LaunchYieldState& ys = GetLaunchYieldState();
-        ys.Sync(pindex->pprev, params.GetConsensus(), m_blockman);
-        ys.Connect(block, pindex, params.GetConsensus(), &view);
+        if (!ys.Sync(pindex->pprev, params.GetConsensus(), m_blockman)) {
+            return FatalError(m_chainman.GetNotifications(), state, _("A block needed to rebuild the sats-leg state could not be read."));
+        }
+        ys.Connect(block, pindex, params.GetConsensus());
     }
 
     return true;

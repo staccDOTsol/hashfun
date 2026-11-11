@@ -116,19 +116,24 @@ bool EarnsYield(const CScript& s)
 std::vector<RegOut> RegisteredOutputs(const CTransaction& tx)
 {
     std::vector<RegOut> out;
+    // Only a coinbase may redirect, and only its output 0: the miner made that output and owns it.
+    // Anywhere else the transaction's author is not the owner of every output, and a redirect
+    // would let a payer keep the yield of coins he pays to someone else. The first HFY1 output
+    // decides, and only if what it names is itself a script that earns: every miner whose block
+    // draws this coin has to be able to relay a Bitcoin payment to it.
     std::vector<unsigned char> redirect;
-    for (const CTxOut& o : tx.vout) {
-        if (auto data = TaggedReturn(o.scriptPubKey, "HFY1")) {
-            if (data->size() >= 5 && data->size() <= 84) redirect.assign(data->begin() + 4, data->end());
-            break;
+    if (tx.IsCoinBase()) {
+        for (const CTxOut& o : tx.vout) {
+            if (auto data = TaggedReturn(o.scriptPubKey, "HFY1")) {
+                if (EarnsYield(CScript(data->begin() + 4, data->end()))) redirect.assign(data->begin() + 4, data->end());
+                break;
+            }
         }
     }
-    const bool coinbase = tx.IsCoinBase();
     for (uint32_t i = 0; i < tx.vout.size(); ++i) {
         const CTxOut& o = tx.vout[i];
         if (o.nValue <= 0 || !EarnsYield(o.scriptPubKey)) continue;
-        // A coinbase's redirect covers only the miner's own output, not the creator's cut.
-        const bool redirected = !redirect.empty() && (!coinbase || i == 0);
+        const bool redirected = !redirect.empty() && i == 0;
         out.push_back({i, o.nValue, redirected ? redirect : std::vector<unsigned char>(o.scriptPubKey.begin(), o.scriptPubKey.end())});
     }
     return out;
@@ -201,11 +206,15 @@ bool VerifyBtcPayment(const PaymentProof& proof, const uint256& merkle_root, con
         error = "btc output does not pay the drawn recipient enough";
         return false;
     }
+    // One tag list per transaction: the first OP_RETURN "HF" output, and no other. Position i of
+    // that list binds output i to one mint block. If later lists counted too, one output could
+    // carry a tag from each of them and settle that many blocks with a single payment.
     for (const CTxOut& o : tx.vout) {
         const auto data = TaggedReturn(o.scriptPubKey, "HF");
-        if (!data || (data->size() - 2) % 20 != 0) continue;
+        if (!data) continue;
         const size_t pos = 2 + size_t{20} * proof.pay_vout;
-        if (data->size() >= pos + 20 && std::equal(tag.begin(), tag.end(), data->begin() + pos)) return true;
+        if ((data->size() - 2) % 20 == 0 && data->size() >= pos + 20 && std::equal(tag.begin(), tag.end(), data->begin() + pos)) return true;
+        break;
     }
     error = "btc tx does not bind this output to the mint block";
     return false;
@@ -228,8 +237,9 @@ void BtcChain::Init(const CPureBlockHeader& anchor, int anchor_height, uint32_t 
 {
     m_nodes.clear();
     m_children.clear();
+    m_order.clear();
     m_regtest = regtest;
-    m_anchor_period_time = anchor_period_time;
+    m_anchor_height = anchor_height;
     m_anchor = anchor.GetHash();
     Node n;
     n.prev = anchor.hashPrevBlock;
@@ -238,8 +248,13 @@ void BtcChain::Init(const CPureBlockHeader& anchor, int anchor_height, uint32_t 
     n.bits = anchor.nBits;
     n.height = anchor_height;
     n.work = 0; // work is counted from the anchor
+    // An anchor that opens a difficulty period is its own period start; otherwise the first
+    // block of its period is below it and the descriptor supplies that block's time.
+    n.period_time = anchor_height % BTC_INTERVAL == 0 ? anchor.nTime : anchor_period_time;
     m_nodes.emplace(m_anchor, n);
+    m_order.emplace(n.work, m_anchor);
     m_best = m_anchor;
+    m_main.assign(1, m_anchor);
 }
 
 const BtcChain::Node* BtcChain::Find(const uint256& hash) const
@@ -259,16 +274,9 @@ uint32_t BtcChain::ExpectedBits(const Node& prev) const
     if (m_regtest) return BTC_REGTEST_BITS;
     const int height = prev.height + 1;
     if (height % BTC_INTERVAL != 0) return prev.bits;
-    // Timestamp of the first block of the period that prev closes.
-    const int first_height = height - BTC_INTERVAL;
-    int64_t first_time = m_anchor_period_time;
-    const Node* n = &prev;
-    while (n->height > first_height) {
-        const Node* p = Find(n->prev);
-        if (!p) break; // below the anchor: the descriptor supplies it
-        n = p;
-    }
-    if (n->height == first_height) first_time = n->time;
+    // prev closes its period; every header carries the time of its period's first block, so
+    // this costs the same at a retarget as anywhere else (no walk down the chain).
+    const int64_t first_time = prev.period_time;
     int64_t timespan = int64_t{prev.time} - first_time;
     timespan = std::clamp<int64_t>(timespan, BTC_TIMESPAN / 4, BTC_TIMESPAN * 4);
     bool ok;
@@ -280,15 +288,22 @@ uint32_t BtcChain::ExpectedBits(const Node& prev) const
     return target.GetCompact();
 }
 
-void BtcChain::PickBest()
+void BtcChain::UpdateMain()
 {
-    const Node* best = nullptr;
-    for (const auto& [hash, n] : m_nodes) {
-        if (!best || n.work > best->work || (n.work == best->work && UintToArith256(hash) < UintToArith256(m_best))) {
-            best = &n;
-            m_best = hash;
-        }
+    // Walk down from the best tip until the old best chain is met, and rewrite only what is above.
+    std::vector<uint256> path;
+    uint256 cur = m_best;
+    const Node* n = &m_nodes.at(cur);
+    for (;;) {
+        const size_t i = static_cast<size_t>(n->height - m_anchor_height);
+        if (i < m_main.size() && m_main[i] == cur) break;
+        path.push_back(cur);
+        if (cur == m_anchor) break;
+        cur = n->prev;
+        n = &m_nodes.at(cur);
     }
+    m_main.resize(static_cast<size_t>(m_nodes.at(m_best).height - m_anchor_height) + 1 - path.size());
+    m_main.insert(m_main.end(), path.rbegin(), path.rend());
 }
 
 bool BtcChain::Accept(const CPureBlockHeader& header, std::string& error)
@@ -330,11 +345,14 @@ bool BtcChain::Accept(const CPureBlockHeader& header, std::string& error)
     n.bits = header.nBits;
     n.height = prev->height + 1;
     n.work = prev->work + (~target / (target + 1)) + 1;
-    const Node& best = m_nodes.at(m_best);
-    const bool better = n.work > best.work || (n.work == best.work && UintToArith256(hash) < UintToArith256(m_best));
+    n.period_time = n.height % BTC_INTERVAL == 0 ? header.nTime : prev->period_time;
     m_nodes.emplace(hash, n);
+    m_order.emplace(n.work, hash);
     ++m_children[header.hashPrevBlock];
-    if (better) m_best = hash;
+    if (m_order.begin()->second != m_best) {
+        m_best = m_order.begin()->second;
+        UpdateMain();
+    }
     return true;
 }
 
@@ -343,26 +361,22 @@ void BtcChain::Remove(const uint256& hash)
     const auto it = m_nodes.find(hash);
     if (it == m_nodes.end() || hash == m_anchor || m_children.count(hash)) return;
     const uint256 prev = it->second.prev;
+    m_order.erase({it->second.work, hash});
     m_nodes.erase(it);
     if (--m_children[prev] == 0) m_children.erase(prev);
     if (hash == m_best) {
-        m_best = m_anchor;
-        PickBest();
+        m_best = m_order.begin()->second;
+        UpdateMain();
     }
 }
 
 int BtcChain::Confirmations(const uint256& hash) const
 {
-    const Node* target = Find(hash);
-    const Node* n = Find(m_best);
-    if (!target || !n) return 0;
-    uint256 cur = m_best;
-    while (n && n->height > target->height) {
-        cur = n->prev;
-        n = Find(cur);
-    }
-    if (!n || cur != hash) return 0;
-    return m_nodes.at(m_best).height - target->height + 1;
+    const Node* n = Find(hash);
+    if (!n) return 0;
+    const size_t i = static_cast<size_t>(n->height - m_anchor_height);
+    if (i >= m_main.size() || m_main[i] != hash) return 0;
+    return static_cast<int>(m_main.size() - i);
 }
 
 } // namespace launchyield

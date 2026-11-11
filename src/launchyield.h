@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <map>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <vector>
@@ -27,10 +28,10 @@
  *   - payment size: owed if owed >= min, else min with probability owed/min
  *     (so every Bitcoin output is worth sending; expectation is preserved);
  *   - recipient class: 80% a holder, 10% the creator, 10% the dev;
- *   - holder: up to 64 candidate points into the value of every earning output
- *     created before the minting block; the payee is the first candidate whose
- *     output is still unspent, i.e. coin-weighted over current holders. No
- *     opt-in: an output is paid at its own script on Bitcoin. All spent -> creator.
+ *   - holder: one point into the value of the coins that are live (unspent) at
+ *     that moment; the coin holding the point is the payee, fixed from then on.
+ *     Coin-weighted over current holders. No opt-in: a coin is paid at its own
+ *     script on Bitcoin. Nobody holds a coin yet -> the creator.
  * The miner pays on Bitcoin and proves it here (SPV against the in-chain
  * Bitcoin header relay) before the settlement deadline; until then the
  * coinbase cannot be spent, and after it the coins are gone.
@@ -38,7 +39,6 @@
 namespace launchyield {
 
 static constexpr int DRAW_DELAY = 6;          //!< seed block = mint block + DRAW_DELAY
-static constexpr int MAX_CANDIDATES = 64;
 static constexpr int HOLDER_BPS = 8000;
 static constexpr int CREATOR_BPS = 1000;      //!< remainder (1000) is the dev's
 
@@ -53,8 +53,8 @@ struct Draw {
 CAmount Owed(const arith_uint256& work, uint64_t num, uint32_t shift);
 uint256 DrawSeed(const uint256& launch_id, const uint256& seed_block_hash);
 Draw ComputeDraw(CAmount owed, CAmount min_payment, const uint256& seed);
-/** i-th candidate point in [0, registered_total); registered_total must be > 0. */
-arith_uint256 CandidatePoint(const uint256& seed, int i, const arith_uint256& registered_total);
+/** Point i derived from the seed, in [0, total); total must be > 0. The holder draw uses point 0 over the live value. */
+arith_uint256 CandidatePoint(const uint256& seed, int i, const arith_uint256& total);
 /** 20-byte tag a Bitcoin payment must carry for (launch, mint block). */
 std::array<unsigned char, 20> PayTag(const uint256& launch_id, const uint256& mint_block_hash);
 
@@ -72,9 +72,9 @@ bool EarnsYield(const CScript& script);
  * Outputs of tx that earn yield, with the Bitcoin script their yield is paid to.
  * Holding is enough: every positive P2PKH / P2SH / witness-program output earns,
  * and is paid at its own scriptPubKey on Bitcoin (a launch is a Bitcoin fork, so
- * the same key controls both). A tx may redirect its outputs' yield with
- * OP_RETURN "HFY1"<btc scriptPubKey> (1..80 bytes); in a coinbase the redirect
- * covers vout 0 only.
+ * the same key controls both). A coinbase may redirect its output 0 (the miner's
+ * own) with OP_RETURN "HFY1"<btc scriptPubKey>: the first such output counts, and
+ * only if that script is itself one that earns. No other transaction can redirect.
  */
 std::vector<RegOut> RegisteredOutputs(const CTransaction& tx);
 
@@ -85,14 +85,15 @@ struct PaymentProof {
     uint32_t tx_index{0};
     std::vector<uint256> branch;
     uint32_t pay_vout{0};
-    uint8_t candidate{0}; //!< which holder candidate was paid (ignored for creator/dev)
+    uint8_t candidate{0}; //!< must be 0 (the payee is fixed by the draw; the byte is from an earlier format)
     std::vector<unsigned char> raw_tx; //!< Bitcoin tx, serialized without witness
 };
 std::optional<PaymentProof> ParsePaymentProof(std::span<const unsigned char> payload);
 /**
  * The Bitcoin tx is in the block with this merkle root, output pay_vout pays
- * at least `pay` to recipient_script, and the tx's "HF" tag list binds that
- * same output index to `tag` (so one output cannot settle two blocks).
+ * at least `pay` to recipient_script, and the tx's "HF" tag list (its first
+ * OP_RETURN "HF" output, and no other) binds that same output index to `tag`,
+ * so one output cannot settle two blocks.
  */
 bool VerifyBtcPayment(const PaymentProof& proof, const uint256& merkle_root, const std::array<unsigned char, 20>& tag,
                       const std::vector<unsigned char>& recipient_script, CAmount pay, std::string& error);
@@ -116,6 +117,7 @@ public:
         uint32_t bits{0};
         int height{0};
         arith_uint256 work;
+        uint32_t period_time{0}; //!< time of the first block of this block's difficulty period
     };
 
     void Init(const CPureBlockHeader& anchor, int anchor_height, uint32_t anchor_period_time, bool regtest);
@@ -133,13 +135,23 @@ public:
 
 private:
     uint32_t ExpectedBits(const Node& prev) const;
-    void PickBest();
+    void UpdateMain();
+
+    /** Most work first, ties to the numerically lowest hash: begin() is the best tip. */
+    struct ByWork {
+        bool operator()(const std::pair<arith_uint256, uint256>& a, const std::pair<arith_uint256, uint256>& b) const
+        {
+            return a.first > b.first || (a.first == b.first && UintToArith256(a.second) < UintToArith256(b.second));
+        }
+    };
 
     std::map<uint256, Node> m_nodes;
     std::map<uint256, int> m_children;
+    std::set<std::pair<arith_uint256, uint256>, ByWork> m_order; //!< every header, best first
+    std::vector<uint256> m_main;                                 //!< the best chain: m_main[i] is at height anchor + i
     uint256 m_anchor;
     uint256 m_best;
-    uint32_t m_anchor_period_time{0};
+    int m_anchor_height{0};
     bool m_regtest{false};
 };
 

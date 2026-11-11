@@ -4,7 +4,7 @@
 // can compare every value against the independent Python model.
 //
 // stdin, one request per line:
-//   {"op":"desc","json":"<descriptor text>"}
+//   {"op":"desc","json":"<descriptor text>"}      (every op: "json_hex":"<the text's bytes in hex>" instead of "json")
 //   {"op":"chain","json":"<descriptor text>","headers":[[time,bits],...]}
 //   {"op":"tail","json":"<descriptor text>","ranges":[[from,to],...]}
 //   {"op":"auxpow","json":"<descriptor text>","header":"<hex: 80-byte header + CAuxPow>"}
@@ -39,7 +39,16 @@ std::string Hex256(const arith_uint256& x) { return ArithToUint256(x).GetHex(); 
 std::optional<LaunchDescriptor> Parse(const UniValue& req, UniValue& out)
 {
     std::string err;
-    auto d = ParseLaunchDescriptor(req["json"].get_str(), err);
+    // "json_hex" in place of "json": the file's bytes in hex, for bytes a JSON string cannot carry
+    // (a launch file that is not valid UTF-8).
+    std::string text;
+    if (req.exists("json_hex")) {
+        const auto bytes = ParseHex(req["json_hex"].get_str());
+        text.assign(bytes.begin(), bytes.end());
+    } else {
+        text = req["json"].get_str();
+    }
+    auto d = ParseLaunchDescriptor(text, err);
     if (!d) {
         out.pushKV("ok", false);
         out.pushKV("error", err);
@@ -233,7 +242,7 @@ UniValue Yield(const UniValue& req)
     const arith_uint256 total = UintToArith256(*uint256::FromHex(req["total"].get_str()));
     UniValue pts(UniValue::VARR);
     if (total != 0) {
-        for (int i = 0; i < MAX_CANDIDATES; ++i) pts.push_back(Hex256(CandidatePoint(seed, i, total)));
+        for (int i = 0; i < 64; ++i) pts.push_back(Hex256(CandidatePoint(seed, i, total))); // the draw uses point 0; the rest check the function
     }
     r.pushKV("points", std::move(pts));
     return r;

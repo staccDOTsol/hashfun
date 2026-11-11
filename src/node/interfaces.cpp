@@ -785,7 +785,7 @@ public:
         if (!LaunchYieldState::Enabled(consensus)) return true;
         LOCK(::cs_main);
         LaunchYieldState& ys{GetLaunchYieldState()};
-        ys.Sync(chainman().ActiveChain().Tip(), consensus, chainman().m_blockman);
+        if (!ys.Sync(chainman().ActiveChain().Tip(), consensus, chainman().m_blockman)) return false;
         return ys.Spendable(height);
     }
     bool shutdownRequested() override { return ShutdownRequested(m_node); }

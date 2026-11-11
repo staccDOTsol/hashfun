@@ -4,16 +4,18 @@
 
 #include <launchyieldstate.h>
 
+#include <arith_uint256.h>
+#include <auxpow.h>
 #include <chain.h>
-#include <coins.h>
 #include <launchcurve.h>
 #include <node/blockstorage.h>
 #include <primitives/block.h>
 #include <streams.h>
 #include <util/log.h>
 
+#include <cassert>
+
 using launchyield::DRAW_DELAY;
-using launchyield::MAX_CANDIDATES;
 using launchyield::Payee;
 
 LaunchYieldState& GetLaunchYieldState()
@@ -35,74 +37,71 @@ bool LaunchYieldState::Spendable(int height) const
     return i->pay == 0 || i->settled;
 }
 
-std::optional<LaunchYieldState::Reg> LaunchYieldState::Candidate(int mint_height, int i) const
+// ---- the coin list -----------------------------------------------------------------------------
+// Coins sit in the order they were appended and never move; a dead coin keeps its place with
+// weight 0. A Fenwick tree over the live values answers "how much is live" and "which coin holds
+// point x" in O(log n). Appending and cutting the tail keep the tree valid: node i only sums
+// positions (i - lowbit(i), i].
+
+static inline size_t LowBit(size_t i) { return i & (~i + 1); }
+
+void LaunchYieldState::TreeAdd(uint32_t index, uint64_t delta)
 {
-    const Info* m = At(mint_height);
-    if (!m || !m->draw_known || mint_height < 1) return std::nullopt;
-    // Value registered strictly before the mint block: a miner never draws its own coinbase.
-    const arith_uint256& total = m_info[mint_height - 1].cum_reg;
-    if (total == 0) return std::nullopt;
-    const arith_uint256 x = launchyield::CandidatePoint(m->seed, i, total);
-    int lo = 0, hi = mint_height - 1; // first height whose cumulative value exceeds x
-    while (lo < hi) {
-        const int mid = lo + (hi - lo) / 2;
-        if (m_info[mid].cum_reg > x) {
-            hi = mid;
-        } else {
-            lo = mid + 1;
+    // delta may be the two's complement of a value: the sums stay exact modulo 2^64 and never go below zero.
+    for (size_t i = size_t{index} + 1; i <= m_tree.size(); i += LowBit(i)) m_tree[i - 1] += delta;
+}
+
+uint32_t LaunchYieldState::TreeFind(uint64_t x) const
+{
+    // The first coin whose cumulative live value exceeds x. Needs x < m_total.
+    size_t pos = 0, step = 1;
+    while (step * 2 <= m_tree.size()) step *= 2;
+    for (; step > 0; step /= 2) {
+        const size_t next = pos + step;
+        if (next <= m_tree.size() && m_tree[next - 1] <= x) {
+            pos = next;
+            x -= m_tree[next - 1];
         }
     }
-    arith_uint256 acc = lo > 0 ? m_info[lo - 1].cum_reg : arith_uint256{0};
-    for (const Reg& r : m_info[lo].reg) {
-        acc += arith_uint256{static_cast<uint64_t>(r.value)};
-        if (acc > x) return r;
-    }
-    return std::nullopt;
+    return static_cast<uint32_t>(pos);
 }
 
-bool LaunchYieldState::Recipient(int mint_height, int candidate, const CCoinsViewCache* view, const Consensus::Params& params,
-                                 std::vector<unsigned char>& script) const
+void LaunchYieldState::Append(Coin coin)
 {
-    const Info* m = At(mint_height);
-    if (!m || !m->draw_known) return false;
-    if (m->payee == Payee::DEV) {
-        script = params.launch_dev_btc_script;
-        return true;
-    }
-    if (m->payee == Payee::CREATOR || mint_height < 1 || m_info[mint_height - 1].cum_reg == 0) {
-        script = params.launch_creator_btc_script;
-        return true;
-    }
-    if (candidate < 0 || candidate > MAX_CANDIDATES) return false;
-    // The payee is the first candidate still unspent; every earlier one must be spent.
-    for (int j = 0; j < candidate; ++j) {
-        const auto c = Candidate(mint_height, j);
-        if (!c) return false;
-        if (view && view->HaveCoin(c->out)) return false;
-    }
-    if (candidate == MAX_CANDIDATES) {
-        script = params.launch_creator_btc_script;
-        return true;
-    }
-    const auto c = Candidate(mint_height, candidate);
-    if (!c) return false;
-    script = c->script;
-    return true;
+    assert(coin.value > 0 && m_coins.size() < UINT32_MAX);
+    const size_t i = m_tree.size() + 1; // 1-based position of the new coin
+    uint64_t sum = static_cast<uint64_t>(coin.value);
+    for (size_t j = i - 1; j > i - LowBit(i); j -= LowBit(j)) sum += m_tree[j - 1];
+    m_tree.push_back(sum);
+    m_total += static_cast<uint64_t>(coin.value);
+    m_index[coin.out] = static_cast<uint32_t>(m_coins.size());
+    coin.live = true;
+    m_coins.push_back(std::move(coin));
 }
 
-bool LaunchYieldState::TrySettle(const launchyield::PaymentProof& proof, int height, const Consensus::Params& params, const CCoinsViewCache* view)
+void LaunchYieldState::Release(int mint_height, Info& cur)
+{
+    Info& m = m_info[mint_height];
+    if (m.released || m.held.empty()) return;
+    for (const Coin& c : m.held) Append(c);
+    m.released = true;
+    cur.released_here.push_back(mint_height);
+}
+
+// ---- settling ----------------------------------------------------------------------------------
+
+bool LaunchYieldState::TrySettle(const launchyield::PaymentProof& proof, int height, const Consensus::Params& params)
 {
     const int64_t m = proof.mint_height;
     if (m < 1 || m + DRAW_DELAY >= height || m >= static_cast<int64_t>(m_info.size())) return false;
     Info& info = m_info[m];
     if (!info.curve || !info.draw_known || info.settled || info.pay == 0) return false;
     if (height > m + params.launch_settle_deadline) return false;
+    if (proof.candidate != 0) return false; // the payee is fixed by the draw: there is nothing to choose
     const auto* btc = m_btc.Find(proof.btc_block);
     if (!btc || m_btc.Confirmations(proof.btc_block) < params.launch_btc_confs) return false;
-    std::vector<unsigned char> recipient;
-    if (!Recipient(m, proof.candidate, view, params, recipient)) return false;
     std::string err;
-    if (!launchyield::VerifyBtcPayment(proof, btc->merkle_root, launchyield::PayTag(params.launch_id, info.hash), recipient, info.pay, err)) {
+    if (!launchyield::VerifyBtcPayment(proof, btc->merkle_root, launchyield::PayTag(params.launch_id, info.hash), info.pay_script, info.pay, err)) {
         LogDebug(BCLog::VALIDATION, "hashfun: payment proof for block %d ignored: %s\n", m, err);
         return false;
     }
@@ -110,37 +109,87 @@ bool LaunchYieldState::TrySettle(const launchyield::PaymentProof& proof, int hei
     return true;
 }
 
-void LaunchYieldState::Connect(const CBlock& block, const CBlockIndex* pindex, const Consensus::Params& params, const CCoinsViewCache* view)
+// ---- connecting and disconnecting a block ------------------------------------------------------
+
+void LaunchYieldState::Connect(const CBlock& block, const CBlockIndex* pindex, const Consensus::Params& params)
 {
     const int height = pindex->nHeight;
     if (height != static_cast<int>(m_info.size())) return;
+    if (Closed(params)) return; // nothing after this block can change what any coinbase may do
     if (height == 0) {
         CPureBlockHeader anchor;
         DataStream ss{params.launch_btc_anchor_header};
         ss >> anchor;
         m_btc.Init(anchor, params.launch_btc_anchor_height, params.launch_btc_anchor_period_time, params.launch_btc_regtest);
     }
-    Info info;
-    info.hash = pindex->GetBlockHash();
-    info.curve = height >= 1 && !LaunchGraduatedAt(pindex->pprev, params);
-    info.owed = info.curve ? launchyield::Owed(GetBlockProof(*pindex), params.launch_sats_num, params.launch_sats_shift) : 0;
-    info.cum_reg = height > 0 ? m_info.back().cum_reg : arith_uint256{0};
+    {
+        Info info;
+        info.hash = pindex->GetBlockHash();
+        info.curve = height >= 1 && !LaunchGraduatedAt(pindex->pprev, params);
+        info.owed = info.curve ? launchyield::Owed(GetBlockProof(*pindex), params.launch_sats_num, params.launch_sats_shift) : 0;
+        info.coins_before = static_cast<uint32_t>(m_coins.size());
+        if (info.curve) m_last_curve = height;
+        m_info.push_back(std::move(info));
+    }
+    Info& cur = m_info.back(); // m_info does not grow again in this call
 
-    // This block's hash seeds the draw of the block DRAW_DELAY below it.
+    // 1. The draw of the block DRAW_DELAY below, over the coins that are live now: at the end of the
+    //    previous block, before anything in this one. The seed is the hash that carried this block's
+    //    work: for a merge-mined block that is the parent chain's block hash (its own hash can be
+    //    re-rolled for free).
     const int drawn = height - DRAW_DELAY;
     if (drawn >= 1 && m_info[drawn].curve) {
         Info& d = m_info[drawn];
-        d.seed = launchyield::DrawSeed(params.launch_id, info.hash);
+        const uint256 work_hash = block.auxpow ? block.auxpow->getParentBlockHash() : cur.hash;
+        d.seed = launchyield::DrawSeed(params.launch_id, work_hash);
         const launchyield::Draw draw = launchyield::ComputeDraw(d.owed, params.launch_sats_min_payment, d.seed);
         d.pay = draw.pay;
         d.payee = draw.payee;
+        d.earning = static_cast<CAmount>(m_total);
+        if (draw.payee == Payee::HOLDER && m_total == 0) {
+            // The holders' share with nobody holding yet (the first blocks of a launch): it is
+            // owed to no one. Not to the creator: that would make the creator the holder of
+            // everything until the first payment confirms on Bitcoin.
+            d.pay = 0;
+        }
+        if (d.pay > 0) {
+            if (draw.payee == Payee::DEV) {
+                d.pay_script = params.launch_dev_btc_script;
+            } else if (draw.payee == Payee::CREATOR) {
+                d.pay_script = params.launch_creator_btc_script;
+            } else {
+                const uint64_t x = launchyield::CandidatePoint(d.seed, 0, arith_uint256{m_total}).GetLow64();
+                const Coin& c = m_coins[TreeFind(x)];
+                assert(c.live);
+                d.pay_script = c.script;
+                d.has_coin = true;
+                d.coin = c.out;
+                d.coin_value = c.value;
+            }
+        }
         d.draw_known = true;
-        info.drew = drawn;
+        cur.drew = drawn;
+        if (d.pay == 0) Release(drawn, cur); // nothing is due: its coinbase is free, and earns from here on
     }
-    m_info.push_back(std::move(info));
-    Info& cur = m_info.back();
 
+    // 2. The transactions, in order: inputs kill coins, tagged outputs relay Bitcoin headers and
+    //    settle blocks, then the transaction's own earning outputs become coins.
+    const bool hold_coinbase = cur.curve && cur.owed > 0;
     for (const CTransactionRef& tx : block.vtx) {
+        const bool coinbase = tx->IsCoinBase();
+        if (!coinbase) {
+            for (const CTxIn& in : tx->vin) {
+                const auto it = m_index.find(in.prevout);
+                if (it == m_index.end()) continue;
+                const uint32_t idx = it->second;
+                Coin& c = m_coins[idx];
+                c.live = false;
+                TreeAdd(idx, ~static_cast<uint64_t>(c.value) + 1);
+                m_total -= static_cast<uint64_t>(c.value);
+                cur.killed.push_back(idx);
+                m_index.erase(it);
+            }
+        }
         for (const CTxOut& out : tx->vout) {
             if (const auto data = launchyield::TaggedReturn(out.scriptPubKey, "HFH1")) {
                 if (const auto headers = launchyield::ParseBtcHeaders(*data)) {
@@ -151,14 +200,22 @@ void LaunchYieldState::Connect(const CBlock& block, const CBlockIndex* pindex, c
                 }
             } else if (const auto data = launchyield::TaggedReturn(out.scriptPubKey, "HFP1")) {
                 if (const auto proof = launchyield::ParsePaymentProof(*data)) {
-                    if (TrySettle(*proof, height, params, view)) cur.settled_here.push_back(proof->mint_height);
+                    if (TrySettle(*proof, height, params)) {
+                        const int m = static_cast<int>(proof->mint_height);
+                        cur.settled_here.push_back(m);
+                        Release(m, cur); // paid: its coinbase earns from here on
+                    }
                 }
             }
         }
         const Txid txid = tx->GetHash();
         for (const launchyield::RegOut& r : launchyield::RegisteredOutputs(*tx)) {
-            cur.reg.push_back({COutPoint{txid, r.vout}, r.value, r.btc_script});
-            cur.cum_reg += arith_uint256{static_cast<uint64_t>(r.value)};
+            Coin c{COutPoint{txid, r.vout}, r.value, r.btc_script, true};
+            if (coinbase && hold_coinbase) {
+                cur.held.push_back(std::move(c));
+            } else {
+                Append(std::move(c));
+            }
         }
     }
 }
@@ -166,14 +223,40 @@ void LaunchYieldState::Connect(const CBlock& block, const CBlockIndex* pindex, c
 void LaunchYieldState::Pop()
 {
     Info& cur = m_info.back();
+    // Everything this block appended is the tail of the coin list.
+    for (size_t i = m_coins.size(); i-- > cur.coins_before;) {
+        const Coin& c = m_coins[i];
+        if (!c.live) continue;
+        m_total -= static_cast<uint64_t>(c.value);
+        m_index.erase(c.out);
+    }
+    m_coins.resize(cur.coins_before);
+    m_tree.resize(cur.coins_before);
+    // The coins it killed are live again (one created and spent inside this block went with the tail).
+    for (auto it = cur.killed.rbegin(); it != cur.killed.rend(); ++it) {
+        if (*it >= cur.coins_before) continue;
+        Coin& c = m_coins[*it];
+        c.live = true;
+        TreeAdd(*it, static_cast<uint64_t>(c.value));
+        m_total += static_cast<uint64_t>(c.value);
+        m_index[c.out] = *it;
+    }
+    for (int m : cur.released_here) m_info[m].released = false;
     for (int m : cur.settled_here) m_info[m].settled = false;
     for (auto it = cur.btc_added.rbegin(); it != cur.btc_added.rend(); ++it) m_btc.Remove(*it);
     if (cur.drew >= 0) {
         Info& d = m_info[cur.drew];
         d.draw_known = false;
         d.pay = 0;
+        d.payee = Payee::HOLDER;
         d.seed = uint256{};
+        d.pay_script.clear();
+        d.has_coin = false;
+        d.coin = COutPoint{};
+        d.coin_value = 0;
+        d.earning = 0;
     }
+    if (cur.curve) m_last_curve = Height() - 1; // curve blocks are 1..m_last_curve, with no gaps
     m_info.pop_back();
 }
 
@@ -182,17 +265,20 @@ void LaunchYieldState::Disconnect(const CBlockIndex* pindex)
     if (!m_info.empty() && Height() == pindex->nHeight && m_info.back().hash == pindex->GetBlockHash()) Pop();
 }
 
-void LaunchYieldState::Sync(const CBlockIndex* tip, const Consensus::Params& params, const node::BlockManager& blockman)
+bool LaunchYieldState::Sync(const CBlockIndex* tip, const Consensus::Params& params, const node::BlockManager& blockman)
 {
-    if (!tip) return;
+    if (!tip) return true;
     while (!m_info.empty() && (Height() > tip->nHeight || m_info.back().hash != tip->GetAncestor(Height())->GetBlockHash())) Pop();
-    while (Height() < tip->nHeight) {
+    while (Height() < tip->nHeight && !Closed(params)) {
         const CBlockIndex* next = tip->GetAncestor(Height() + 1);
         CBlock block;
         if (!blockman.ReadBlock(block, *next)) {
+            // Without this block the state says nothing about later ones, and a node that guessed
+            // would follow blocks its peers reject. The caller stops.
             LogError("hashfun: cannot read block %d to rebuild the sats-leg state\n", next->nHeight);
-            return;
+            return false;
         }
-        Connect(block, next, params, /*view=*/nullptr);
+        Connect(block, next, params);
     }
+    return true;
 }
