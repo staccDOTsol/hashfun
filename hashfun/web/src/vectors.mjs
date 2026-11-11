@@ -1,5 +1,6 @@
 // Runs the cases tests/test_web_js.py feeds on stdin through btc.js and prints the results.
 import * as B from './btc.js';
+import * as K from './book.js';
 
 let input = '';
 process.stdin.on('data', (d) => { input += d; });
@@ -31,6 +32,10 @@ process.stdin.on('end', () => {
         return { hex: B.txHex(tx), txid: B.txid(tx), pub: B.hex(B.pubkey(B.unhex(c.priv))) };
       }
       if (c.op === 'key') return { key: B.hex(B.keyFromSignature(c.sig)) };
+      if (c.op === 'meta') return { hash: B.hex(B.metaHash({ ...c.meta, image: B.unhex(c.meta.image) })), type: B.imageType(B.unhex(c.meta.image)), b64: B.b64(B.unhex(c.meta.image)) };
+      if (c.op === 'sign') { const sig = B.signText(B.unhex(c.priv), c.text); return { sig, ok: B.verifyText(B.hex(B.pubkey(B.unhex(c.priv))), c.text, sig) }; }
+      if (c.op === 'verify') return { ok: B.verifyText(c.pub, c.text, c.sig) };
+      if (c.op === 'book') return { order: K.orderText(c.order), take: K.takeText(c.take), note: K.noteText(c.fill, c.kind, c.body), alive: K.aliveText(c.maker, c.ts), cancel: K.cancelText(c.order_id), id: K.textId(K.orderText(c.order)), give: K.giveFor(c.order, c.take.get_amount) };
       return { error: 'unknown op' };
     } catch (e) {
       return { error: String(e.message || e) };

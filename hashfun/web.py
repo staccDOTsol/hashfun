@@ -21,7 +21,10 @@ from typing import Dict, Optional
 from urllib.parse import urlparse, parse_qs
 
 from . import descriptor as D
+from . import meta as M
 from . import yieldmodel as Y
+from .book import Book
+from .crypto import hash160
 from .rpc import RPC, RPCError
 from .ser import address_to_script, script_to_address
 
@@ -44,7 +47,20 @@ class CoinIndex:
         self.ticker, self.rpc, self.d, self.btc_hrp = ticker, rpc, d, btc_hrp
         self.lock = threading.RLock()
         self.info, self.error = None, "starting"
+        try:  # the picture and blurb, only if they are the ones the launch id commits to
+            self.meta = M.check(d)
+        except M.MetaError as e:
+            log.warning("%s: %s", ticker, e)
+            self.meta = None
         self.reset()
+
+    def meta_json(self) -> dict:
+        m = self.meta
+        if not m:
+            return {}
+        return {"description": m.description, "links": {k: getattr(m, k) for k in M.LINKS if getattr(m, k)},
+                "meta": self.d.meta.hex(),
+                **({"image": f"/api/coin/{self.ticker}/image?m={self.d.meta.hex()[:16]}"} if m.image else {})}
 
     def reset(self):
         self.hashes = [self.d.genesis_hash]
@@ -112,7 +128,7 @@ class CoinIndex:
     def summary(self) -> dict:
         d, i = self.d, self.info
         if not i:
-            return {"ticker": self.ticker, "name": d.name, "id": d.id_hex, "error": self.error}
+            return {"ticker": self.ticker, "name": d.name, "id": d.id_hex, "error": self.error, **self.meta_json()}
         with self.lock:
             rows = [self.rows[h] for h in sorted(self.rows)]
             recent = rows[-30:]
@@ -132,7 +148,7 @@ class CoinIndex:
                 "last_block_time": rows[-1]["time"] if rows else d.genesis_time,
                 "hashrate": (recent[-1]["work"] - recent[0]["work"]) / span if span else 0,
                 "target_spacing": d.target_spacing, "creator_fee_bps": d.creator_fee_bps, "earning_supply": sum(self.bal.values()),
-                "holders": len(self.bal), "error": self.error,
+                "holders": len(self.bal), "error": self.error, **self.meta_json(),
                 "recent": [{"height": r["height"], "time": r["time"], "pay": r["pay"], "pay_to": r.get("pay_to")}
                            for r in rows if r.get("settled") and r.get("pay") and r.get("payee") == "holder"][-6:],
             }
@@ -162,17 +178,41 @@ class CoinIndex:
             return {"balance": sum(u["value"] for u in utxos), "utxos": utxos, "earning_supply": sum(self.bal.values()),
                     "height": tip}
 
+    def spendable(self, script_hex: str) -> int:
+        return sum(u["value"] for u in self.address(script_hex)["utxos"] if u["spendable"])
+
 
 class Site:
-    def __init__(self, btc: RPC, registry, maker=None, allow_launch=False, launch_args=()):
+    def __init__(self, btc: RPC, registry, maker=None, allow_launch=False, launch_args=(), book_path=None,
+                 book_confs=6, book_lock=14400, book_min_lock=600):
         self.btc, self.reg, self.maker, self.allow_launch = btc, registry, maker, allow_launch
         self.launch_args = list(launch_args)
+        # What the page proposes for peer-to-peer swaps: confirmations to wait for on a launch
+        # chain (Bitcoin: 1) and the length of the second lock. Each trader's page enforces its own.
+        self.book_confs, self.book_lock = book_confs, book_lock
         chain = btc.getblockchaininfo()["chain"]
         self.btc_chain = chain
         self.btc_hrp, self.btc_p2pkh, self.btc_p2sh = BTC_NETS.get(chain, BTC_NETS["main"])
         self.coins: Dict[str, CoinIndex] = {}
         self.scan_lock = threading.Lock()
         self.lock = threading.RLock()
+        self.book = Book(self.book_chains, self.book_backing, book_path, min_lock=book_min_lock)
+
+    # ---- the peer-to-peer book: which chains it covers and what stands behind an order
+    @property
+    def btc_id(self) -> str:
+        return "btc:" + self.btc_chain
+
+    def book_chains(self) -> Dict[str, str]:
+        return {self.btc_id: "BTC", **{c.d.id_hex: t for t, c in list(self.coins.items()) if c.info}}
+
+    def book_backing(self, chain: str, maker: str) -> Optional[int]:
+        if chain == self.btc_id:
+            return None  # would take a UTXO-set scan per order; the taker's page checks the lock itself
+        for c in list(self.coins.values()):
+            if c.d.id_hex == chain:
+                return c.spendable("0014" + hash160(bytes.fromhex(maker)).hex())
+        return 0
 
     def refresh(self):
         """Pick up launches registered since the last call, then poll each one."""
@@ -191,6 +231,7 @@ class Site:
                 self.refresh()
                 if self.maker:
                     self.maker.tick()
+                self.book.save()
             except Exception:
                 log.exception("refresh")
             time.sleep(interval)
@@ -267,11 +308,16 @@ class Site:
         if ticker in self.reg.data:
             raise ValueError(f"{ticker} already exists here")
         creator_script = bytes.fromhex(body["creator_script"])
+        try:
+            metadata = M.Meta.from_json(body["metadata"]) if body.get("metadata") else None
+        except M.MetaError as e:
+            raise ValueError(str(e))
         regtest = self.btc_chain == "regtest"
         anchor = None if regtest else D.btc_anchor_from_rpc(self.btc)
         d = D.make(name, ticker, creator_script, int(body["graduation_hashes"]),
                    creator_fee_bps=int(body.get("creator_fee_bps", 100)), btc_anchor=anchor, btc_regtest=regtest,
                    sats_total=int(body["sats_total"]), creator_btc_script=self.btc_script(body["creator_btc_address"]),
+                   metadata=metadata,
                    **({"pow_limit_bits": int(body["pow_limit_bits"])} if "pow_limit_bits" in body else {}))
         d.grind_genesis()
         from .cli import home
@@ -283,7 +329,7 @@ class Site:
             self.reg.up(ticker, ["-minewithoutpeers", *self.launch_args])
         except SystemExit as e:  # the CLI helpers exit on failure; a server must not
             raise ValueError(str(e))
-        return {"ticker": ticker, "id": d.id_hex}
+        return {"ticker": ticker, "id": d.id_hex, "meta": d.meta.hex() if any(d.meta) else None}
 
 
 def handler(site: Site):
@@ -293,11 +339,12 @@ def handler(site: Site):
         def log_message(self, *a):
             pass
 
-        def _send(self, code, body: bytes, ctype="application/json"):
+        def _send(self, code, body: bytes, ctype="application/json", cache="no-store"):
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
+            self.send_header("Cache-Control", cache)
+            self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
             self.wfile.write(body)
 
@@ -316,8 +363,11 @@ def handler(site: Site):
         def _api(self, method, parts, q, body):
             if parts == ["config"]:
                 return {"btc": {"chain": site.btc_chain, "hrp": site.btc_hrp, "p2pkh": site.btc_p2pkh, "p2sh": site.btc_p2sh},
-                        "maker": bool(site.maker), "allow_launch": site.allow_launch,
-                        "launches": {t: {"hrp": c.d.hrp, "name": c.d.name} for t, c in list(site.coins.items())}}
+                        "maker": bool(site.maker), "allow_launch": site.allow_launch, "btc_id": site.btc_id,
+                        "book": {"confs": site.book_confs, "lock": site.book_lock},
+                        "launches": {t: {"hrp": c.d.hrp, "name": c.d.name, "id": c.d.id_hex, "image": c.meta_json().get("image"),
+                                         "target_spacing": c.d.target_spacing}
+                                     for t, c in list(site.coins.items())}}
             if parts == ["board"]:
                 return [c.summary() for c in list(site.coins.values())]
             if parts == ["quote"]:
@@ -333,6 +383,8 @@ def handler(site: Site):
                 return asdict(o)
             if parts == ["launch"] and method == "POST":
                 return site.launch(body)
+            if parts and parts[0] == "book":
+                return site.book.api(method, parts[1:], q, body)
             if len(parts) >= 2 and parts[0] == "coin" and len(parts) == 2:
                 return site.coin(parts[1]).detail()
             if len(parts) == 4 and parts[0] == "coin" and parts[2] == "address":
@@ -358,6 +410,14 @@ def handler(site: Site):
             u = urlparse(self.path)
             if not u.path.startswith("/api/"):
                 return self._static("index.html" if u.path in ("/", "") else u.path.lstrip("/"))
+            m = re.fullmatch(r"/api/coin/([A-Z0-9]{2,10})/image", u.path)
+            if m and method == "GET":
+                c = site.coins.get(m.group(1))
+                if not c or not c.meta or not c.meta.image:
+                    return self._json(404, {"error": "no picture"})
+                # Content-addressed by the launch id, so it can be cached forever. The type is the
+                # one the bytes themselves declare (meta.py refuses anything but four raster formats).
+                return self._send(200, c.meta.image, c.meta.image_type, cache="public, max-age=31536000, immutable")
             try:
                 body = None
                 if method == "POST":
@@ -420,12 +480,18 @@ def main(argv=None):
     ap.add_argument("--maker", help="maker config JSON: run a swap maker in this process")
     ap.add_argument("--allow-launch", action="store_true", help="let the launch form create chains on this machine")
     ap.add_argument("--launch-arg", action="append", default=[], help="extra hashfund argument for chains created here")
+    ap.add_argument("--book-confs", type=int, default=6,
+                    help="peer-to-peer swaps: confirmations the page waits for on a launch chain (default 6; Bitcoin is 1)")
+    ap.add_argument("--book-lock", type=int, default=14400,
+                    help="peer-to-peer swaps: seconds the maker's lock lasts; the taker's lasts twice that (default 4 h)")
     a = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     btc = RPC(a.btc_rpc, cookie_file=a.btc_cookie)
     reg = Registry()
     maker = build_maker(a.maker, reg, btc) if a.maker else None
-    site = Site(btc, reg, maker, a.allow_launch, a.launch_arg)
+    from .cli import home
+    site = Site(btc, reg, maker, a.allow_launch, a.launch_arg, book_path=os.path.join(home(), "book.json"),
+                book_confs=a.book_confs, book_lock=a.book_lock)
     host, port = a.listen.rsplit(":", 1)
     serve(site, host, int(port))
     print(json.dumps({"site": f"http://{host}:{port}", "bitcoin": site.btc_chain, "launches": sorted(reg.data),

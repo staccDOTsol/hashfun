@@ -135,13 +135,13 @@ class Rig:
     """What `hashfun mine` runs: a pool on one node (templates, settler, merge-mined children)
     and a CPU miner pointed at it."""
 
-    def __init__(self, loop, node, d, payout, btc_payout, settler, children=None):
+    def __init__(self, loop, node, d, payout, btc_payout, settler, children=None, duty=1.0):
         self.loop, self.node, self.settler = loop, node, settler
         self.src = LaunchSource(node.rpc, d.hrp, d.ticker, settler=settler, yield_hrp="bcrt", children=children)
         self.port = free_port()
         self.server = StratumServer(self.src, "127.0.0.1", self.port, difficulty=2e-6, poll_interval=0.2)
         asyncio.run_coroutine_threadsafe(self.server.serve(), loop)
-        self.miner = StratumMiner("127.0.0.1", self.port, f"{payout},{btc_payout}", batch=4096)
+        self.miner = StratumMiner("127.0.0.1", self.port, f"{payout},{btc_payout}", batch=4096, duty=duty)
         self.fut = None
         time.sleep(0.6)
 

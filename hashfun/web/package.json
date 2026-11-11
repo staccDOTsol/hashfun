@@ -6,7 +6,8 @@
   "scripts": {
     "build": "esbuild src/app.js --bundle --minify --format=iife --target=es2020 --outfile=static/app.js",
     "vectors": "node src/vectors.mjs",
-    "fonts": "node -e \"const f=require('fs'),b='node_modules/@fontsource/';[['anton','anton',[400]],['inter','inter',[400,500,600,700]],['jetbrains-mono','mono',[400,500,700]]].forEach(([p,o,ws])=>ws.forEach(w=>f.copyFileSync(b+p+'/files/'+p+'-latin-'+w+'-normal.woff2','static/'+o+'-'+w+'.woff2')))\""
+    "fonts": "node -e \"const f=require('fs'),b='node_modules/@fontsource/';[['anton','anton',[400]],['inter','inter',[400,500,600,700]],['jetbrains-mono','mono',[400,500,700]]].forEach(([p,o,ws])=>ws.forEach(w=>f.copyFileSync(b+p+'/files/'+p+'-latin-'+w+'-normal.woff2','static/'+o+'-'+w+'.woff2')))\"",
+    "lint": "eslint --no-config-lookup --rule \"no-use-before-define: ['error', {functions: false, classes: false, variables: false}]\" --rule \"no-const-assign: error\" --rule \"no-dupe-keys: error\" --rule \"no-redeclare: error\" --rule \"no-unreachable: error\" src/app.js src/book.js src/btc.js"
   },
   "dependencies": {
     "@noble/hashes": "1.4.0",
@@ -16,6 +17,7 @@
     "@fontsource/anton": "^5.0.20",
     "@fontsource/inter": "^5.0.20",
     "@fontsource/jetbrains-mono": "^5.0.20",
-    "esbuild": "0.21.5"
+    "esbuild": "0.21.5",
+    "eslint": "10.14.0"
   }
 }

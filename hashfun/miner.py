@@ -17,9 +17,10 @@ log = logging.getLogger("hashfun.miner")
 
 
 class StratumMiner:
-    def __init__(self, host, port, username, password="x", batch=20000, max_shares=None):
+    def __init__(self, host, port, username, password="x", batch=20000, max_shares=None, duty=1.0):
         self.host, self.port, self.username, self.password = host, port, username, password
         self.batch, self.max_shares = batch, max_shares
+        self.duty = min(1.0, max(0.01, duty))  # share of one core to use: rest between batches below 1
         self.en1, self.en2_size = b"", 4
         self.diff = 1.0
         self.job = None
@@ -105,8 +106,11 @@ class StratumMiner:
                 target = target_for_difficulty(self.diff)
                 start = 0
                 while start < 2**32 and seq == self.job_seq:
+                    t_scan = time.time()
                     found = await asyncio.to_thread(self._scan, job, en2, start, self.batch, target)
                     self.hashes += self.batch
+                    if self.duty < 1.0:
+                        await asyncio.sleep((time.time() - t_scan) * (1.0 / self.duty - 1.0))
                     for nonce in found:
                         res = await (await self._send("mining.submit", [self.username, job["id"], en2.hex(),
                                                                          f"{job['ntime']:08x}", f"{nonce:08x}"]))

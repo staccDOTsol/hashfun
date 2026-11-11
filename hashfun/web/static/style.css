@@ -44,6 +44,15 @@ h1, h2, p { margin: 0; }
 .pill.l { border-color: var(--l); color: var(--l); } .pill.full { background: var(--l); color: var(--bg); border-color: var(--l); } .pill.w { border-color: var(--text); color: var(--text); }
 .tile { display: flex; align-items: center; justify-content: center; flex: none; width: 52px; height: 52px; font: 400 26px/1 Anton, Impact, sans-serif; text-transform: uppercase; border: 2px solid transparent; }
 .tile.big { width: 76px; height: 76px; font-size: 40px; }
+.tile.pic { object-fit: cover; padding: 0; border-color: var(--line); background: var(--panel2); }
+.drop { position: relative; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; flex: 0 0 176px; min-height: 176px; padding: 12px; border: 2px dashed var(--line); background: var(--bg); color: var(--text); cursor: pointer; text-align: center; }
+.drop:hover, .drop:focus-within { border-color: var(--o); } .drop.has { border-style: solid; border-color: var(--o); } .drop img { width: 116px; height: 116px; object-fit: cover; }
+.drop input { position: absolute; width: 1px; height: 1px; opacity: 0; }
+.field textarea { flex: 1; min-width: 0; padding: 12px 0; background: transparent; color: var(--text); border: 0; outline: 0; font: inherit; resize: vertical; }
+.field select { flex: 1; min-width: 0; min-height: 56px; background: transparent; color: var(--text); border: 0; outline: 0; font-size: 18px; font-weight: 600; } .field select option { background: var(--panel); color: var(--text); }
+.offer { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; width: 100%; padding: 14px 16px; background: transparent; color: var(--text); border: 0; border-bottom: 1px solid var(--panel2); border-left: 4px solid transparent; text-align: left; }
+.offer:hover { background: var(--panel2); } .offer.on { border-left-color: var(--o); background: #1D1710; }
+a.tr { color: var(--text); text-decoration: none; } a.tr:hover { background: var(--panel2); color: var(--text); }
 .meter { position: relative; height: 12px; background: var(--panel2); } .meter > i { display: block; height: 100%; background: var(--o); } .meter.l > i { background: var(--l); }
 .meter::after { content: ''; position: absolute; inset: 0; background-image: repeating-linear-gradient(90deg, transparent 0 10px, var(--panel) 10px 12px); }
 .meter.tall { height: 24px; } .meter.tall::after { background-image: repeating-linear-gradient(90deg, transparent 0 14px, var(--panel) 14px 17px); }

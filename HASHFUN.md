@@ -135,12 +135,53 @@ Version rolling is refused by the pool (`mining.configure`): ASICs rolling bits 
 | Instant | `instant_max_sats` in the maker config: buys up to that size are filled on the unconfirmed Bitcoin lock. The maker carries the double-spend risk; larger buys wait for `btc_confs` |
 | Sell | the page locks coins on the launch chain (it signs the P2WPKH spend), the maker locks BTC, the page claims it to the wallet address after one Bitcoin confirmation |
 | Yield | Bags reads the Bitcoin outputs at the page key's script and sweeps them to the wallet address |
-| Launch | the form posts name, ticker, curve size, BTC total and the creator's scripts; the server builds the descriptor, grinds genesis, starts the node (`--allow-launch`) |
-| API | `/api/board`, `/api/coin/T`, `/api/coin/T/address/A`, `/api/chain/<btc\|T>/{time,txout,tx,spender,address}`, `/api/quote`, `/api/orders`, `/api/launch`. Reads and broadcasts only |
+| Launch | the form posts name, ticker, curve size, BTC total, the creator's scripts and the optional picture and blurb (see Pictures and metadata); the server builds the descriptor, grinds genesis, starts the node (`--allow-launch`) |
+| API | `/api/board`, `/api/coin/T`, `/api/coin/T/address/A`, `/api/chain/<btc\|T>/{time,txout,tx,spender,address}`, `/api/quote`, `/api/orders`, `/api/launch`, `/api/book/...`. Reads, broadcasts and signed messages between traders only |
 
 `hashfun/tests/test_web_js.py` holds the browser's Bitcoin code to the Python byte for byte (addresses, HTLC scripts, signed redeem, refund and P2WPKH transactions). `hashfun/tests/web_regtest.py` drives the real site in Chromium against real nodes, pool, settler and maker; only the wallet is a stand-in (a mock `window.unisat` backed by a regtest wallet).
 
 The maker quotes `hashes_per_coin x (hashprice + sats owed per hash) x (1 +/- spread)` and refuses a quote it cannot fill from its wallet. The node wallet treats curve coinbases that are not settled as immature, so they stay out of its balance and coin selection.
+
+## Pictures and metadata
+
+A launch can carry a picture (PNG, JPEG, GIF or WebP, at most 64 KB), a description (500 bytes) and three links. None of it is consensus data and the node never reads it. The descriptor commits to it with one field: `meta` = SHA256 of
+
+    "hashfun-meta\x01" || vs(description) || vs(image_type) || vs(image) || vs(website) || vs(x) || vs(telegram)
+
+`meta` is hashed into the launch id (appended to the canonical bytes when set, so a launch without metadata keeps the id it would always have had), and the genesis coinbase pushes the launch id. So the genesis block pins the picture: it cannot be changed after launch, by the creator or by a site showing it. The bytes ride in the launch file under `metadata` (every node needs that file to join the chain, so everyone on the chain has them); `hashfun/meta.py` `check()` verifies them against the hash, `hashfun node add` refuses a file where they differ, and the site only shows what verifies.
+
+| Where | What |
+|---|---|
+| CLI | `hashfun launch new ... --image FILE --description TEXT --website URL --x URL --telegram URL` |
+| Launch form | drop a picture: small files go in untouched (animations survive), larger ones are cropped to the middle and re-encoded in the browser to under 48 KB before anything is hashed. The page recomputes the hash and refuses the launch if the server committed to anything else |
+| Site | `/api/coin/T/image` serves the committed bytes with the type the bytes themselves declare, cacheable forever; SVG is refused (it can carry script) |
+| C++ | `LaunchDescriptor::meta` in `src/kernel/launch.{h,cpp}`; `test_diff_cpp` holds parser and id to the Python |
+
+## The peer-to-peer book
+
+`hashfun/book.py` (server) and `hashfun/web/src/book.js` (browser): holders trade with each other, any pair of chains the site follows (Bitcoin and every launch; they run the same script engine, so the same HTLC works on all of them). The server is a bulletin board and a mailbox. Orders, takes and every later message are short texts signed with the traders' page keys; contracts are built, checked and funded in the two browsers.
+
+    maker   posts an order     give 1,000 CAT, want 50,000 sats (any pair, either direction)
+    taker   takes part of it   picks a secret, sends its hash and the timelock of its own lock
+    maker   accepts            its page reserves that part of the order
+    taker   locks              HTLC on the chain the maker wants, to the maker's key, refund at T
+    maker   locks              HTLC on the chain it gives, to the taker's key, refund at T - lock
+    taker   claims             reveals the secret on the maker's chain
+    maker   claims             uses the revealed secret on the taker's chain
+
+| Rule | Why |
+|---|---|
+| Both contracts are fully determined by the signed take (keys, hash, timelocks) | each page rebuilds the other side's contract itself and accepts only that exact script, amount and confirmation count |
+| Taker locks first | a maker is never out of pocket for an order nobody completes |
+| Only live, backed orders are listed | a maker must be online to lock its side: its page sends a signed heartbeat, and the board checks the coins behind an order at the maker's key on launch chains (Bitcoin behind a bid is not checked; the taker's page checks the actual lock) |
+| The taker claims only while `MTP + margin < maker locktime` | a claim confirming after the maker's refund would hand the maker both sides |
+| Records before broadcasts | every swap lives in the browser's storage and is advanced one step at a time: a reload or a closed tab loses nothing, and a lock whose other side stopped is refunded by the page after its timelock |
+| Chains are named `btc:<net>` or by launch id in everything signed | no replay on another network or against another coin with the same ticker |
+| One tab runs the engine (a Web Lock), ticking from a worker timer | two tabs answering the same take would lock twice; a hidden tab's own timers are slowed to one a minute by browsers, a worker's are not. The page warns before it is closed mid-swap |
+
+Sats offered by a maker are paid from its page key on Bitcoin (deposit from the wallet first: a page cannot ask the wallet to sign unattended); a taker paying sats pays from the wallet. `hashfun web --book-confs N --book-lock SECONDS` set what the page proposes (default 6 confirmations on a launch chain, 1 on Bitcoin, 4 h for the maker's lock, twice that for the taker's). Each page enforces its own numbers. The house maker (`--maker`) is unchanged and remains the instant path for small buys.
+
+API: `GET /api/book[?maker=PUB]`, `POST /api/book/{order,cancel,alive,take}`, `GET|POST /api/book/fill/ID`.
 
 ## Wallet file
 
@@ -163,11 +204,12 @@ Taker rules (wallet): reveals the secret only after `N` confirmations on the mak
 ```
 python -m unittest hashfun.tests.test_core      # vectors (BIP32/39/143/173), curve, LWMA, descriptor, HTLC, AuxPoW
 python -m unittest hashfun.tests.test_stack     # pool+miner, merged mining gate, proxy split, electrum+wallet+reorg, swaps buy/sell/refund (simulator)
+python -m unittest hashfun.tests.test_book      # launch metadata; the peer-to-peer book's server side (signatures, reservations, expiry)
 bash contrib/hashfun/difftest/build.sh build/hfdiff && HFDIFF=build/hfdiff python -m unittest hashfun.tests.test_diff_cpp
 python -m hashfun.tests.e2e_regtest --hashfund build/bin/hashfund --bitcoind /path/to/stock/bitcoind
 python -m hashfun.tests.fleet_regtest --hashfund build/bin/hashfund --bitcoind /path/to/stock/bitcoind   # ~4.5 min, real time
-python -m unittest hashfun.tests.test_web_js    # browser Bitcoin code vs Python (needs node; cd hashfun/web && npm install)
-python -m hashfun.tests.web_regtest --hashfund build/bin/hashfund --bitcoind /path/to/stock/bitcoind     # ~6 min, needs playwright
+python -m unittest hashfun.tests.test_web_js    # browser code vs Python, bundle is current, lint (needs node; cd hashfun/web && npm install)
+python -m hashfun.tests.web_regtest --hashfund build/bin/hashfund --bitcoind /path/to/stock/bitcoind     # ~9 min, two browsers, needs playwright
 ```
 
 `test_stack` runs against an in-process simulator whose consensus is the Python model, not the C++ node. `test_diff_cpp` compiles the node's own consensus sources (descriptor parser and identity, `CLaunchParams` + genesis, curve, LWMA, tail) without the rest of the node, in ~20 s, and compares them value by value with the Python model on random descriptors and adversarial header sequences (zero, negative and >6T solvetimes, off-schedule nBits, graduation crossings); it also requires both parsers to accept and reject exactly the same descriptor JSON. `e2e_regtest` covers what needs a running node: block acceptance (creator output, excess coinbase, nBits), the auxpow gate, GBT, merged mining against stock bitcoind and a swap over real nodes. With `--workdir` its phases can run in separate processes (`--phases 1-6`, `7-8`, `9`). `fleet_regtest` is the multi-node test: production-mode launches, P2P on localhost, real time; gating, state agreement (tip, UTXO set, Bitcoin relay, every obligation) across nodes, late joiner, restarts, partitions and reorgs in both directions including a forged Bitcoin header branch, two competing pools, AuxPoW blocks over P2P, the settlement lock in the mempool, transaction relay, `verifychain`, stall relief against the wall clock.

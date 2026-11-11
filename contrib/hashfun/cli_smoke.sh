@@ -43,9 +43,21 @@ b w generatetoaddress 110 "$BA" >/dev/null
 
 hf launch new --name "Grad smoke" --ticker GRD --creator-address "$(addr grd)" --graduation-hashes 30 \
   --pow-limit 207fffff --spacing 10 --window 10 --test -o "$W/grd.json" >/dev/null 2>&1
+# a 1x1 PNG as the coin's picture: its hash goes into the launch id
+python3 -c "
+import struct, sys, zlib
+c = lambda t, d: struct.pack('>I', len(d)) + t + d + struct.pack('>I', zlib.crc32(t + d))
+open(sys.argv[1], 'wb').write(b'\x89PNG\r\n\x1a\n' + c(b'IHDR', struct.pack('>IIBBBBB', 1, 1, 8, 2, 0, 0, 0)) + c(b'IDAT', zlib.compress(b'\x00\xff\x9a\x1f')) + c(b'IEND', b''))" "$W/sts.png"
 hf launch new --name "Sats smoke" --ticker STS --creator-address "$(addr sts)" --graduation-hashes 1e9 \
   --pow-limit 207fffff --spacing 10 --window 10 --test --btc-rpc "$BTC" --btc-cookie "$COOKIE" \
-  --sats-total 20000 --creator-btc-address "$(b w getnewaddress "" bech32)" --btc-hrp bcrt -o "$W/sts.json" >/dev/null 2>&1
+  --sats-total 20000 --creator-btc-address "$(b w getnewaddress "" bech32)" --btc-hrp bcrt \
+  --image "$W/sts.png" --description "smoke test coin" --x https://x.com/smoke -o "$W/sts.json" >/dev/null 2>&1
+[ "$(hf launch info "$W/sts.json" | j "d['meta']['verified'] and d['meta']['image_type'] == 'image/png' and d['meta']['x'] == 'https://x.com/smoke'")" = "True" ]
+# a launch file whose picture is not the committed one is refused
+python3 -c "
+import json, sys
+d = json.load(open(sys.argv[1])); d['metadata']['description'] = 'swapped'; json.dump(d, open(sys.argv[2], 'w'))" "$W/sts.json" "$W/bad.json"
+if hf node add "$W/bad.json" >/dev/null 2>&1; then echo "tampered metadata was accepted"; exit 1; fi
 hf node add "$W/grd.json" >/dev/null; hf node add "$W/sts.json" >/dev/null
 hf node up | tee "$W/up.json" >/dev/null
 [ "$(j "d['GRD']+d['STS']" < "$W/up.json")" = "startedstarted" ]
@@ -85,6 +97,8 @@ WEBPID=$!
 for _ in $(seq 100); do [ "$(curl -sf "http://127.0.0.1:$WP/api/board" 2>/dev/null | j "sum('height' in c for c in d)" 2>/dev/null)" = "2" ] && break; sleep 0.2; done
 echo "site: $(curl -sf "http://127.0.0.1:$WP/api/board" | j "[(c['ticker'], c['height'], c['graduated']) for c in d]")"
 [ "$(curl -sf "http://127.0.0.1:$WP/api/coin/STS" | j "len(d['blocks']) > 5 and d['paid']['holder'] + d['paid']['creator'] + d['paid']['dev'] > 0")" = "True" ]
+[ "$(curl -sf "http://127.0.0.1:$WP/api/coin/STS/image" | cmp -s - "$W/sts.png" && echo same)" = "same" ]
+[ "$(curl -sf "http://127.0.0.1:$WP/api/book" | j "d['orders']")" = "[]" ]
 curl -sf "http://127.0.0.1:$WP/" | grep -q "<title>hashfun</title>"
 [ "$(curl -sf "http://127.0.0.1:$WP/app.js" | wc -c)" -gt 20000 ]
 kill "$WEBPID" 2>/dev/null || true

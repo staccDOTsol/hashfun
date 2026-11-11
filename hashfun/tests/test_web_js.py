@@ -155,6 +155,84 @@ class WebJsTest(unittest.TestCase):
         self.assertEqual(len({w["key"] for w in want}), len(sigs))
         self.assertTrue(sha256d(b"") and hash160(b""))
 
+    def test_committed_bundle_is_built_from_these_sources(self):
+        """static/app.js is what the site serves and what ships in the npm package: it must be the
+        build of src/ as it stands (a stale bundle once hid a fix from the browser test)."""
+        import tempfile
+        esbuild = os.path.join(WEB, "node_modules", ".bin", "esbuild")
+        if not os.path.exists(esbuild):
+            self.skipTest("esbuild not installed")
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "app.js")
+            subprocess.run([esbuild, "src/app.js", "--bundle", "--minify", "--format=iife", "--target=es2020", "--outfile=" + out,
+                            "--log-level=error"], cwd=WEB, check=True, timeout=120)
+            with open(out, "rb") as a, open(os.path.join(WEB, "static", "app.js"), "rb") as b:
+                self.assertEqual(hashlib.sha256(a.read()).hexdigest(), hashlib.sha256(b.read()).hexdigest(),
+                                 "static/app.js is stale: cd hashfun/web && npm run build")
+
+    def test_sources_lint_clean(self):
+        """A name used before its declaration in the same scope throws only when that line runs
+        (it once sat in the offer form, where no unit test reaches). The linter sees it statically."""
+        eslint = os.path.join(WEB, "node_modules", ".bin", "eslint")
+        if not os.path.exists(eslint):
+            self.skipTest("eslint not installed")
+        p = subprocess.run(["npm", "run", "--silent", "lint"], cwd=WEB, capture_output=True, timeout=180)
+        self.assertEqual(p.returncode, 0, (p.stdout + p.stderr).decode()[-2000:])
+
+    def test_metadata_hash(self):
+        from hashfun import meta as M
+        cases, want = [], []
+        for i in range(24):
+            head = self.rng.choice([b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff\xe0", b"GIF89a", b"RIFF\x00\x00\x00\x00WEBP", b""])
+            image = head + self.rb(self.rng.choice([0, 20, 300, 70000 - len(head)]) if head else 0)
+            m = M.Meta(description=self.rng.choice(["", "rig cat", "λ ✓ two\nlines", "x" * 500]), image=image,
+                       image_type=M.image_type_of(image) or "", website=self.rng.choice(["", "https://a.example/b?c=d"]),
+                       x=self.rng.choice(["", "https://x.com/rigcat"]), telegram=self.rng.choice(["", "https://t.me/rigcat"]))
+            cases.append({"op": "meta", "meta": {"description": m.description, "image_type": m.image_type, "image": image.hex(),
+                                                 "website": m.website, "x": m.x, "telegram": m.telegram}})
+            want.append({"hash": m.hash().hex(), "type": M.image_type_of(image), "b64": m.to_json().get("image", "")})
+        self.assertEqual(run_js(cases), want)
+
+    def test_signed_text_both_ways(self):
+        from hashfun import book as K
+        texts = ["hashfun-alive-v1\n02ab\n1800000000", "x", "λ\nline two", "a" * 400]
+        keys = [self.priv() for _ in texts]
+        out = run_js([{"op": "sign", "priv": f"{k:064x}", "text": t} for k, t in zip(keys, texts)])
+        for k, t, o in zip(keys, texts, out):   # the page signs, the board verifies
+            self.assertTrue(o["ok"])
+            self.assertTrue(K.verify(pubkey_from_priv(k).hex(), t, o["sig"]), t)
+            self.assertFalse(K.verify(pubkey_from_priv(k).hex(), t + "!", o["sig"]))
+            self.assertFalse(K.verify(pubkey_from_priv(keys[0] + 1).hex(), t, o["sig"]))
+        cases, want = [], []
+        for k, t in zip(keys, texts):           # the other side signs (here: Python), the page verifies
+            r, s_ = ecdsa_sign(k, sha256d(t.encode()))
+            sig, pub = f"{r:064x}{s_:064x}", pubkey_from_priv(k).hex()
+            cases += [{"op": "verify", "pub": pub, "text": t, "sig": sig}, {"op": "verify", "pub": pub, "text": t + " ", "sig": sig},
+                      {"op": "verify", "pub": pub, "text": t, "sig": sig[:-2] + ("00" if sig[-2:] != "00" else "01")},
+                      {"op": "verify", "pub": pub, "text": t, "sig": "zz"}]
+            want += [{"ok": True}, {"ok": False}, {"ok": False}, {"ok": False}]
+        self.assertEqual(run_js(cases), want)
+
+    def test_book_texts_and_ids(self):
+        from hashfun import book as K
+        cases, want = [], []
+        for _ in range(20):
+            o = {"maker": pubkey_from_priv(self.priv()).hex(), "give": self.rb(32).hex(), "give_amount": self.rng.randint(1, 21 * 10**14),
+                 "get": self.rng.choice(["btc:main", "btc:regtest", self.rb(32).hex()]), "get_amount": self.rng.randint(1, 21 * 10**14),
+                 "min_get": self.rng.randint(1, 10**9), "expiry": self.rng.randint(1, 2**32 - 1), "nonce": self.rb(8).hex(),
+                 "lock": self.rng.randint(600, 86400), "confs": self.rng.randint(0, 100)}
+            t = {"order": K.text_id(K.order_text(o)), "taker": pubkey_from_priv(self.priv()).hex(),
+                 "get_amount": self.rng.randint(1, o["get_amount"]), "secret_hash": self.rb(32).hex(),
+                 "locktime": self.rng.randint(500_000_000, 2**32 - 1), "ts": self.rng.randint(0, 2**32 - 1)}
+            body = self.rng.choice([{}, {"until": 1800000000}, {"why": "too late"}, {"vout": 1, "txid": "ab" * 32, "contract": "6382"}])
+            fill, kind, ts = K.text_id(K.take_text(t)), self.rng.choice(["accept", "locked", "fail"]), self.rng.randint(0, 2**32 - 1)
+            cases.append({"op": "book", "order": o, "take": t, "fill": fill, "kind": kind, "body": body, "maker": o["maker"], "ts": ts,
+                          "order_id": t["order"]})
+            want.append({"order": K.order_text(o), "take": K.take_text(t), "note": K.note_text(fill, kind, body),
+                         "alive": K.alive_text(o["maker"], ts), "cancel": K.cancel_text(t["order"]), "id": t["order"],
+                         "give": K.give_for(o, t["get_amount"])})
+        self.assertEqual(run_js(cases), want)
+
 
 if __name__ == "__main__":
     unittest.main()

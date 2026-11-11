@@ -210,3 +210,31 @@ export const keyFromSignature = (sigB64) => {
   return k;
 };
 export const randomBytes = (n) => crypto.getRandomValues(new Uint8Array(n));
+
+// ---------------------------------------------------------------- signed text (hashfun/book.py)
+// Orders and swap messages are short texts signed with the hashfun key: ECDSA over SHA256d of the
+// text, r || s as 64 bytes of hex.
+export const signText = (priv, text) => secp.sign(sha256d(utf8(text)), priv, { lowS: true }).toCompactHex();
+export const verifyText = (pubHex, text, sigHex) => {
+  try { return /^[0-9a-f]{128}$/.test(sigHex) && secp.verify(sigHex, sha256d(utf8(text)), unhex(pubHex), { lowS: false }); } catch (e) { return false; }
+};
+// The secret a swap's claim revealed: the 32-byte witness item that hashes to the contract's hash.
+export const secretFromWitness = (witnesses, secretHash) => {
+  for (const w of witnesses) for (const item of w) if (item.length === 64 && eq(sha256(unhex(item)), secretHash)) return unhex(item);
+  return null;
+};
+
+// ---------------------------------------------------------------- launch metadata (hashfun/meta.py)
+export const imageType = (d) => {
+  const at = (o, s) => [...s].every((c, i) => d[o + i] === c.charCodeAt(0));
+  if (d[0] === 0x89 && at(1, 'PNG\r\n\x1a\n')) return 'image/png';
+  if (d[0] === 0xff && d[1] === 0xd8 && d[2] === 0xff) return 'image/jpeg';
+  if (at(0, 'GIF87a') || at(0, 'GIF89a')) return 'image/gif';
+  if (at(0, 'RIFF') && at(8, 'WEBP')) return 'image/webp';
+  return null;
+};
+// m: { description, image_type, image (bytes), website, x, telegram }. What the descriptor's
+// `meta` field must equal: the page checks the site committed to the picture it was given.
+export const metaHash = (m) => sha256(cat(utf8('hashfun-meta\x01'), varbytes(utf8(m.description || '')), varbytes(utf8(m.image_type || '')),
+  varbytes(m.image || new Uint8Array(0)), ...['website', 'x', 'telegram'].map((k) => varbytes(utf8(m[k] || '')))));
+export const b64 = (bytes) => { let s = ''; for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode(...bytes.subarray(i, i + 0x8000)); return btoa(s); };
