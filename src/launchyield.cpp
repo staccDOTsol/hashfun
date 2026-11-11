@@ -105,24 +105,31 @@ std::optional<std::vector<unsigned char>> TaggedReturn(const CScript& script, st
     return data;
 }
 
+bool EarnsYield(const CScript& s)
+{
+    const size_t n = s.size();
+    if (n == 25 && s[0] == OP_DUP && s[1] == OP_HASH160 && s[2] == 20 && s[23] == OP_EQUALVERIFY && s[24] == OP_CHECKSIG) return true;
+    if (n == 23 && s[0] == OP_HASH160 && s[1] == 20 && s[22] == OP_EQUAL) return true;
+    return n >= 4 && n <= 42 && (s[0] == OP_0 || (s[0] >= OP_1 && s[0] <= OP_16)) && s[1] == n - 2;
+}
+
 std::vector<RegOut> RegisteredOutputs(const CTransaction& tx)
 {
     std::vector<RegOut> out;
-    std::vector<unsigned char> btc_script;
+    std::vector<unsigned char> redirect;
     for (const CTxOut& o : tx.vout) {
         if (auto data = TaggedReturn(o.scriptPubKey, "HFY1")) {
-            if (data->size() < 5 || data->size() > 84) return out;
-            btc_script.assign(data->begin() + 4, data->end());
+            if (data->size() >= 5 && data->size() <= 84) redirect.assign(data->begin() + 4, data->end());
             break;
         }
     }
-    if (btc_script.empty()) return out;
     const bool coinbase = tx.IsCoinBase();
     for (uint32_t i = 0; i < tx.vout.size(); ++i) {
         const CTxOut& o = tx.vout[i];
-        if (coinbase && i > 0) break;
-        if (o.nValue <= 0 || (!o.scriptPubKey.empty() && o.scriptPubKey[0] == OP_RETURN)) continue;
-        out.push_back({i, o.nValue, btc_script});
+        if (o.nValue <= 0 || !EarnsYield(o.scriptPubKey)) continue;
+        // A coinbase's redirect covers only the miner's own output, not the creator's cut.
+        const bool redirected = !redirect.empty() && (!coinbase || i == 0);
+        out.push_back({i, o.nValue, redirected ? redirect : std::vector<unsigned char>(o.scriptPubKey.begin(), o.scriptPubKey.end())});
     }
     return out;
 }

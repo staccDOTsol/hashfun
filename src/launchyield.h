@@ -27,10 +27,10 @@
  *   - payment size: owed if owed >= min, else min with probability owed/min
  *     (so every Bitcoin output is worth sending; expectation is preserved);
  *   - recipient class: 80% a holder, 10% the creator, 10% the dev;
- *   - holder: up to 16 candidate points into the value of all yield-registered
- *     outputs created up to the minting block; the payee is the first
- *     candidate whose output is still unspent, i.e. coin-weighted over holders
- *     who have not moved. All 16 spent -> creator.
+ *   - holder: up to 64 candidate points into the value of every earning output
+ *     created before the minting block; the payee is the first candidate whose
+ *     output is still unspent, i.e. coin-weighted over current holders. No
+ *     opt-in: an output is paid at its own script on Bitcoin. All spent -> creator.
  * The miner pays on Bitcoin and proves it here (SPV against the in-chain
  * Bitcoin header relay) before the settlement deadline; until then the
  * coinbase cannot be spent, and after it the coins are gone.
@@ -38,7 +38,7 @@
 namespace launchyield {
 
 static constexpr int DRAW_DELAY = 6;          //!< seed block = mint block + DRAW_DELAY
-static constexpr int MAX_CANDIDATES = 16;
+static constexpr int MAX_CANDIDATES = 64;
 static constexpr int HOLDER_BPS = 8000;
 static constexpr int CREATOR_BPS = 1000;      //!< remainder (1000) is the dev's
 
@@ -66,10 +66,15 @@ struct RegOut {
     CAmount value{0};
     std::vector<unsigned char> btc_script;
 };
+/** P2PKH, P2SH or a witness program: a script that means the same thing on Bitcoin. */
+bool EarnsYield(const CScript& script);
 /**
- * Outputs of tx that earn yield: the tx carries OP_RETURN "HFY1"<btc scriptPubKey>
- * (1..80 bytes). Every other positive, non-OP_RETURN output registers to that
- * script; in a coinbase only vout 0 does.
+ * Outputs of tx that earn yield, with the Bitcoin script their yield is paid to.
+ * Holding is enough: every positive P2PKH / P2SH / witness-program output earns,
+ * and is paid at its own scriptPubKey on Bitcoin (a launch is a Bitcoin fork, so
+ * the same key controls both). A tx may redirect its outputs' yield with
+ * OP_RETURN "HFY1"<btc scriptPubKey> (1..80 bytes); in a coinbase the redirect
+ * covers vout 0 only.
  */
 std::vector<RegOut> RegisteredOutputs(const CTransaction& tx);
 

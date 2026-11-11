@@ -26,6 +26,7 @@ from typing import Dict, List, Optional
 
 from .auxpow import AuxTree, serialize_auxpow, check_auxpow
 from .crypto import sha256d
+from .yieldmodel import yield_tag_script
 from .rpc import RPC, RPCError
 from .ser import (Tx, TxIn, TxOut, varint, push, push_int, merkle_branch_for_first, root_from_branch,
                   bits_to_target, header_bytes, address_to_script, Reader)
@@ -191,9 +192,14 @@ class AuxSet:
 
 class LaunchSource(JobSource):
     def __init__(self, rpc: RPC, hrp: str, ticker: str, default_payout: str = None,
-                 children: Optional[Dict[str, dict]] = None):
+                 children: Optional[Dict[str, dict]] = None, settler=None, yield_hrp: str = "bc"):
+        """settler: hashfun.settler.Settler for launches with a sats leg (pays and proves the
+        Bitcoin owed by the blocks this pool finds). Miners who log in as
+        "<launch address>,<bitcoin address>" get their coinbase registered for BTC yield."""
         super().__init__()
         self.auxset = AuxSet({k: v for k, v in (children or {}).items() if k != ticker})
+        self.settler, self.yield_hrp = settler, yield_hrp
+        self.settle_outs: List[TxOut] = []
         self.rpc, self.hrp, self.ticker = rpc, hrp, ticker
         self.name = ticker
         self.default_payout = default_payout
@@ -216,8 +222,17 @@ class LaunchSource(JobSource):
             return False
         tmpl = await asyncio.to_thread(self.rpc.getblocktemplate, {"rules": ["segwit"]})
         self.last_full = now
+        settle_changed = False
+        if self.settler:
+            try:
+                outs = await asyncio.to_thread(self.settler.coinbase_outputs)
+            except Exception as e:  # the Bitcoin node being down must not stop mining
+                log.warning("[%s] settler: %s", self.ticker, e)
+                outs = self.settle_outs
+            settle_changed = [o.script_pubkey for o in outs] != [o.script_pubkey for o in self.settle_outs]
+            self.settle_outs = outs
         if (self.tmpl and tmpl["previousblockhash"] == self.prev and tmpl["bits"] == self.tmpl["bits"]
-                and now - self.last_push < 30):
+                and not settle_changed and now - self.last_push < 30):
             return False  # same job, nothing to push
         self.last_push = now
         if tmpl["previousblockhash"] != self.prev or aux_changed:
@@ -241,6 +256,10 @@ class LaunchSource(JobSource):
         outs = [TxOut(t["coinbasevalue"], self.payout_script(username))]
         if "creatorfee" in t:
             outs.append(TxOut(t["creatorfee"]["amount"], bytes.fromhex(t["creatorfee"]["script"])))
+        yield_script = self.yield_script(username)
+        if yield_script:
+            outs.append(TxOut(0, yield_tag_script(yield_script)))
+        outs += self.settle_outs
         has_commit = "default_witness_commitment" in t
         if has_commit:
             outs.append(TxOut(0, bytes.fromhex(t["default_witness_commitment"])))
@@ -251,6 +270,16 @@ class LaunchSource(JobSource):
                    merkle_branch_for_first([b"\0" * 32] + txids), t["version"], int(t["bits"], 16), t["curtime"],
                    t["height"], datas, has_commit, clean,
                    {"target": int(t["target"], 16), "fixed_ntime": True, **auxctx})
+
+    def yield_script(self, username: str) -> Optional[bytes]:
+        """Bitcoin scriptPubKey from "<launch address>,<bitcoin address>[.worker]", if given."""
+        parts = (username or "").split(".")[0].split(",")
+        if len(parts) < 2 or not parts[1]:
+            return None
+        try:
+            return address_to_script(parts[1], self.yield_hrp)
+        except Exception:
+            return None
 
     async def on_solution(self, job, header, coinbase, hash_int):
         aux_events = await self.auxset.submit(job, header, coinbase, hash_int)
@@ -264,6 +293,8 @@ class LaunchSource(JobSource):
         ev = {"chain": self.ticker, "kind": "block", "height": job.height, "hash": h, "result": res}
         self.blocks_found.append(ev)
         self.last_full = 0
+        if res is None and self.settler:
+            self.settler.add_block(job.height, h)
         log.info("[%s] block %s at %d: %s", self.ticker, h, job.height, res or "accepted")
         return [ev]
 

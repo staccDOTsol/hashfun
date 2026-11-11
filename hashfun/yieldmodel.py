@@ -13,7 +13,7 @@ from .ser import Tx, bits_to_target, target_to_bits
 
 MAX_MONEY = 21_000_000 * 100_000_000
 DRAW_DELAY = 6
-MAX_CANDIDATES = 16
+MAX_CANDIDATES = 64
 HOLDER_BPS, CREATOR_BPS = 8000, 1000
 HOLDER, CREATOR, DEV = 0, 1, 2
 OP_RETURN = 0x6A
@@ -86,25 +86,32 @@ def tagged_return(script: bytes, tag: bytes) -> Optional[bytes]:
     return rest
 
 
+def earns_yield(script: bytes) -> bool:
+    """P2PKH, P2SH or a witness program: a script that means the same thing on Bitcoin."""
+    n = len(script)
+    if n == 25 and script[:3] == b"\x76\xa9\x14" and script[23:] == b"\x88\xac":
+        return True
+    if n == 23 and script[:2] == b"\xa9\x14" and script[22] == 0x87:
+        return True
+    return 4 <= n <= 42 and (script[0] == 0 or 0x51 <= script[0] <= 0x60) and script[1] == n - 2
+
+
 def registered_outputs(tx: Tx, coinbase: bool) -> List[Tuple[int, int, bytes]]:
-    """[(vout, value, btc_script)] of outputs that earn yield (see launchyield.h)."""
-    btc_script = b""
+    """[(vout, value, btc_script)]: every earning output, paid at its own script on Bitcoin unless
+    the tx redirects with OP_RETURN "HFY1"<script> (coinbase: redirect covers vout 0 only)."""
+    redirect = b""
     for o in tx.vout:
         data = tagged_return(o.script_pubkey, b"HFY1")
         if data is not None:
-            if not 5 <= len(data) <= 84:
-                return []
-            btc_script = data[4:]
+            if 5 <= len(data) <= 84:
+                redirect = data[4:]
             break
-    if not btc_script:
-        return []
     out = []
     for i, o in enumerate(tx.vout):
-        if coinbase and i > 0:
-            break
-        if o.value <= 0 or o.script_pubkey[:1] == bytes([OP_RETURN]):
+        if o.value <= 0 or not earns_yield(o.script_pubkey):
             continue
-        out.append((i, o.value, btc_script))
+        redirected = redirect and (not coinbase or i == 0)
+        out.append((i, o.value, redirect if redirected else o.script_pubkey))
     return out
 
 

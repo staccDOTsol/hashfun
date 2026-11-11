@@ -407,8 +407,13 @@ class DiffCpp(unittest.TestCase):
         rng = random.Random(SEED + 7)
         for i in range(max(200, N * 5)):
             coinbase = rng.random() < 0.3
-            outs = [TxOut(rng.choice([0, 1, 546, 10**8]), rng.choice([b"\x51", b"\x00\x14" + rng.randbytes(20),
-                                                                     b"\x6a\x01\x01", b""]))
+            outs = [TxOut(rng.choice([0, 1, 546, 10**8]), rng.choice([
+                b"\x51", b"\x00\x14" + rng.randbytes(20), b"\x6a\x01\x01", b"", b"\x00\x20" + rng.randbytes(32),
+                b"\x51\x20" + rng.randbytes(32), b"\x76\xa9\x14" + rng.randbytes(20) + b"\x88\xac",
+                b"\xa9\x14" + rng.randbytes(20) + b"\x87", b"\x76\xa9\x14" + rng.randbytes(20) + b"\x88\xad",
+                b"\x60\x28" + rng.randbytes(40), b"\x60\x29" + rng.randbytes(41), b"\x00\x02\x01\x02",
+                b"\x00\x01\x01", b"\x4f\x02\x01\x02", b"\x00\x15" + rng.randbytes(20),
+                b"\x21" + rng.randbytes(33) + b"\xac", b"\x52\x02\xab\xcd"]))
                     for _ in range(rng.randrange(0, 5))]
             spk = rng.randbytes(rng.choice([1, 22, 34, 80]))
             tagout = rng.choice([Y.yield_tag_script(spk), Y.yield_tag_script(spk), Y.op_return(b"HFY1"),

@@ -15,10 +15,12 @@ Phases, in order (each check prints PASS/FAIL):
   9  Electrum servers + HD wallet + maker: atomic swap BTC -> launch coins
   10 sats leg on a third launch: curve blocks owe real BTC to a drawn payee; Bitcoin headers
      and SPV payment proofs ride in coinbases; unsettled coinbases cannot be spent
+  11 the pool settles on its own: Settler relays headers, pays each drawn payee from a Bitcoin
+     wallet and publishes the proofs while a stratum miner mines a fresh sats-leg launch
 
 --workdir keeps chains, wallets and results between invocations, so the phases
 can be split across processes on hosts that cap a command's runtime:
-  --workdir W --phases 1-6;  --workdir W --phases 7-8;  --workdir W --phases 9;  ... --phases 10
+  --workdir W --phases 1-6;  --workdir W --phases 7-8;  --workdir W --phases 9;  ... --phases 10;  --phases 11
 Genesis is dated a day back and phases 1-6 run on mocktime, so the real-time
 phases (7-9) start with every chain clock behind the wall clock.
 """
@@ -49,7 +51,7 @@ from hashfun.stratum import LaunchSource, MergedSource, StratumServer
 from hashfun.swap import KeyStore, Maker, NodeChain, relay_handler
 from hashfun.wallet import Wallet, LAUNCH_COIN_BASE
 from hashfun import yieldmodel as Y
-from hashfun.ser import segwit_encode
+from hashfun.settler import Settler
 
 COIN = 100_000_000
 DAY = 86400
@@ -569,7 +571,7 @@ class E2E:
         reg = TxOut(0, Y.yield_tag_script(btc_script(holder_btc)))
         raw = lambda hexhash: bytes.fromhex(hexhash)[::-1]  # noqa: E731
 
-        def mine(extra_outs=(), extra_txs=(), register=True, expect=None):
+        def mine(extra_outs=(), extra_txs=(), register=False, expect=None):
             T[0] += d.target_spacing
             n3.rpc.setmocktime(T[0])
             t = n3.rpc.getblocktemplate({"rules": ["segwit"]})
@@ -591,11 +593,9 @@ class E2E:
             """Pay block `height`'s obligation on Bitcoin; returns (HFP1 output, obligation)."""
             ob = n3.rpc.getmintobligation(height)
             script = to or bytes.fromhex(ob["pay_script"])
-            ver, prog = (script[0] - 0x50 if script[0] else 0), script[2:]
-            addr = segwit_encode("bcrt", ver, prog)
-            rawtx = wb.createrawtransaction([], [{addr: (amount or ob["pay"]) / COIN},
-                                                 {"data": (b"HF" + bytes.fromhex(tag or ob["tag"])).hex()}])
-            funded = wb.fundrawtransaction(rawtx, {"changePosition": 2})
+            rawtx = Tx(version=2, vin=[], vout=[TxOut(amount or ob["pay"], script),
+                                                TxOut(0, Y.payment_outputs_tag([bytes.fromhex(tag or ob["tag"])]))])
+            funded = wb.fundrawtransaction(rawtx.serialize(witness=False).hex(), {"changePosition": 2}, False)
             txid = wb.sendrawtransaction(wb.signrawtransactionwithwallet(funded["hex"])["hex"])
             bh = wb.generatetoaddress(1, self.btc_addr)[0]
             txids = btc.rpc.getblock(bh, 1)["tx"]
@@ -644,12 +644,26 @@ class E2E:
               f"{ob1['payee']} {ob1['pay_script']}")
         obh = next((o for o in (n3.rpc.getmintobligation(h) for h in range(2, 7)) if o["payee"] == "holder"), None)
         if obh:  # 1 - 0.2^5 of runs
+            # No opt-in: every earlier coinbase output earns and is paid at its own script on Bitcoin.
+            scripts = {(cbs[h].txid()[::-1].hex(), v): o.script_pubkey.hex()
+                       for h in range(1, obh["height"]) for v, o in enumerate(cbs[h].vout)}
             c0 = obh["candidates"][0]
-            early = {cbs[h].txid()[::-1].hex() for h in range(1, obh["height"])}
-            check("10 holder candidates are earlier registered coinbases, paid at their Bitcoin script",
-                  len(obh["candidates"]) == Y.MAX_CANDIDATES and all(c["txid"] in early and c["vout"] == 0
-                                                                     for c in obh["candidates"])
-                  and c0["unspent"] and bytes.fromhex(obh["pay_script"]) == btc_script(holder_btc), json.dumps(c0))
+            check("10 holders earn without opting in: candidates are earlier outputs, paid at their own script",
+                  len(obh["candidates"]) == Y.MAX_CANDIDATES
+                  and all(scripts.get((c["txid"], c["vout"])) == c["btc_script"] for c in obh["candidates"])
+                  and c0["unspent"] and obh["pay_script"] == c0["btc_script"]
+                  and {c["btc_script"] for c in obh["candidates"]} <= {pay_spk.hex(), self.creator_spk.hex()},
+                  json.dumps(c0))
+        mine_h(register=True)  # optional redirect: this coinbase's yield goes to another Bitcoin script
+        redirected = cbs[n3.rpc.getblockcount()].txid()[::-1].hex()
+        for _ in range(Y.DRAW_DELAY + 2):
+            mine_h()
+        seen = [c for h in range(2, n3.rpc.getblockcount() - Y.DRAW_DELAY + 1)
+                for c in n3.rpc.getmintobligation(h).get("candidates", []) if c["txid"] == redirected]
+        if seen:
+            check("10 an HFY1 redirect sends the miner output's yield to the named script, not the creator's",
+                  all(c["btc_script"] == (btc_script(holder_btc).hex() if c["vout"] == 0 else self.creator_spk.hex())
+                      for c in seen), json.dumps(seen[0]))
 
         mine_h(relay_out())
         check("10 Bitcoin headers relayed in a coinbase are tracked",
@@ -698,11 +712,14 @@ class E2E:
             check("10 a block spending an unsettled coinbase is invalid", False, str(e))
         # A holder draw names an earlier registered coinbase. Once its owner moves those coins, the
         # next candidate (or the creator) becomes the payee of any still-unsettled block.
-        while n3.rpc.getblockcount() < 130:
+        while n3.rpc.getblockcount() < 200:
             mine_h()
         target = next(h for h in range(5, 60) if (lambda o: o["payee"] == "holder" and not o["settled"])(
             n3.rpc.getmintobligation(h)))
         before = n3.rpc.getmintobligation(target)
+        # pick a holder draw whose first candidate is a miner output we can spend
+        target, before = next((h, o) for h, o in ((h, n3.rpc.getmintobligation(h)) for h in range(5, 90))
+                              if o["payee"] == "holder" and not o["settled"] and o["candidates"][0]["vout"] == 0)
         hc = next(h for h, cb in cbs.items() if cb.txid()[::-1].hex() == before["candidates"][0]["txid"])
         if not n3.rpc.getmintobligation(hc)["spendable"]:
             good, _ = pay(hc)
@@ -729,6 +746,74 @@ class E2E:
         check("10 state rebuilt from blocks after restart",
               [n3.rpc.getmintobligation(h) for h in (1, 2, 3, target)] == snap and n3.rpc.getbtcrelay() == relay)
 
+    # ------------------------------------------------------------ phase 11: automatic settlement
+    def p11(self):
+        a, btc, wb = self.a, self.btc, self.wb
+        btc.rpc.setmocktime(0)
+        if wb.getbalance() < 10:
+            wb.generatetoaddress(101, self.btc_addr)
+        spk = lambda addr: bytes.fromhex(wb.getaddressinfo(addr)["scriptPubKey"])  # noqa: E731
+        creator_btc, miner_btc = wb.getnewaddress("", "bech32"), wb.getnewaddress("", "bech32")
+        tag = f"{int(time.time())}"
+        path = os.path.join(self.dir, f"AUTO-{tag}.json")
+        d = D.make("AUTO e2e", "AUTO", self.creator_spk, 10**9, test=True, pow_limit_bits=0x207FFFFF,
+                   target_spacing=10, lwma_window=10, genesis_time=int(time.time()) - DAY)
+        d.ftl = 7200
+        d.btc_anchor_height = max(0, btc.rpc.getblockcount() - 450)  # a few coinbases of header catch-up
+        d.btc_anchor_header = bytes.fromhex(btc.rpc.getblockheader(btc.rpc.getblockhash(d.btc_anchor_height), False))
+        # 2 hashes/block at the floor -> 4,000 sats owed: a 40% lottery for 10,000. Real-time pool
+        # mining ratchets difficulty, so later blocks owe more and pay in full.
+        d.sats_num, d.sats_shift, d.creator_btc_script = 2000, 0, spk(creator_btc)
+        D.validate(d)
+        d.grind_genesis()
+        with open(path, "w") as f:
+            f.write(d.dumps())
+        n4 = Node(a.hashfund, os.path.join(self.dir, f"n4-{tag}"), [f"-launch={path}"], free_port())
+        self.nodes.append(n4)
+        w4 = open_wallet(n4.rpc)
+        miner_addr = w4.getnewaddress("", "bech32")
+        settler = Settler(n4.rpc, wb, os.path.join(self.dir, f"settler-{tag}.json"), max_pay_sats=COIN)
+        src = LaunchSource(n4.rpc, d.hrp, d.ticker, settler=settler, yield_hrp="bcrt")
+        port = free_port()
+        asyncio.run_coroutine_threadsafe(StratumServer(src, "127.0.0.1", port, difficulty=1e-6,
+                                                       poll_interval=0.2).serve(), self.loop)
+        time.sleep(1)
+        m = StratumMiner("127.0.0.1", port, f"{miner_addr},{miner_btc}", batch=4096)
+        FIRST = 8  # the first FIRST pool blocks must all end up spendable
+        t0 = time.time()
+
+        def obligations():
+            return [n4.rpc.getmintobligation(h) for h in range(1, min(n4.rpc.getblockcount(), FIRST) + 1)]
+
+        while time.time() - t0 < 110:
+            asyncio.run_coroutine_threadsafe(m.run(duration=1.0), self.loop).result(60)
+            wb.generatetoaddress(1, self.btc_addr)
+            obs = obligations()
+            if len(obs) == FIRST and all(o["spendable"] for o in obs):
+                break
+        obs = obligations()
+        tip = n4.rpc.getblockcount()
+        allobs = [n4.rpc.getmintobligation(h) for h in range(1, tip + 1)]
+        paid = [o for o in allobs if o["settled"]]
+        lottery_free = [o for o in allobs if o["draw_known"] and o["pay"] == 0]
+        print(f"   AUTO: {tip} blocks in {time.time() - t0:.0f}s; settled by payment {len(paid)}, "
+              f"nothing due {len(lottery_free)}, relay at {n4.rpc.getbtcrelay()['height']}/{btc.rpc.getblockcount()}, "
+              f"settler {settler.status()}", flush=True)
+        check("11 pool mined a sats-leg launch through stratum", tip >= FIRST, f"{tip} blocks")
+        check("11 first blocks all spendable without manual steps", len(obs) == FIRST and all(o["spendable"] for o in obs),
+              json.dumps([(o["height"], o.get("pay"), o["settled"]) for o in obs]))
+        check("11 settler paid and proved at least one obligation on Bitcoin", len(paid) >= 1, f"{len(paid)}")
+        check("11 settler relayed Bitcoin headers through coinbases",
+              n4.rpc.getbtcrelay()["height"] >= btc.rpc.getblockcount() - 3, json.dumps(n4.rpc.getbtcrelay()))
+        cb = n4.rpc.getblock(n4.rpc.getblockhash(2), 2)["tx"][0]
+        check("11 miner's coinbase is registered for BTC yield at its Bitcoin address",
+              any(o["scriptPubKey"]["hex"] == Y.yield_tag_script(spk(miner_btc)).hex() for o in cb["vout"]))
+        holders = [o for o in allobs if o["draw_known"] and o["payee"] == "holder" and o["settled"] and o["height"] > 1]
+        if holders:
+            check("11 holder draws go to the miner's redirect address or the creator's own script",
+                  all(c["btc_script"] in (spk(miner_btc).hex(), self.creator_spk.hex())
+                      for o in holders for c in o["candidates"]))
+
 
 def parse_phases(s):
     out = []
@@ -743,7 +828,7 @@ def main():
     ap.add_argument("--hashfund", required=True)
     ap.add_argument("--bitcoind", required=True, help="stock Bitcoin Core bitcoind")
     ap.add_argument("--workdir", help="persist chains, wallets and results here (lets --phases span runs)")
-    ap.add_argument("--phases", default="1-10", help="e.g. 1-6 or 7,8 (in order, each once)")
+    ap.add_argument("--phases", default="1-11", help="e.g. 1-6 or 7,8 (in order, each once)")
     ap.add_argument("--keep", action="store_true", help="keep the temporary datadirs")
     a = ap.parse_args()
     phases = parse_phases(a.phases)

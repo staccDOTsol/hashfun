@@ -33,8 +33,8 @@ With `sats_num > 0` a curve block owes real BTC on top of its hash: `owed = (wor
 | Step | Rule |
 |---|---|
 | Draw | the hash of block `h+6` seeds block `h`'s draw. Debts under `sats_min_payment` pay the minimum with probability owed/min. Payee class: 80% holder, 10% creator (`creator_btc_script`), 10% dev (compiled-in script, currently a placeholder nobody can spend) |
-| Holder | 16 candidate points into the value of all yield-registered outputs created before block `h`; the payee is the first candidate still unspent (coin-weighted over holders who have not moved). All spent or none registered: creator |
-| Register | a tx with `OP_RETURN "HFY1"<btc scriptPubKey>` registers its other outputs (coinbase: vout 0 only) |
+| Holder | hold and you earn, no opt-in. 64 candidate points into the value of every P2PKH / P2SH / witness-program output created before block `h`; the payee is the first candidate still unspent (coin-weighted over current holders), paid at that output's own scriptPubKey on Bitcoin (same key, since a launch is a Bitcoin fork). All spent or none yet: creator |
+| Redirect | optional: a tx with `OP_RETURN "HFY1"<btc scriptPubKey>` sends its outputs' yield to that script instead (coinbase: vout 0 only) |
 | Pay | a Bitcoin tx whose output `i` pays the payee and whose `OP_RETURN "HF"<20-byte tags>` has `SHA256("hashfun-pay"||launch_id||block_hash)[:20]` at position `i` |
 | Bitcoin view | `OP_RETURN "HFH1"<80-byte headers>` relays Bitcoin headers; the node keeps a validating header tree from `btc_anchor_header` (PoW, retarget, median time), so its view of Bitcoin is a function of launch blocks only |
 | Prove | `OP_RETURN "HFP1"<proof>`: merkle proof of the payment in a relayed Bitcoin block with `btc_confs` confirmations. Invalid proofs and headers are ignored, never block-invalidating |
