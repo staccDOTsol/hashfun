@@ -70,8 +70,9 @@ def main(argv=None):
     p.add_argument("--graduation-hashes", type=float, default=1e22, help="total hash to graduate (default 1e22)")
     p.add_argument("--supply", type=int, default=15_000_000, help="virtual token supply (coins), <= 21M")
     p.add_argument("--fee-bps", type=int, default=100)
-    p.add_argument("--spacing", type=int, default=60)
-    p.add_argument("--window", type=int, default=45)
+    p.add_argument("--spacing", type=int, default=5)
+    p.add_argument("--window", type=int, default=90)
+    p.add_argument("--btc-anchor", metavar="HEIGHT:HASH", help="recent Bitcoin block; proves the launch was not mined before it")
     p.add_argument("--pow-limit", default="1e0fffff", help="difficulty floor (compact); LWMA ramps up from here")
     p.add_argument("--tail-years", type=int, default=8)
     p.add_argument("--test", action="store_true", help="test launch: mockable time, nonstandard txs allowed")
@@ -91,7 +92,8 @@ def main(argv=None):
         creator = address_to_script(a.creator_address, hrp)
         d = D.make(a.name, a.ticker, creator, int(a.graduation_hashes), supply_coins=a.supply,
                    creator_fee_bps=a.fee_bps, target_spacing=a.spacing, lwma_window=a.window, test=a.test,
-                   tail_years=a.tail_years, pow_limit_bits=int(a.pow_limit, 16), hrp=hrp)
+                   tail_years=a.tail_years, pow_limit_bits=int(a.pow_limit, 16), hrp=hrp,
+                   btc_anchor=a.btc_anchor.split(":") if a.btc_anchor else None)
         d.seeds = a.seed
         t0 = time.time()
         expected = 2**256 / (bits_to_target(d.pow_limit_bits) + 1)
