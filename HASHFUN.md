@@ -16,8 +16,10 @@ Base: Bitcoin Core master (32.99) + Namecoin's `auxpow` branch (AuxPoW only, no 
 | Tail | after graduation: `tail_reward >> (height / tail_halving_interval)` per block |
 | Creator fee | coinbase must pay `floor(subsidy * creator_fee_bps / 10000)` to `creator_script` (`bad-cb-creator-fee`) |
 | AuxPoW | valid only if the parent block's `W >= W_g` (`auxpow-before-graduation`); chain ID from the launch id, kept in `[1, 0x1FFE]` so a BIP9/version-rolled BTC parent never collides |
-| Difficulty | LWMA-1 every block, window N, solvetimes capped at 6T, monotonic-forced timestamps, overflow-guarded; next target depends only on ancestors |
-| FTL | per-descriptor future time limit (default `N*T/20`) |
+| Difficulty | LWMA-1 every block, window N, solvetimes capped at 6T, monotonic-forced timestamps, overflow-guarded |
+| Stall relief | the target doubles for every full 6T a block's own timestamp sits past its parent's, up to the pow limit, so an abandoned chain decays to CPU-minable in minutes. Safe because issuance is priced by work. nBits is a function of (ancestors, own nTime): no nTime rolling, templates refresh every few seconds |
+| BTC anchor | optional `btc_anchor_height` / `btc_anchor_hash` in the descriptor, hashed into the launch id: no block of the launch can predate that Bitcoin block |
+| FTL | per-descriptor future time limit (default 60 s with the 5 s / N=90 defaults) |
 | Genesis | coinbase `scriptSig = PUSH32(launch_id)`, one zero-value `OP_RETURN` output, `nVersion=1`, must meet `pow_limit_bits` |
 
 Sniping does nothing: a low-difficulty block pays exactly its work at the curve price. Merge-mining pools cannot touch presale issuance because auxpow is invalid until graduation; after it, exahash secures the tail.
@@ -34,6 +36,7 @@ JSON. The launch id is `SHA256d` of a canonical binary serialization of every co
 || u32 genesis_time || u32 pow_limit_bits || u32 target_spacing || u32 lwma_window || u32 ftl
 || 32B virtual_work (big-endian) || i64 virtual_tokens || i64 graduation_tokens
 || i64 tail_reward || u32 tail_halving_interval || bytes creator_script || u16 creator_fee_bps || u8 test
+|| u32 btc_anchor_height || 32B btc_anchor_hash (as displayed)
 ```
 
 (`str`/`bytes` = CompactSize length + data; integers little-endian.) Derived from the id: P2P magic (`SHA256("hashfun-magic"||id)[:4] | 0x80` per byte), auxpow chain ID, default ports, datadir `launch_<ticker>_<id8>`.

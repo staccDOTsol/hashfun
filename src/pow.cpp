@@ -24,9 +24,8 @@
  * the multiplication is guarded against 256-bit overflow (relevant for
  * test launches whose powLimit is near 2^255).
  *
- * Next target depends only on ancestors, never on the candidate block's own
- * timestamp, so a template's nBits (and therefore its work-weighted subsidy)
- * is fixed for the whole template lifetime.
+ * This base target depends only on ancestors. LaunchStallRelief below then
+ * eases it by the candidate block's own timestamp.
  */
 static unsigned int LwmaNextWorkRequired(const CBlockIndex* pindexLast, const Consensus::Params& params)
 {
@@ -61,10 +60,40 @@ static unsigned int LwmaNextWorkRequired(const CBlockIndex* pindexLast, const Co
     return next_target.GetCompact();
 }
 
+/**
+ * Real-time stall relief for launch chains: the target doubles for every full
+ * 6T the candidate block's timestamp sits past its parent's, up to powLimit.
+ *
+ * A launch only attracts hash while minting is profitable, and LWMA alone
+ * adjusts per block, so a chain left at high difficulty would never produce
+ * the block that lowers it. With relief, difficulty decays in wall-clock time
+ * until anyone can extend the chain. This is safe to make aggressive because
+ * issuance is priced by work: an easier block mints proportionally fewer
+ * coins, so stamping a block late (bounded by the FTL) buys nothing.
+ *
+ * nBits is therefore a function of (ancestors, own nTime): a template is only
+ * valid for the 6T bucket it was built in, and miners must not roll nTime.
+ */
+static unsigned int LaunchStallRelief(unsigned int base_bits, const CBlockIndex* pindexLast, const CBlockHeader* pblock, const Consensus::Params& params)
+{
+    if (pblock == nullptr) return base_bits;
+    const int64_t elapsed = pblock->GetBlockTime() - pindexLast->GetBlockTime();
+    const int64_t step = 6 * params.nPowTargetSpacing;
+    if (step < 1 || elapsed < step) return base_bits;
+    const arith_uint256 pow_limit = UintToArith256(params.powLimit);
+    arith_uint256 target;
+    target.SetCompact(base_bits);
+    for (int64_t n = elapsed / step; n > 0; --n) {
+        if (target > (pow_limit >> 1)) return pow_limit.GetCompact();
+        target <<= 1;
+    }
+    return target.GetCompact();
+}
+
 unsigned int GetNextWorkRequired(const CBlockIndex* pindexLast, const CBlockHeader *pblock, const Consensus::Params& params)
 {
     assert(pindexLast != nullptr);
-    if (params.lwma_window > 0) return LwmaNextWorkRequired(pindexLast, params);
+    if (params.lwma_window > 0) return LaunchStallRelief(LwmaNextWorkRequired(pindexLast, params), pindexLast, pblock, params);
     unsigned int nProofOfWorkLimit = UintToArith256(params.powLimit).GetCompact();
 
     // Only change once per difficulty adjustment interval

@@ -22,7 +22,12 @@ SRCS=(src/kernel/launch.cpp src/launchcurve.cpp src/pow.cpp src/chain.cpp src/ke
 export ROOT OBJ CXX
 compile() {
   local o="$OBJ/$(echo "$1" | tr / _).o"
-  [ "$o" -nt "$ROOT/$1" ] && return 0
+  local fresh=1 dep
+  # Rebuild when the source or any header the fork touches is newer than the object.
+  for dep in "$1" src/kernel/launch.h src/launchcurve.h src/consensus/params.h src/kernel/chainparams.h src/pow.h; do
+    [ "$o" -nt "$ROOT/$dep" ] || fresh=0
+  done
+  [ "$fresh" = 1 ] && return 0
   "$CXX" -std=c++20 -O1 -DDISABLE_OPTIMIZED_SHA256 -I"$ROOT/src" -I"$ROOT/src/univalue/include" \
     -c "$ROOT/$1" -o "$o.tmp" && mv "$o.tmp" "$o"
 }

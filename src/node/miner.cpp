@@ -182,6 +182,10 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
 
     // hashfun: difficulty is fixed by the ancestors (LWMA), so the work-weighted
     // subsidy for this template is known before the header is final.
+    // On launch chains nBits also depends on the block's own timestamp (stall
+    // relief), so the time is settled first and then left alone.
+    const bool launch_chain{chainparams.GetConsensus().launch_enabled};
+    if (launch_chain) UpdateTime(pblock, chainparams.GetConsensus(), pindexPrev);
     const uint32_t next_bits{GetNextWorkRequired(pindexPrev, pblock, chainparams.GetConsensus())};
     const CAmount block_subsidy{GetBlockSubsidyForBlock(pindexPrev, next_bits, nHeight, chainparams.GetConsensus())};
     const CAmount creator_fee{LaunchCreatorFee(block_subsidy, chainparams.GetConsensus())};
@@ -241,8 +245,8 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
 
     // Fill in header
     pblock->hashPrevBlock  = pindexPrev->GetBlockHash();
-    UpdateTime(pblock, chainparams.GetConsensus(), pindexPrev);
-    pblock->nBits          = GetNextWorkRequired(pindexPrev, pblock, chainparams.GetConsensus());
+    if (!launch_chain) UpdateTime(pblock, chainparams.GetConsensus(), pindexPrev);
+    pblock->nBits          = launch_chain ? next_bits : GetNextWorkRequired(pindexPrev, pblock, chainparams.GetConsensus());
     pblock->nNonce         = 0;
 
     if (m_options.test_block_validity) {

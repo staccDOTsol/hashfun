@@ -213,6 +213,8 @@ std::vector<unsigned char> LaunchCanonicalBytes(const LaunchDescriptor& d)
     PutBytes(v, d.creator_script.data(), d.creator_script.size());
     PutU16(v, d.creator_fee_bps);
     PutU8(v, d.test ? 1 : 0);
+    PutU32(v, d.btc_anchor_height);
+    v.insert(v.end(), d.btc_anchor_hash.begin(), d.btc_anchor_hash.end());
     return v;
 }
 
@@ -293,6 +295,24 @@ std::optional<LaunchDescriptor> ParseLaunchDescriptor(const std::string& json, s
     }
     if (!GetUInt(o, "p2p_port", d.p2p_port, error, 65535)) return std::nullopt;
     if (!GetUInt(o, "rpc_port", d.rpc_port, error, 65535)) return std::nullopt;
+    if (!GetUInt(o, "btc_anchor_height", d.btc_anchor_height, error, 0xffffffff)) return std::nullopt;
+    {
+        const UniValue& a = o.find_value("btc_anchor_hash");
+        if (!a.isNull()) {
+            const std::string& s = a.isStr() ? a.get_str() : std::string{};
+            if (s.size() != 64 || !IsHex(s)) {
+                error = "btc_anchor_hash: expected 64 hex characters";
+                return std::nullopt;
+            }
+            const auto bytes = ParseHex(s);
+            std::copy(bytes.begin(), bytes.end(), d.btc_anchor_hash.begin());
+        }
+        const bool has_hash = std::any_of(d.btc_anchor_hash.begin(), d.btc_anchor_hash.end(), [](unsigned char c) { return c != 0; });
+        if (d.btc_anchor_height != 0 && !has_hash) {
+            error = "btc_anchor_hash: required with btc_anchor_height";
+            return std::nullopt;
+        }
+    }
     {
         const UniValue& s = o.find_value("seeds");
         if (!s.isNull()) {
@@ -426,6 +446,8 @@ std::string LaunchDescriptorToJSON(const LaunchDescriptor& d)
     o.pushKV("creator_script", HexStr(d.creator_script));
     o.pushKV("creator_fee_bps", static_cast<int64_t>(d.creator_fee_bps));
     o.pushKV("test", d.test);
+    o.pushKV("btc_anchor_height", static_cast<int64_t>(d.btc_anchor_height));
+    o.pushKV("btc_anchor_hash", HexStr(d.btc_anchor_hash));
     o.pushKV("p2p_port", static_cast<int64_t>(LaunchP2PPort(d)));
     o.pushKV("rpc_port", static_cast<int64_t>(LaunchRPCPort(d)));
     UniValue seeds(UniValue::VARR);

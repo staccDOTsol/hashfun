@@ -330,15 +330,42 @@ class E2E:
     def p5(self):
         d1, n1 = self.d1, self.n1
         ok, detail = True, ""
-        for step in [1] * 8 + [40] * 6:
-            self.step(step)
-            self.w1.generatetoaddress(1, self.addr1)
-            tip = n1.rpc.getblockcount()
-            hs = [self.header(h) for h in range(tip + 1)]
-            model = d1.lwma_next_bits([x[0] for x in hs], [x[1] for x in hs])
-            node = int(n1.rpc.getlaunchinfo()["next"]["bits"], 16)
-            if ok and model != node:
-                ok, detail = False, f"after h{tip}: node {node:08x} model {model:08x}"
+
+        def run(steps):
+            nonlocal ok, detail
+            for step in steps:
+                self.step(step)
+                self.w1.generatetoaddress(1, self.addr1)
+                tip = n1.rpc.getblockcount()
+                hs = [self.header(h) for h in range(tip + 1)]
+                model = d1.lwma_next_bits([x[0] for x in hs], [x[1] for x in hs])
+                node = int(n1.rpc.getlaunchinfo()["next"]["bits"], 16)
+                if ok and model != node:
+                    ok, detail = False, f"after h{tip}: node {node:08x} model {model:08x}"
+
+        run([1] * 8)
+        # Stall relief: difficulty is now ~10x the floor. With no block for 3 x 6T the target
+        # must be exactly 8x easier, the un-relieved bits must be refused, and the block connects.
+        tip = n1.rpc.getblockcount()
+        hs = [self.header(h) for h in range(tip + 1)]
+        times, bits = [x[0] for x in hs], [x[1] for x in hs]
+        base = d1.lwma_next_bits(times, bits)
+        self.step(18 * d1.target_spacing)
+        t = n1.rpc.getblocktemplate({"rules": ["segwit"]})
+        want = d1.next_bits(times, bits, t["curtime"])
+        check("5 stall relief: template nBits C++ == Python", int(t["bits"], 16) == want != base,
+              f"node {t['bits']} model {want:08x} base {base:08x}")
+        ratio = bits_to_target(want) / bits_to_target(base)
+        check("5 stall relief: target 8x easier after 18T", abs(ratio - 8) < 0.01, f"{ratio}")
+        r = n1.rpc.submitblock(ser_block(*block_from_gbt(t, self.spk1, bits=base)))
+        check("5 stall relief: un-relieved nBits rejected", r == "bad-diffbits", r)
+        model = d1.subsidy(self.rel_work(tip), want, tip + 1)
+        check("5 stall relief: relieved block mints by its own work",
+              t["coinbasevalue"] + t.get("creatorfee", {}).get("amount", 0) == model,
+              f"{t['coinbasevalue']} + fee vs {model}")
+        r = n1.rpc.submitblock(ser_block(*block_from_gbt(t, self.spk1)))
+        check("5 stall relief: relieved block accepted", r is None, r)
+        run([40] * 6)
         check("5 LWMA next bits C++ == Python", ok, detail)
         bits = [self.header(h)[1] for h in range(1, n1.rpc.getblockcount() + 1)]
         check("5 LWMA actually retargeted", len(set(bits)) > 3, f"{sorted(set(bits))}")

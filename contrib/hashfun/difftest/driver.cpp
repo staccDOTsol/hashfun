@@ -90,7 +90,7 @@ UniValue Chain(const UniValue& req)
     idx.back()->BuildSkip();
 
     UniValue next(UniValue::VARR), relw(UniValue::VARR), supply(UniValue::VARR), grad(UniValue::VARR),
-        grad_h(UniValue::VARR), subsidy(UniValue::VARR), fee(UniValue::VARR), permitted(UniValue::VARR);
+        grad_h(UniValue::VARR), subsidy(UniValue::VARR), fee(UniValue::VARR), permitted(UniValue::VARR), timed(UniValue::VARR);
     const CBlockHeader dummy;
     auto record = [&](const CBlockIndex* tip) {
         next.push_back(strprintf("%08x", GetNextWorkRequired(tip, &dummy, c)));
@@ -107,6 +107,12 @@ UniValue Chain(const UniValue& req)
         b->nHeight = b->pprev->nHeight + 1;
         b->nTime = static_cast<uint32_t>(headers[i][0].getInt<int64_t>());
         b->nBits = static_cast<uint32_t>(headers[i][1].getInt<int64_t>());
+        {
+            // Consensus nBits for a block with this timestamp (LWMA base + stall relief).
+            CBlockHeader hdr;
+            hdr.nTime = b->nTime;
+            timed.push_back(strprintf("%08x", GetNextWorkRequired(b->pprev, &hdr, c)));
+        }
         b->nChainWork = b->pprev->nChainWork + GetBlockProof(*b);
         b->BuildSkip();
         const CAmount s = LaunchSubsidy(b->pprev, b->nBits, b->nHeight, c);
@@ -125,6 +131,7 @@ UniValue Chain(const UniValue& req)
     r.pushKV("subsidy", std::move(subsidy));
     r.pushKV("creator_fee", std::move(fee));
     r.pushKV("permitted", std::move(permitted));
+    r.pushKV("bits_for_time", std::move(timed));
     return r;
 }
 

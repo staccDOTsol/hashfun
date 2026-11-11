@@ -36,14 +36,16 @@ class Launch:
     secret_prefix: int = 168
     genesis_nonce: int = 0
     pow_limit_bits: int = 0x1D00FFFF
-    target_spacing: int = 60
-    lwma_window: int = 45
-    ftl: int = 300
+    target_spacing: int = 5
+    lwma_window: int = 90
+    ftl: int = 60
     tail_reward: int = 0
     tail_halving_interval: int = 0
     creator_script: bytes = b""
     creator_fee_bps: int = 0
     test: bool = False
+    btc_anchor_height: int = 0
+    btc_anchor_hash: str = "00" * 32  # as displayed; hashed into the id, so the chain cannot predate it
     p2p_port: int = 0
     rpc_port: int = 0
     seeds: List[str] = field(default_factory=list)
@@ -62,7 +64,7 @@ class Launch:
                 u32(self.ftl) + self.virtual_work.to_bytes(32, "big") + struct.pack("<q", self.virtual_tokens) +
                 struct.pack("<q", self.graduation_tokens) + struct.pack("<q", self.tail_reward) +
                 u32(self.tail_halving_interval) + vs(self.creator_script) + struct.pack("<H", self.creator_fee_bps) +
-                bytes([1 if self.test else 0]))
+                bytes([1 if self.test else 0]) + u32(self.btc_anchor_height) + bytes.fromhex(self.btc_anchor_hash))
 
     @property
     def id(self) -> bytes:
@@ -200,6 +202,25 @@ class Launch:
         nxt = min(avg * sw, pow_limit) or 1
         return target_to_bits(nxt)
 
+    def next_bits(self, timestamps: List[int], bits: List[int], block_time: Optional[int] = None) -> int:
+        """Consensus nBits for a block stamped block_time on top of the given chain: the LWMA
+        base, doubled in target for every full 6T since the parent (stall relief, mirrors
+        LaunchStallRelief). block_time=None gives the base."""
+        from .ser import target_to_bits
+        base = self.lwma_next_bits(timestamps, bits)
+        if block_time is None:
+            return base
+        n = (block_time - timestamps[-1]) // (6 * self.target_spacing)
+        if n <= 0:
+            return base
+        pow_limit = bits_to_target(self.pow_limit_bits)
+        target = bits_to_target(base)
+        for _ in range(n):
+            if target > pow_limit >> 1:
+                return target_to_bits(pow_limit)
+            target <<= 1
+        return target_to_bits(target)
+
     # ------------------------------------------------------------ json
     def to_json(self) -> dict:
         return {
@@ -211,7 +232,8 @@ class Launch:
             "virtual_tokens": self.virtual_tokens, "graduation_tokens": self.graduation_tokens,
             "tail_reward": self.tail_reward, "tail_halving_interval": self.tail_halving_interval,
             "creator_script": self.creator_script.hex(), "creator_fee_bps": self.creator_fee_bps,
-            "test": self.test, **({"p2p_port": self.p2p_port} if self.p2p_port else {}),
+            "test": self.test, "btc_anchor_height": self.btc_anchor_height, "btc_anchor_hash": self.btc_anchor_hash,
+            **({"p2p_port": self.p2p_port} if self.p2p_port else {}),
             **({"rpc_port": self.rpc_port} if self.rpc_port else {}), "seeds": self.seeds,
         }
 
@@ -281,6 +303,11 @@ def parse(text_or_obj) -> Launch:
     test = o.get("test")
     if test is not None and not isinstance(test, bool):
         raise DescriptorError("test: expected bool")
+    anchor = o.get("btc_anchor_hash")
+    if anchor is None:
+        anchor = "00" * 32
+    elif not isinstance(anchor, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", anchor):
+        raise DescriptorError("btc_anchor_hash: expected 64 hex characters")
     seeds = o.get("seeds")
     if seeds is not None and (not isinstance(seeds, list) or not all(isinstance(x, str) for x in seeds)):
         raise DescriptorError("seeds: expected array of strings")
@@ -302,7 +329,8 @@ def parse(text_or_obj) -> Launch:
         tail_halving_interval=_int(o, "tail_halving_interval", 2**32 - 1),
         creator_script=creator_script,
         creator_fee_bps=_int(o, "creator_fee_bps", 1000),
-        test=bool(test), p2p_port=_int(o, "p2p_port", 65535), rpc_port=_int(o, "rpc_port", 65535),
+        test=bool(test), btc_anchor_height=_int(o, "btc_anchor_height", 2**32 - 1), btc_anchor_hash=anchor.lower(),
+        p2p_port=_int(o, "p2p_port", 65535), rpc_port=_int(o, "rpc_port", 65535),
         seeds=list(seeds or []),
     )
     validate(d)
@@ -310,6 +338,8 @@ def parse(text_or_obj) -> Launch:
 
 
 def validate(d: Launch):
+    if d.btc_anchor_height and not int(d.btc_anchor_hash, 16):
+        raise DescriptorError("btc_anchor_hash: required with btc_anchor_height")
     if d.version != 1:
         raise DescriptorError("unsupported descriptor version")
     try:
@@ -360,8 +390,8 @@ PUMP_RATIO_T = 10730
 
 
 def make(name: str, ticker: str, creator_script: bytes, graduation_hashes: int, *, supply_coins=15_000_000,
-         creator_fee_bps=100, target_spacing=60, lwma_window=45, ftl=None, test=False, tail_years=8,
-         pow_limit_bits=0x1E0FFFFF, genesis_time=None, hrp=None) -> Launch:
+         creator_fee_bps=100, target_spacing=5, lwma_window=90, ftl=None, test=False, tail_years=8,
+         pow_limit_bits=0x1E0FFFFF, genesis_time=None, hrp=None, btc_anchor=None) -> Launch:
     """Build a descriptor with pump.fun-proportioned curve and a tail that emits
     the rest of the supply over `tail_years` with 4 halvings-ish."""
     t0 = supply_coins * COIN
@@ -377,5 +407,7 @@ def make(name: str, ticker: str, creator_script: bytes, graduation_hashes: int, 
                ftl=ftl or max(15, lwma_window * target_spacing // 20), tail_reward=tail,
                tail_halving_interval=interval, creator_script=creator_script, creator_fee_bps=creator_fee_bps,
                test=test)
+    if btc_anchor:
+        d.btc_anchor_height, d.btc_anchor_hash = int(btc_anchor[0]), btc_anchor[1].lower()
     validate(d)
     return d

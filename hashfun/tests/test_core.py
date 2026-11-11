@@ -195,6 +195,37 @@ class Lwma(unittest.TestCase):
         self.assertGreater(bits_to_target(b), 0)
 
 
+    def test_stall_relief_revives_abandoned_chain(self):
+        # A sniper mines 60 one-second blocks (difficulty ratchets ~1.4x per block), then all
+        # hash leaves. LWMA alone would leave the chain stuck at that difficulty forever.
+        d = test_launch(pow_limit_bits=0x1F00FFFF, lwma_window=10, target_spacing=5)
+        T, limit = d.target_spacing, bits_to_target(d.pow_limit_bits)
+        ts, bits = [1_700_000_000], [d.pow_limit_bits]
+        for _ in range(60):
+            ts.append(ts[-1] + 1)
+            bits.append(d.next_bits(ts[:-1], bits, ts[-1]))
+        stuck = bits_to_target(d.lwma_next_bits(ts, bits))
+        self.assertLess(stuck, limit >> 20)
+        # Inside the first 6T nothing changes; after that the target doubles every 6T up to the limit.
+        self.assertEqual(d.next_bits(ts, bits, ts[-1] + 6 * T - 1), d.lwma_next_bits(ts, bits))
+        self.assertEqual(d.next_bits(ts, bits, ts[-1] - 100), d.lwma_next_bits(ts, bits))
+        for n in (1, 2, 7):
+            got = bits_to_target(d.next_bits(ts, bits, ts[-1] + 6 * T * n))
+            self.assertAlmostEqual(got / (stuck << n), 1, places=4)
+        waited = next(n for n in range(1, 400) if bits_to_target(d.next_bits(ts, bits, ts[-1] + 6 * T * n)) == limit)
+        self.assertLess(waited * 6 * T, 20 * 60, "an abandoned chain is back at the pow limit within 20 minutes")
+        # The relieved block feeds LWMA, so the chain stays easy instead of snapping back.
+        hard = bits[-1]
+        ts.append(ts[-1] + 6 * T * waited)
+        bits.append(d.next_bits(ts[:-1], bits, ts[-1]))
+        self.assertGreater(bits_to_target(d.lwma_next_bits(ts, bits)), stuck << 5)
+        # Work-priced issuance: the relieved block mints by its (tiny) work, so waiting is no discount.
+        big = test_launch(pow_limit_bits=0x1F00FFFF, lwma_window=10, target_spacing=5, virtual_work=1 << 60)
+        easy_sub, hard_sub = big.subsidy(0, bits[-1], 61), big.subsidy(0, hard, 61)
+        self.assertLess(easy_sub, hard_sub)
+        self.assertLessEqual(easy_sub / work_from_bits(bits[-1]), hard_sub / work_from_bits(hard) * 1.01)
+
+
 class Descriptor(unittest.TestCase):
     def test_roundtrip_identity_and_genesis(self):
         d = test_launch()

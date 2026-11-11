@@ -133,15 +133,23 @@ class LaunchSource(JobSource):
         self.tmpl = None
         self.prev = None
         self.last_full = 0
+        self.last_push = 0
+        self.refresh_secs = 3
         self.blocks_found = []
 
     async def refresh(self) -> bool:
         best = await asyncio.to_thread(self.rpc.getbestblockhash)
         now = time.time()
-        if best == self.prev and now - self.last_full < 30:
+        # nBits depends on the template's own time (stall relief doubles the target every 6T
+        # without a block), so an unchanged tip still needs a fresh template every few seconds.
+        if best == self.prev and now - self.last_full < self.refresh_secs:
             return False
         tmpl = await asyncio.to_thread(self.rpc.getblocktemplate, {"rules": ["segwit"]})
         self.last_full = now
+        if (self.tmpl and tmpl["previousblockhash"] == self.prev and tmpl["bits"] == self.tmpl["bits"]
+                and now - self.last_push < 30):
+            return False  # same job, nothing to push
+        self.last_push = now
         if tmpl["previousblockhash"] != self.prev:
             self.version_tag += 1
         self.prev = tmpl["previousblockhash"]
@@ -170,7 +178,7 @@ class LaunchSource(JobSource):
         txids, datas = _gbt_txs(t)
         return Job(job_id, self, bytes.fromhex(t["previousblockhash"])[::-1], c1, c2,
                    merkle_branch_for_first([b"\0" * 32] + txids), t["version"], int(t["bits"], 16), t["curtime"],
-                   t["height"], datas, has_commit, clean, {"target": int(t["target"], 16)})
+                   t["height"], datas, has_commit, clean, {"target": int(t["target"], 16), "fixed_ntime": True})
 
     async def on_solution(self, job, header, coinbase, hash_int):
         if hash_int > job.ctx["target"]:
@@ -380,6 +388,8 @@ class Session:
             self.rejects += 1
             return False, [22, "duplicate share", None]
         self.seen.add(key)
+        if job.ctx.get("fixed_ntime") and ntime != job.ntime:
+            return False, [20, "ntime rolling is not allowed on launch chains", None]
         if not (job.ntime - 600 <= ntime <= job.ntime + 7200):
             return False, [20, "ntime out of range", None]
         header, cb = job.assemble(self.en1, en2, ntime, nonce)

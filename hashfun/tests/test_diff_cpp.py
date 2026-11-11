@@ -62,6 +62,9 @@ def launch(rng, easy=True, **kw):
         ftl=rng.choice([1, 300, 7200]), tail_reward=tail, tail_halving_interval=ihl if tail else rng.choice([0, ihl]),
         creator_script=script, creator_fee_bps=rng.choice([0, 1, 100, 1000]) if script else 0,
         test=rng.random() < 0.5,
+        **rng.choice([{}, {}, {"btc_anchor_height": rng.randrange(1, 2**32),
+                               "btc_anchor_hash": "%064x" % rng.randrange(1, 2**256)},
+                      {"btc_anchor_hash": "%064X" % rng.randrange(1, 2**224)}]),
         p2p_port=rng.choice([0, 0, 18444]), rpc_port=rng.choice([0, 0, 18445]),
     )
     base.update(kw)
@@ -175,7 +178,12 @@ class DiffCpp(unittest.TestCase):
             {"genesis_time": "1700000000"}, {"genesis_time": 1.5}, {"genesis_time": True},
             {"test": "yes"}, {"test": 1}, {"test": False},
             {"p2p_port": 65536}, {"p2p_port": -1}, {"p2p_port": 1}, {"seeds": "x"}, {"seeds": ["a:1", "b"]},
-            {"foo": 1}, {"secret_prefix": 300}, {"name": 5}, {"hrp": 5}, {"creator_script": 0},
+            {"foo": 1}, {"secret_prefix": 300},
+            {"btc_anchor_height": 5}, {"btc_anchor_height": 5, "btc_anchor_hash": "00" * 32},
+            {"btc_anchor_height": 5, "btc_anchor_hash": "ab" * 32}, {"btc_anchor_hash": "AB" * 32},
+            {"btc_anchor_hash": "ab" * 31}, {"btc_anchor_hash": "ab" * 33}, {"btc_anchor_hash": "zz" * 32},
+            {"btc_anchor_hash": " " + "ab" * 31 + "a"}, {"btc_anchor_hash": 5}, {"btc_anchor_hash": None},
+            {"btc_anchor_hash": "0x" + "ab" * 31}, {"btc_anchor_height": 2**32}, {"btc_anchor_height": "7"}, {"name": 5}, {"hrp": 5}, {"creator_script": 0},
             {"virtual_work": "0x"}, {"virtual_work": "0x" + "0" * 64}, {"virtual_work": "0x" + "0" * 63 + "5"},
             {"virtual_work": "0x" + "0" * 65}, {"virtual_work": ""}, {"virtual_work": "+5"}, {"virtual_work": "5.0"},
             {"genesis_time": "0x"}, {"genesis_time": "0x10"}, {"genesis_time": "0X10"}, {"genesis_time": "+5"},
@@ -223,9 +231,9 @@ class DiffCpp(unittest.TestCase):
             times, bits = [d.genesis_time], [d.pow_limit_bits]
             # Mostly honest (bits = model's next), with jitter: zero/negative/huge solvetimes and off-model bits.
             for _ in range(rng.choice([60, 150, 300])):
-                st = rng.choice([T, T, T // 2 or 1, 0, -T, 7 * T, 1, 3 * T])
+                st = rng.choice([T, T, T // 2 or 1, 0, -T, 6 * T - 1, 6 * T, 7 * T, 1, 3 * T, 40 * T, 2000 * T])
                 times.append(max(0, times[-1] + st))
-                b = d.lwma_next_bits(times[:-1], bits)
+                b = d.next_bits(times[:-1], bits, times[-1])
                 if rng.random() < 0.15:
                     b = target_to_bits(rng.randrange(1, pow_limit + 1))
                 bits.append(b)
@@ -240,6 +248,9 @@ class DiffCpp(unittest.TestCase):
                     if r["subsidy"][h - 1] != sub or r["creator_fee"][h - 1] != d.creator_fee(sub):
                         mism.append(("subsidy", h, r["subsidy"][h - 1], sub))
                     acc += works[h - 1]
+                    want = d.next_bits(times[:h], bits[:h], times[h])
+                    if int(r["bits_for_time"][h - 1], 16) != want:
+                        mism.append(("bits_for_time", h, r["bits_for_time"][h - 1], f"{want:08x}"))
                 nb = d.lwma_next_bits(times[:h + 1], bits[:h + 1])
                 if int(r["next_bits"][h], 16) != nb:
                     mism.append(("next_bits", h, r["next_bits"][h], f"{nb:08x}"))

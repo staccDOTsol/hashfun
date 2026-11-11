@@ -121,10 +121,10 @@ class SimChain:
         h = self.height if height is None else height
         return sum(self.works[1:h + 1])
 
-    def next_bits(self) -> int:
+    def next_bits(self, block_time: Optional[int] = None) -> int:
         if not self.launch:
             return 0x207FFFFF
-        return self.launch.lwma_next_bits([b.time for b in self.blocks], [b.bits for b in self.blocks])
+        return self.launch.next_bits([b.time for b in self.blocks], [b.bits for b in self.blocks], block_time)
 
     def subsidy(self, height: int, bits: int) -> int:
         if not self.launch:
@@ -183,7 +183,7 @@ class SimChain:
             if prev != self.blocks[-1].hash:
                 return "inconclusive" if prev in self.index else "prev-blk-not-found"
             height = self.height + 1
-            if blk.bits != self.next_bits():
+            if blk.bits != self.next_bits(blk.time):
                 return "bad-diffbits"
             target = bits_to_target(blk.bits)
             if blk.auxpow:
@@ -259,7 +259,7 @@ class SimChain:
     def template(self, payout_spk: bytes = None):
         with self.lock:
             height = self.height + 1
-            bits = self.next_bits()
+            bits = self.next_bits(max(self.clock, self.mtp() + 1))
             sub = self.subsidy(height, bits)
             fee = self.launch.creator_fee(sub) if self.launch else 0
             txs = list(self.mempool.values())

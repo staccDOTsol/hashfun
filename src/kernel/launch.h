@@ -33,9 +33,9 @@ struct LaunchDescriptor {
     uint32_t genesis_time{0};
     uint32_t genesis_nonce{0};
     uint32_t pow_limit_bits{0x1d00ffff};
-    uint32_t target_spacing{60};
-    uint32_t lwma_window{45};
-    uint32_t ftl{300};
+    uint32_t target_spacing{5};
+    uint32_t lwma_window{90};
+    uint32_t ftl{60};
     std::array<unsigned char, 32> virtual_work_be{}; //!< V0, big-endian
     int64_t virtual_tokens{0};                        //!< T0, satoshis
     int64_t graduation_tokens{0};                     //!< G, satoshis
@@ -44,6 +44,11 @@ struct LaunchDescriptor {
     std::vector<unsigned char> creator_script;
     uint16_t creator_fee_bps{0};
     bool test{false};
+    //! Optional anchor: a Bitcoin block that existed when the descriptor was
+    //! made (height + hash as displayed). It is hashed into the launch id, so
+    //! no block of this chain can predate that Bitcoin block. All-zero = none.
+    uint32_t btc_anchor_height{0};
+    std::array<unsigned char, 32> btc_anchor_hash{};
 
     // Not part of the launch id.
     uint16_t p2p_port{0};
