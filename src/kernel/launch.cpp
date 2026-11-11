@@ -729,13 +729,20 @@ uint16_t LaunchP2PPort(const LaunchDescriptor& d)
     if (d.p2p_port) return d.p2p_port;
     const auto h = TaggedDerive("hashfun-port", d.id);
     const uint32_t v = h[0] | (static_cast<uint32_t>(h[1]) << 8);
-    return static_cast<uint16_t>(20000 + (v % 10000) * 2);
+    // Three ports in a row per launch, as Bitcoin has them (8332, 8333, 8334): RPC, P2P, and the
+    // one above P2P, where the node listens for incoming Tor connections. All under the range
+    // systems hand out to outgoing connections (Linux from 32768, macOS from 49152): a port in
+    // that range can be held by a connection made a moment ago, and the node cannot listen on
+    // it then. 20002..31998 in steps of 4.
+    return static_cast<uint16_t>(20002 + (v % 3000) * 4);
 }
 
 uint16_t LaunchRPCPort(const LaunchDescriptor& d)
 {
     if (d.rpc_port) return d.rpc_port;
-    return LaunchP2PPort(d) + 1;
+    // One under the P2P port. One above is where the node binds its Tor listener (127.0.0.1): a
+    // node serving RPC there could not start with default settings.
+    return LaunchP2PPort(d) - 1;
 }
 
 std::string LaunchDataDirName(const LaunchDescriptor& d)

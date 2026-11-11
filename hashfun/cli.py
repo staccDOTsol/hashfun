@@ -29,6 +29,7 @@ import json
 import logging
 import os
 import platform
+import random
 import shutil
 import signal
 import socket
@@ -112,12 +113,28 @@ def hashfund_binary() -> str:
     return hashfund_choice()[0]
 
 
+_HANDED_OUT = set()
+
+
 def free_port() -> int:
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    p = s.getsockname()[1]
-    s.close()
-    return p
+    """A port to listen on later: free now, and under the range systems hand out to outgoing
+    connections (Linux from 32768, macOS from 49152). A port the system picks itself (bind to 0)
+    comes from that range, and can be taken as some connection's source port before the node that
+    was promised it gets to listen."""
+    for _ in range(400):
+        p = random.randrange(20000, 32768)
+        if p in _HANDED_OUT:
+            continue
+        s = socket.socket()
+        try:
+            s.bind(("127.0.0.1", p))
+        except OSError:
+            continue
+        finally:
+            s.close()
+        _HANDED_OUT.add(p)
+        return p
+    raise RuntimeError("no free port between 20000 and 32767")
 
 
 def check_btc_anchor(d: D.Launch, btc, what: str):
@@ -170,8 +187,16 @@ class Registry:
         old = self.data.get(d.ticker)
         if old and old["id"] != d.id_hex:
             sys.exit(f"{d.ticker} is already registered with a different launch id ({old['id'][:16]}...)")
+        # The RPC port: the one already registered; else the launch's own (one under its P2P port),
+        # unless another registered launch has it; else any free one that is not this launch's P2P port.
+        rpcport = (old or {}).get("rpcport")
+        taken = {e.get("rpcport") for t, e in self.data.items() if t != d.ticker} | {p2p_port or d.p2p}
+        if not rpcport:
+            rpcport = d.rpc
+            while rpcport in taken:
+                rpcport = free_port()
         self.data[d.ticker] = {"id": d.id_hex, "descriptor": dst, "datadir": os.path.join(base, "node"),
-                               "rpcport": (old or {}).get("rpcport") or free_port(),
+                               "rpcport": rpcport,
                                "peers": sorted(set((old or {}).get("peers", [])) | set(peers)),
                                "p2pport": p2p_port or (old or {}).get("p2pport")}
         self.save()

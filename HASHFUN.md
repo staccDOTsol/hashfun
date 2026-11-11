@@ -100,6 +100,8 @@ JSON. The launch id is `SHA256d` of a canonical binary serialization of every co
 
 (`str`/`bytes` = CompactSize length + data; integers little-endian.) Derived from the id: P2P magic (`SHA256("hashfun-magic"||id)[:4] | 0x80` per byte), auxpow chain ID, default ports, datadir `launch_<ticker>_<id8>`.
 
+Ports: three in a row per launch, as Bitcoin has them (8332, 8333, 8334). P2P is `20002 + (id-derived mod 3000) * 4`, RPC is one under it, and one above it is where the node itself listens for incoming Tor connections (a node told to serve RPC there cannot start). All of them sit under the range systems hand out to outgoing connections (Linux from 32768, macOS from 49152): a port in that range can be held by a connection made a moment ago, and a node cannot listen on it then. The CLI registers a launch on its own RPC port unless another registered launch has it, and the tools pick any other listening port from 20000..32767. Not consensus: `p2p_port` and `rpc_port` in the launch file override them.
+
 `test: true` launches allow `setmocktime` and nonstandard txs.
 
 `version` is 2. It is hashed into the id and names the rule set, so a file made for one rule set is never read under another. Version 1 was the pre-release set (the first sats leg, and a parser that took anchors, payout scripts and time limits it should have refused): both parsers refuse it and say to create the launch again.

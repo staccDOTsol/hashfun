@@ -132,12 +132,19 @@ class Launch:
     def p2p(self) -> int:
         if self.p2p_port:
             return self.p2p_port
+        # Three ports in a row per launch, as Bitcoin has them (8332, 8333, 8334): RPC, P2P, and
+        # the one above P2P, where the node itself listens for incoming Tor connections. All under
+        # the range systems hand out to outgoing connections (Linux from 32768, macOS from 49152):
+        # a port in that range can be held by a connection made a moment ago, and a node cannot
+        # listen on it then. 20002..31998 in steps of 4.
         h = self._derive(b"hashfun-port")
-        return 20000 + ((h[0] | (h[1] << 8)) % 10000) * 2
+        return 20002 + ((h[0] | (h[1] << 8)) % 3000) * 4
 
     @property
     def rpc(self) -> int:
-        return self.rpc_port or self.p2p + 1
+        # one under the P2P port; one above is the node's own Tor listener, and a node told to
+        # serve RPC there cannot start
+        return self.rpc_port or self.p2p - 1
 
     @property
     def datadir_name(self) -> str:

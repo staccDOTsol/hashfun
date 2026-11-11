@@ -29,6 +29,7 @@ import asyncio
 import glob
 import json
 import os
+import random
 import shutil
 import socket
 import struct
@@ -64,12 +65,28 @@ def check(name, cond, detail=""):
     return cond
 
 
-def free_port():
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    p = s.getsockname()[1]
-    s.close()
-    return p
+_HANDED_OUT = set()
+
+
+def free_port() -> int:
+    """A port to listen on later: free now, and under the range systems hand out to outgoing
+    connections (Linux from 32768, macOS from 49152). A port the system picks itself (bind to 0)
+    comes from that range, and can be taken as some connection's source port before the node that
+    was promised it gets to listen."""
+    for _ in range(400):
+        p = random.randrange(20000, 32768)
+        if p in _HANDED_OUT:
+            continue
+        s = socket.socket()
+        try:
+            s.bind(("127.0.0.1", p))
+        except OSError:
+            continue
+        finally:
+            s.close()
+        _HANDED_OUT.add(p)
+        return p
+    raise RuntimeError("no free port between 20000 and 32767")
 
 
 def coins_to_sats(v) -> int:

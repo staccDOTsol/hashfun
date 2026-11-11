@@ -240,7 +240,7 @@ class Descriptor(unittest.TestCase):
         self.assertEqual(d2.genesis_hash, d.genesis_hash)
         self.assertTrue(1 <= d.chain_id <= 0x1FFF and d.chain_id not in (1, 98, 4096))
         self.assertTrue(all(b & 0x80 for b in d.magic))
-        self.assertTrue(20000 <= d.p2p < 40000)
+        self.assertTrue(20002 <= d.p2p <= 31998 and d.p2p % 4 == 2 and d.rpc == d.p2p - 1)  # and p2p + 1 is the node's Tor listener
 
     def test_nonce_ports_seeds_not_in_id(self):
         d = test_launch()
@@ -882,6 +882,97 @@ class WalletVaultTest(unittest.TestCase):
                 Wallet(path, "correct horse battery")
 
 
+
+
+class RpcConnections(unittest.TestCase):
+    """The RPC client keeps one connection per thread for calls that only read, and never sends
+    anything else twice. A new connection per call ran a Mac out of ports in the first CI run."""
+
+    def setUp(self):
+        import http.server
+        import json
+        import threading
+        seen = self.seen = {"conns": set(), "calls": [], "drop_after": None, "served": 0}
+
+        class H(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                seen["conns"].add(self.client_address)
+                seen["calls"].append(req["method"])
+                seen["served"] += 1
+                if req["method"] == "getnothing":  # close without a word, as a node that died would
+                    self.close_connection = True
+                    self.connection.shutdown(2)
+                    return
+                body = json.dumps({"result": req["method"], "error": None, "id": req["id"]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                if seen["drop_after"] is not None and seen["served"] >= seen["drop_after"]:
+                    seen["drop_after"] = None
+                    self.close_connection = True  # an idle connection the node gave up on: closed, and nobody told the client
+
+        self.srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.srv.daemon_threads = True
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        from hashfun.rpc import RPC
+        self.rpc = RPC(f"http://u:p@127.0.0.1:{self.srv.server_address[1]}", timeout=5)
+
+    def tearDown(self):
+        self.rpc.close()
+        self.srv.shutdown()
+        self.srv.server_close()
+
+    def test_reads_share_one_connection(self):
+        for _ in range(50):
+            self.assertEqual(self.rpc.getblockcount(), "getblockcount")
+        self.assertEqual(self.rpc.wallet("w").listunspent(), "listunspent")
+        self.assertEqual(len(self.seen["conns"]), 1, "50 reads and a wallet view's read: one connection")
+
+    def test_anything_else_gets_its_own_connection(self):
+        self.rpc.getblockcount()
+        self.rpc.sendtoaddress("a", 1)
+        self.rpc.submitblock("00")
+        self.rpc.getblockcount()
+        self.assertEqual(len(self.seen["conns"]), 3, "the kept one, and one for each call that changes something")
+
+    def test_a_read_is_sent_again_when_the_kept_connection_went_stale(self):
+        self.seen["drop_after"] = 1
+        self.rpc.getblockcount()            # served, then the server closes the connection behind it
+        self.assertEqual(self.rpc.getbestblockhash(), "getbestblockhash")  # stale: sent again on a new one
+        self.assertEqual(len(self.seen["conns"]), 2)
+        self.assertEqual(self.seen["calls"].count("getbestblockhash"), 1, "the first attempt never reached the server")
+
+    def test_nothing_that_changes_things_is_ever_sent_twice(self):
+        import http.client
+        self.seen["drop_after"] = 1
+        self.rpc.getblockcount()
+        self.rpc.sendtoaddress("a", 1)      # its own connection: the stale kept one is not in its way
+        self.assertEqual(self.seen["calls"].count("sendtoaddress"), 1)
+        with self.assertRaises((http.client.HTTPException, OSError)):
+            self.rpc.wallet("w").getnothing()   # a new connection, and the server hangs up: no second try
+        self.assertEqual(self.seen["calls"].count("getnothing"), 1)
+
+    def test_each_thread_has_its_own(self):
+        import threading
+        self.rpc.getblockcount()
+        t = threading.Thread(target=self.rpc.getblockcount)
+        t.start()
+        t.join()
+        self.assertEqual(len(self.seen["conns"]), 2)
+
+    def test_after_an_error_the_next_call_starts_clean(self):
+        import http.client
+        with self.assertRaises((http.client.HTTPException, OSError)):
+            self.rpc.getnothing()
+        self.assertEqual(self.rpc.getblockcount(), "getblockcount")
 
 if __name__ == "__main__":
     unittest.main()
