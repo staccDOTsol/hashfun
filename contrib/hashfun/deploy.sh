@@ -14,10 +14,19 @@
 #                            ci/logs/ (larger; for when the last lines are not enough)
 #   bash deploy.sh rerun     run the failed jobs of that build again (for a failure that was
 #                            GitHub's, not the code's)
+#   bash deploy.sh kick      for when GitHub has the push and builds nothing: writes what GitHub
+#                            says about the workflow to ci/kick.txt, switches Actions on if it
+#                            is off, and starts the build (it asks for a run; if GitHub does not
+#                            know the workflow, it pushes the release tag again, same commit)
 #
 # Before it changes anything on GitHub it prints what it is about to do (create or reuse the
 # repository, push, store the token, tag: the tag is what makes GitHub publish to npm) and asks
 # once. YES=1 answers that question in advance.
+#
+# A push is supposed to start the build. GitHub has been seen to start nothing for the first
+# pushes to a new repository, so after pushing the script looks for the build of this commit,
+# asks GitHub to run the workflow when none is listed, and says "building" only about a build it
+# has seen. When there is none it says so and ends with a failure.
 #
 # Safe to run again at any point: every step first looks at what is already there. After a new
 # set of patches arrives, the same command rebuilds the source, replaces the branch on GitHub
@@ -55,7 +64,12 @@ esac
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 CMD="${1:-deploy}"
 BRANCH=hashfun
+WORKFLOW=hashfun.yml
 NPM_REGISTRY=https://registry.npmjs.org
+# After a push, GitHub is given LIST_POLLS looks, CANCEL_POLL seconds apart (about 90 s), to list
+# the build before the script asks for one itself. WAITED counts the looks spent so far.
+LIST_POLLS=18
+WAITED=0
 
 say() { printf '%s\n' "$*"; }
 step() { printf '\n== %s\n' "$*"; }
@@ -114,6 +128,20 @@ slug_of_url() {
   printf '%s\n' "$1" |
     sed -n -E 's#^(https://([^/@]*@)?github\.com/|git@github\.com:|ssh://git@github\.com/)([^/]+)/([^/]+)$#\3/\4#p' |
     sed -e 's/\.git$//'
+}
+
+# owner/name of the GitHub repository that remote $1 of the source points at; nothing when it is
+# not a GitHub URL or there is no such remote. Asked both ways: as git resolves it (a machine's
+# url.insteadOf rules applied) and as it is written in the configuration.
+remote_slug() {
+  local u slug
+  for u in "$(git -C "$SRC" remote get-url "$1" 2> /dev/null || true)" "$(git -C "$SRC" config --get "remote.$1.url" 2> /dev/null || true)"; do
+    slug="$(slug_of_url "$u")"
+    if [ -n "$slug" ]; then
+      printf '%s' "$slug"
+      return 0
+    fi
+  done
 }
 
 # a "key": "value" line of a small JSON file on stdin (package.json keeps one such line per key)
@@ -205,16 +233,15 @@ look_repo() {
 # Which remote of the source repository is this GitHub repository. `origin` when it is free or
 # already this repository; never repoint a remote that names something else. (Local only.)
 pick_remote() {
-  local url="https://github.com/$REPO.git" cur
+  local url="https://github.com/$REPO.git" want
+  want="$(lower "$REPO")"
   REMOTE=origin
-  cur="$(git -C "$SRC" remote get-url origin 2> /dev/null || true)"
-  if [ -n "$cur" ] && [ "$(lower "$(slug_of_url "$cur")")" != "$(lower "$REPO")" ]; then
+  if git -C "$SRC" config --get remote.origin.url > /dev/null 2>&1 && [ "$(lower "$(remote_slug origin)")" != "$want" ]; then
     REMOTE=deploy
-    cur="$(git -C "$SRC" remote get-url deploy 2> /dev/null || true)"
   fi
-  if [ -z "$cur" ]; then
+  if ! git -C "$SRC" config --get "remote.$REMOTE.url" > /dev/null 2>&1; then
     git -C "$SRC" remote add "$REMOTE" "$url"
-  elif [ "$(lower "$(slug_of_url "$cur")")" != "$(lower "$REPO")" ]; then
+  elif [ "$(lower "$(remote_slug "$REMOTE")")" != "$want" ]; then
     git -C "$SRC" remote set-url "$REMOTE" "$url"
   fi
 }
@@ -480,16 +507,19 @@ do_push() {
     first)
       say "   pushing $BRANCH (the whole history the first time: a few minutes) ..."
       ggit push "$REMOTE" "refs/heads/$BRANCH:refs/heads/$BRANCH" || push_failed
+      PUSHED_BRANCH=1
       ;;
     forward)
       say "   pushing $BRANCH: $(short "$REMOTE_HEAD") -> $(short "$HEAD_SHA") ..."
       ggit push "$REMOTE" "refs/heads/$BRANCH:refs/heads/$BRANCH" || push_failed
+      PUSHED_BRANCH=1
       ;;
     replace)
       git -C "$SRC" branch -f "replaced-$(short "$REMOTE_HEAD")" "$REMOTE_HEAD" > /dev/null
       say "   replacing $BRANCH on GitHub: $(short "$REMOTE_HEAD") -> $(short "$HEAD_SHA") (the old one stays in $SRC as branch replaced-$(short "$REMOTE_HEAD"))"
       # only if GitHub still has what was there when the plan was made
       ggit push "--force-with-lease=refs/heads/$BRANCH:$REMOTE_HEAD" "$REMOTE" "refs/heads/$BRANCH:refs/heads/$BRANCH" || push_failed
+      PUSHED_BRANCH=1
       ;;
   esac
   git -C "$SRC" config hashfun.pushed "$HEAD_SHA"
@@ -546,22 +576,51 @@ stop_tag_builds() {
   return 0
 }
 
+# ---- is GitHub building it ------------------------------------------------------------------------
+# The newest builds GitHub lists, one per line: id, status, conclusion, event, branch or tag name,
+# commit, url. LIST_OK=0 (and an empty list) when GitHub could not be asked: "none listed" and
+# "could not ask" are different answers, and only the first is a reason to ask for a build.
+list_builds() {
+  LIST_OK=1
+  if ! gh run list --repo "$REPO" --limit 40 --json databaseId,status,conclusion,event,headBranch,headSha,url \
+    --jq '.[] | [(.databaseId | tostring), .status, (if (.conclusion // "") == "" then "-" else .conclusion end), .event, (.headBranch // "-"), .headSha, (.url // "-")] | @tsv' \
+    > "$TMP/builds.tsv" 2> "$TMP/builds.err" < /dev/null; then
+    LIST_OK=0
+    : > "$TMP/builds.tsv"
+  fi
+}
+# Out of the last list: the newest build of this commit on the branch or tag $1 (nothing: there is none).
+build_on() { awk -F'\t' -v r="$1" -v s="$HEAD_SHA" '$5 == r && $6 == s { print; exit }' "$TMP/builds.tsv"; }
+# The same, counting only a build that is queued, running or has succeeded: not one that failed or was stopped.
+good_build_on() {
+  awk -F'\t' -v r="$1" -v s="$HEAD_SHA" '$5 == r && $6 == s && ($2 != "completed" || $3 == "success") { print; exit }' "$TMP/builds.tsv"
+}
+# The page of a build, from its line of the list.
+build_url() {
+  local url
+  url="$(printf '%s' "$1" | cut -f7)"
+  case "$url" in
+    http*) printf '%s' "$url" ;;
+    *) printf 'https://github.com/%s/actions/runs/%s' "$REPO" "$(printf '%s' "$1" | cut -f1)" ;;
+  esac
+}
+
 # One build per commit. The workflow runs for a push to the branch and for a tag, so a branch and
 # a tag on the same commit start two full builds; the tag's also releases, so the branch's is
-# stopped, once GitHub shows the tag's.
+# stopped, once GitHub shows the tag's. $1: up to which count of WAITED this may wait for the two
+# to be listed (its own count: nothing more is waited for).
 drop_branch_build() {
-  local list="$TMP/dup.tsv" ids="" id tagrun=0 n=0
+  local max="$1" ids="" id tagrun=""
   while :; do
-    gh run list --repo "$REPO" --limit 30 --json databaseId,status,event,headBranch,headSha \
-      --jq '.[] | [(.databaseId | tostring), .status, .event, (.headBranch // "-"), .headSha] | @tsv' > "$list" 2> /dev/null < /dev/null || : > "$list"
-    tagrun="$(awk -F'\t' -v t="$TAGNAME" -v s="$HEAD_SHA" '$4 == t && $5 == s { n++ } END { print n + 0 }' "$list")"
-    ids="$(awk -F'\t' -v b="$BRANCH" -v s="$HEAD_SHA" '$3 == "push" && $4 == b && $5 == s && $2 != "completed" { print $1 }' "$list")"
-    if [ "$tagrun" != 0 ] && [ -n "$ids" ]; then break; fi
+    list_builds
+    tagrun="$(build_on "$TAGNAME")"
+    ids="$(awk -F'\t' -v b="$BRANCH" -v s="$HEAD_SHA" '$4 == "push" && $5 == b && $6 == s && $2 != "completed" { print $1 }' "$TMP/builds.tsv")"
+    if [ -n "$tagrun" ] && [ -n "$ids" ]; then break; fi
     # nothing was pushed to the branch just now and no build of it is running: nothing to wait for
     if [ "$BR" = same ] && [ -z "$ids" ]; then return 0; fi
-    n=$((n + 1))
-    if [ "$n" -ge 8 ]; then return 0; fi
-    [ "$n" != 1 ] || say "   (waiting up to 40 s for GitHub to list the builds of this commit, to stop the duplicate one)"
+    if [ "$WAITED" -ge "$max" ]; then return 0; fi
+    [ "$WAITED" != 0 ] || say "   (waiting for GitHub to list the builds of this commit: up to a minute and a half)"
+    WAITED=$((WAITED + 1))
     sleep "${CANCEL_POLL:-5}"
   done
   for id in $ids; do
@@ -569,6 +628,59 @@ drop_branch_build() {
       say "   stopped build $id of the branch push: the build of $TAGNAME covers the same commit (one build per commit)"
     fi
   done
+}
+
+# Is GitHub building this commit on $1 (the release tag, or the branch)? $2: 1 when this run
+# pushed that ref, so that a build may still be on its way and is worth waiting for.
+# A push is supposed to start the workflow. On a new repository GitHub has been seen to start
+# nothing, for the branch and for the tag, with Actions switched on: no workflow and no build
+# listed an hour later; asked to run the workflow, it started at once. So: look, wait for what a
+# push may still bring, and when nothing is listed ask for the build. A build of this commit
+# that is already listed, in whatever state, is never doubled.
+# Returns 0 with BUILD_LINE (its line of the list) and BUILD_HOW (found, or asked: it had to be
+# asked for); 1 with DISPATCH_ERR when there is no build, or (BUILD_UNKNOWN=1) when GitHub could
+# not be asked which builds there are: then nothing is asked for either.
+ensure_build() {
+  local ref="$1" pushed="$2" n=0
+  BUILD_LINE=""
+  BUILD_HOW=""
+  BUILD_UNKNOWN=0
+  DISPATCH_ERR=""
+  while :; do
+    list_builds
+    BUILD_LINE="$(build_on "$ref")"
+    if [ -n "$BUILD_LINE" ]; then
+      BUILD_HOW=found
+      return 0
+    fi
+    [ "$pushed" = 1 ] || break
+    [ "$WAITED" -lt "$LIST_POLLS" ] || break
+    [ "$WAITED" != 0 ] || say "   (waiting for GitHub to list the build of this commit: up to a minute and a half)"
+    WAITED=$((WAITED + 1))
+    sleep "${CANCEL_POLL:-5}"
+  done
+  if [ "$LIST_OK" != 1 ]; then
+    BUILD_UNKNOWN=1
+    DISPATCH_ERR="GitHub could not be asked which builds there are ($(first_line "$TMP/builds.err"))"
+    return 1
+  fi
+  say "   GitHub lists no build of this commit on $ref (it has been seen to ignore the first pushes to a new repository): asking it to run the workflow ..."
+  if ! gh workflow run "$WORKFLOW" --repo "$REPO" --ref "$ref" > "$TMP/dispatch.out" 2> "$TMP/dispatch.err" < /dev/null; then
+    DISPATCH_ERR="GitHub refused to run the workflow on $ref: $(first_line "$TMP/dispatch.err")"
+    return 1
+  fi
+  while [ "$n" -lt 12 ]; do
+    list_builds
+    BUILD_LINE="$(build_on "$ref")"
+    if [ -n "$BUILD_LINE" ]; then
+      BUILD_HOW=asked
+      return 0
+    fi
+    n=$((n + 1))
+    sleep "${CANCEL_POLL:-5}"
+  done
+  DISPATCH_ERR="GitHub took the request to run the workflow on $ref and listed no build within a minute"
+  return 1
 }
 
 do_tag() {
@@ -592,12 +704,14 @@ do_tag() {
     say "   tagging $(short "$HEAD_SHA") as $TAGNAME ..."
     ggit push "$REMOTE" "refs/tags/$TAGNAME:refs/tags/$TAGNAME" || push_failed
     TAG_STATE="$TAGNAME on $(short "$HEAD_SHA")"
+    PUSHED_TAG=1
   else
     say "   moving $TAGNAME: $(short "$TAG_CUR") -> $(short "$HEAD_SHA") ($PKG@$VERSION is not on npm, so nothing published changes)"
     ggit push "--force-with-lease=refs/tags/$TAGNAME:$TAG_RAW" "$REMOTE" "refs/tags/$TAGNAME:refs/tags/$TAGNAME" || push_failed
     TAG_STATE="$TAGNAME moved to $(short "$HEAD_SHA")"
+    PUSHED_TAG=1
   fi
-  drop_branch_build
+  drop_branch_build 8
 }
 
 # ---- which repository, for status and wait --------------------------------------------------------
@@ -608,13 +722,32 @@ known_repo() {
     return 0
   fi
   if [ -d "$SRC/.git" ] || [ -f "$SRC/.git" ]; then
-    r="$(slug_of_url "$(git -C "$SRC" remote get-url "$(git -C "$SRC" config --get "branch.$BRANCH.remote" || echo origin)" 2> /dev/null || true)")"
+    r="$(remote_slug "$(git -C "$SRC" config --get "branch.$BRANCH.remote" || echo origin)")"
   fi
   [ -n "$r" ] || [ ! -f "$OUT/deploy.txt" ] || r="$(sed -n 's/^repo: //p' "$OUT/deploy.txt" | sed -n '1p')"
   printf '%s' "$r"
 }
 
 # ---- status ---------------------------------------------------------------------------------------
+# The run that matters, out of the list in file $1 (newest first; column 5 the branch or tag,
+# column 6 the commit): the newest of the commit the source here is at (when the source is here
+# and GitHub lists one), else the newest of all; and of that commit's, a release tag's first.
+pick_run() {
+  awk -F'\t' -v want="${LOCAL_HEAD:-}" '
+    { row[NR] = $0; sh[NR] = $6; rf[NR] = $5 }
+    END {
+      if (NR == 0) exit
+      sha = sh[1]
+      if (want != "") for (i = 1; i <= NR; i++) if (sh[i] == want) { sha = want; break }
+      pick = ""
+      for (i = 1; i <= NR; i++) if (sh[i] == sha) {
+        if (pick == "") pick = row[i]
+        if (rf[i] ~ /^v[0-9]/) { pick = row[i]; break }
+      }
+      print pick
+    }' "$1"
+}
+
 # Sets RUN_ID (empty: no run yet), RUN_STATUS, RUN_CONCLUSION, SUMMARY1..3; writes status.txt, and
 # failed.log unless called with "light" (the waiting loop looks every minute and fetches the logs
 # once, at the end).
@@ -632,19 +765,20 @@ status_once() {
     RUN_ID=""
     RUN_STATUS=none
     RUN_CONCLUSION=-
+    STALE=""
     {
       say "hashfun build status, written $now by deploy.sh"
       say "repo: $REPO"
-      say "run: none yet (GitHub starts one a few seconds after a push)"
+      say "run: none yet (GitHub lists a build within a minute of a push; when the push is older than that: bash deploy.sh kick)"
+      say "local: ${LOCAL_HEAD:--}"
     } > "$OUT/status.txt"
     : > "$OUT/failed.log"
-    SUMMARY1="no build of $REPO yet (GitHub starts one a few seconds after a push)"
-    SUMMARY2="https://github.com/$REPO/actions"
+    SUMMARY1="no build of $REPO yet   https://github.com/$REPO/actions"
+    SUMMARY2="GitHub lists a build within a minute of a push. When the push is older than that, it is not going to start one by itself: bash \"$HERE/deploy.sh\" kick"
     SUMMARY3="wrote $OUT/status.txt"
     return 0
   fi
-  # The run that matters: the newest; when a release tag's run exists for the same commit, that one.
-  line="$(awk -F'\t' 'NR == 1 { sha = $6; pick = $0 } $6 == sha && $5 ~ /^v[0-9]/ { pick = $0; exit } END { print pick }' "$runs")"
+  line="$(pick_run "$runs")"
   RUN_ID="$(printf '%s' "$line" | cut -f1)"
   RUN_STATUS="$(printf '%s' "$line" | cut -f2)"
   RUN_CONCLUSION="$(printf '%s' "$line" | cut -f3)"
@@ -654,6 +788,11 @@ status_once() {
   sha="$(printf '%s' "$line" | cut -f6)"
   created="$(printf '%s' "$line" | cut -f7)"
   url="$(printf '%s' "$line" | cut -f8)"
+  # a build of some other commit says nothing about the source here: say so before anything else
+  STALE=""
+  if [ -n "${LOCAL_HEAD:-}" ] && [ "$sha" != "$LOCAL_HEAD" ]; then
+    STALE="NOT A BUILD OF THE SOURCE HERE (the source is at $(short "$LOCAL_HEAD"); GitHub lists no build of that commit; start one: bash \"$HERE/deploy.sh\", or if it is pushed already: bash \"$HERE/deploy.sh\" kick). The newest build there is: "
+  fi
   gh run view "$RUN_ID" --repo "$REPO" --json jobs \
     --jq '.jobs[] | [(.databaseId | tostring), .status, (if (.conclusion // "") == "" then "-" else .conclusion end), .name, ([.steps[]? | select(.conclusion == "failure") | .name] | join("; ") | if . == "" then "-" else . end)] | @tsv' \
     > "$jobs" 2> "$TMP/jobs.err" < /dev/null || : > "$jobs"
@@ -702,6 +841,8 @@ status_once() {
     say "event: $ev"
     say "ref: $ref"
     say "commit: $sha"
+    say "local: ${LOCAL_HEAD:--}"
+    if [ -n "$STALE" ]; then say "stale: yes (this build is not of the commit the source here is at)"; else say "stale: no"; fi
     say "created: $created"
     say "status: $RUN_STATUS"
     say "conclusion: $RUN_CONCLUSION"
@@ -716,7 +857,7 @@ status_once() {
     say "recent runs (id, status, conclusion, event, ref, commit, created):"
     awk -F'\t' '{ printf "  %s %s %s %s %s %s %s\n", $1, $2, $3, $4, $5, substr($6, 1, 12), $7 }' "$runs"
   } > "$OUT/status.txt"
-  SUMMARY1="run $RUN_ID ($ev $ref at $(short "$sha")): $RUN_STATUS, $RUN_CONCLUSION   $url"
+  SUMMARY1="${STALE}run $RUN_ID ($ev $ref at $(short "$sha")): $RUN_STATUS, $RUN_CONCLUSION   $url"
   if [ "$n_bad" -gt 0 ]; then
     SUMMARY2="jobs: $n_ok ok, $n_bad failed ($bad_names), $n_open not finished"
   else
@@ -726,16 +867,33 @@ status_once() {
 }
 
 version_if_known() {
-  # for the release and npm lines of the status; quietly nothing when the source is not there
+  # for the release and npm lines of the status, and to tell a build of this source from one of
+  # another commit; quietly nothing when the source is not there
   PKG=""
   VERSION=""
   TAGNAME=""
+  LOCAL_HEAD=""
   local sha
   sha="$(git -C "$SRC" rev-parse -q --verify "refs/heads/$BRANCH" 2> /dev/null || true)"
   [ -n "$sha" ] || return 0
+  LOCAL_HEAD="$sha"
   PKG="$(git -C "$SRC" show "$sha:contrib/hashfun/npm/package.json" 2> /dev/null | json_string name || true)"
   VERSION="$(git -C "$SRC" show "$sha:contrib/hashfun/npm/package.json" 2> /dev/null | json_string version || true)"
   if [ -n "$PKG" ] && [ -n "$VERSION" ]; then TAGNAME="v$VERSION"; else TAGNAME=""; fi
+}
+
+# ---- kick: what GitHub says, kept in a file --------------------------------------------------------
+knote() {
+  say "$*"
+  say "$*" >> "$KLOG"
+}
+# one question to GitHub, its answer and its exit status into the file; never stops the script
+kask() {
+  local title="$1" rc=0
+  shift
+  say "== $title" >> "$KLOG"
+  "$@" >> "$KLOG" 2>&1 < /dev/null || rc=$?
+  say "   (exit $rc)" >> "$KLOG"
 }
 
 # ---- commands -------------------------------------------------------------------------------------
@@ -748,6 +906,7 @@ case "$CMD" in
     if [ "$CMD" = wait ]; then
       say "waiting for the build of $REPO to end (looking every ${POLL:-60} s; Ctrl-C stops the waiting, not the build)"
       tries=0
+      none=0
       last=""
       while :; do
         status_once light
@@ -755,9 +914,16 @@ case "$CMD" in
           status_once
           break
         fi
-        if [ "$SUMMARY2" != "$last" ]; then
-          say "  $(date '+%H:%M')  $SUMMARY2"
-          last="$SUMMARY2"
+        progress="$SUMMARY2"
+        if [ "$RUN_STATUS" = none ]; then
+          # two more looks; a build that is not listed by then is not coming (the last lines say what to do)
+          none=$((none + 1))
+          if [ "$none" -ge 3 ]; then break; fi
+          progress="no build listed yet"
+        fi
+        if [ "$progress" != "$last" ]; then
+          say "  $(date '+%H:%M')  $progress"
+          last="$progress"
         fi
         tries=$((tries + 1))
         if [ "$tries" -ge "${MAX_POLLS:-600}" ]; then
@@ -784,7 +950,9 @@ case "$CMD" in
       fi
     fi
     if [ "$CMD" = rerun ] && [ -n "$RUN_ID" ]; then
-      if [ "$RUN_STATUS" != completed ]; then
+      if [ -n "$STALE" ]; then
+        SUMMARY3="$SUMMARY3; not run again: build $RUN_ID is of another commit than the source here"
+      elif [ "$RUN_STATUS" != completed ]; then
         SUMMARY3="$SUMMARY3; not run again: build $RUN_ID has not ended yet"
       elif [ "$RUN_CONCLUSION" = success ]; then
         SUMMARY3="$SUMMARY3; not run again: build $RUN_ID succeeded"
@@ -794,12 +962,143 @@ case "$CMD" in
         SUMMARY3="$SUMMARY3; GitHub did not start them again ($(first_line "$TMP/rerun.err"))"
       fi
     fi
-    if [ "$RUN_STATUS" = completed ] && [ "$RUN_CONCLUSION" = success ] && [ -n "$PKG" ]; then
+    if [ "$RUN_STATUS" = completed ] && [ "$RUN_CONCLUSION" = success ] && [ -n "$PKG" ] && [ -z "${STALE:-}" ]; then
       SUMMARY3="$SUMMARY3. Green: once npm has it (a minute after the release job): npm i -g $PKG && hashfun doctor"
     fi
     say "$SUMMARY1"
     say "$SUMMARY2"
     say "$SUMMARY3"
+    ;;
+
+  kick)
+    gh_login
+    REPO="$(known_repo)"
+    [ -n "$REPO" ] || die "nothing was deployed from here yet, so there is no build to start" "first: bash deploy.sh    (or name the repository: REPO=owner/name bash deploy.sh kick)"
+    version_if_known
+    HEAD_SHA="$LOCAL_HEAD"
+    [ -n "$HEAD_SHA" ] && [ -n "$TAGNAME" ] || die "no source repository with a branch $BRANCH at $SRC, so there is no commit to build" "first: bash deploy.sh"
+    # the remote of the source repository that is this GitHub repository
+    REMOTE=""
+    for r in "$(git -C "$SRC" config --get "branch.$BRANCH.remote" || true)" origin deploy; do
+      [ -n "$r" ] || continue
+      if [ "$(lower "$(remote_slug "$r")")" = "$(lower "$REPO")" ]; then
+        REMOTE="$r"
+        break
+      fi
+    done
+    [ -n "$REMOTE" ] || die "$SRC has no remote for https://github.com/$REPO" "first: bash deploy.sh"
+    ggit ls-remote "$REMOTE" "refs/heads/$BRANCH" "refs/tags/$TAGNAME*" > "$TMP/refs" 2> "$TMP/ls.err" ||
+      die "could not read $REPO over git ($(first_line "$TMP/ls.err"))" "check the network, then: gh auth status"
+    REMOTE_HEAD="$(awk -v t="refs/heads/$BRANCH" '$2 == t { print $1 }' "$TMP/refs")"
+    TAG_RAW="$(awk -v t="refs/tags/$TAGNAME" '$2 == t { print $1 }' "$TMP/refs")"
+    TAG_CUR="$(awk -v t="refs/tags/$TAGNAME^{}" '$2 == t { print $1 }' "$TMP/refs")"
+    TAG_CUR="${TAG_CUR:-$TAG_RAW}"
+    # what to build: the release tag when it is on this commit, else the branch
+    if [ "$TAG_CUR" = "$HEAD_SHA" ]; then
+      KREF="$TAGNAME"
+    elif [ "$REMOTE_HEAD" = "$HEAD_SHA" ]; then
+      KREF="$BRANCH"
+    else
+      die "GitHub has neither $BRANCH nor $TAGNAME on the commit the source here is at ($(short "$HEAD_SHA"))" "push it first: bash deploy.sh"
+    fi
+    mkdir -p "$OUT"
+    KLOG="$OUT/kick.txt"
+    {
+      say "hashfun kick, $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+      say "repo: $REPO"
+      say "commit: $HEAD_SHA"
+      say "ref: $KREF"
+    } > "$KLOG"
+
+    say "1/4 asking GitHub what it knows about the workflow on $REPO ..."
+    kask "login" gh api user --jq '.login'
+    kask "repository" gh api "repos/$REPO" --jq '{visibility, fork, disabled, archived, default_branch, size, created_at, pushed_at}'
+    kask "actions permissions" gh api "repos/$REPO/actions/permissions"
+    kask "workflows GitHub knows" gh api "repos/$REPO/actions/workflows" --jq '.total_count, (.workflows[] | [.name, .path, .state] | @tsv)'
+    kask "builds GitHub lists" gh run list --repo "$REPO" --limit 10
+    kask "the workflow file on $KREF" gh api "repos/$REPO/contents/.github/workflows/$WORKFLOW?ref=$KREF" --jq '{path, size, sha}'
+    kask "check suites of the commit" gh api "repos/$REPO/commits/$HEAD_SHA/check-suites" --jq '.check_suites[] | [.app.slug, .status, (.conclusion // "-"), (.head_branch // "-")] | @tsv'
+
+    # never a second build beside one that is queued, running or has succeeded
+    list_builds
+    [ "$LIST_OK" = 1 ] || die "could not read the builds of $REPO ($(first_line "$TMP/builds.err")), so nothing was started: a build may be there" "check: gh auth status    then again: bash deploy.sh kick"
+    line="$(good_build_on "$KREF")"
+    if [ -n "$line" ]; then
+      knote "a build of this commit on $KREF is there already ($(printf '%s' "$line" | cut -f2), $(printf '%s' "$line" | cut -f3)): nothing to start.   $(build_url "$line")"
+      knote "look at it with: bash \"$HERE/deploy.sh\" status"
+      exit 0
+    fi
+    line="$(build_on "$KREF")"
+    [ -z "$line" ] || knote "   (the last build of this commit on $KREF ended as $(printf '%s' "$line" | cut -f3): a new one is started. Only its failed jobs again would be: bash \"$HERE/deploy.sh\" rerun)"
+
+    say "2/4 making sure Actions is switched on for $REPO ..."
+    enabled="$(gh api "repos/$REPO/actions/permissions" --jq '.enabled' 2> /dev/null < /dev/null || echo unknown)"
+    if [ "$enabled" = true ]; then
+      knote "   it is on"
+    elif [ "$enabled" = false ]; then
+      if gh api -X PUT "repos/$REPO/actions/permissions" -F enabled=true >> "$KLOG" 2>&1 < /dev/null; then
+        knote "   Actions was switched off for this repository: switched on"
+      else
+        knote "   Actions is switched off for this repository and could not be switched on from here (GitHub's answer is in $KLOG): Settings, Actions, General"
+      fi
+    else
+      knote "   (GitHub did not say whether it is on; going on)"
+    fi
+
+    say "3/4 starting the build of $(short "$HEAD_SHA") on $KREF ..."
+    HOW=""
+    if gh workflow run "$WORKFLOW" --repo "$REPO" --ref "$KREF" >> "$KLOG" 2>&1 < /dev/null; then
+      HOW="asked GitHub to run the workflow on $KREF"
+    elif [ "$KREF" != "$TAGNAME" ]; then
+      knote "   GitHub refused to run the workflow on $KREF (its answer is in $KLOG). A branch cannot be pushed again the way a tag can."
+    else
+      knote "   GitHub refused to run the workflow on $KREF (its answer is in $KLOG). The other trigger is the push of the tag:"
+      rc=0
+      npm_has_version || rc=$?
+      if [ "$rc" = 0 ]; then
+        knote "   $TAGNAME is NOT pushed again: $PKG@$VERSION is on npm already, and the tag of a published version is left alone"
+      elif [ "$rc" = 2 ]; then
+        knote "   $TAGNAME is NOT pushed again: npm could not be asked whether $PKG@$VERSION is published (again when npm answers: npm view $PKG@$VERSION version)"
+      elif ggit fetch -q "$REMOTE" "+refs/tags/$TAGNAME:refs/tags/$TAGNAME" >> "$KLOG" 2>&1 &&
+        ggit push "--force-with-lease=refs/tags/$TAGNAME:$TAG_RAW" "$REMOTE" ":refs/tags/$TAGNAME" >> "$KLOG" 2>&1; then
+        # exactly what GitHub had under that name went away; it comes back unchanged
+        if ggit push "$REMOTE" "refs/tags/$TAGNAME:refs/tags/$TAGNAME" >> "$KLOG" 2>&1; then
+          HOW="deleted $TAGNAME on GitHub and pushed it again, on the same commit"
+        else
+          knote "   $TAGNAME was deleted on GitHub and could NOT be pushed again (git's message is in $KLOG). Put it back with: bash \"$HERE/deploy.sh\""
+        fi
+      else
+        knote "   $TAGNAME could not be pushed again (git's message is in $KLOG); it is on GitHub as it was"
+      fi
+    fi
+    found=""
+    if [ -n "$HOW" ]; then
+      knote "   $HOW"
+      say "4/4 waiting up to two minutes for GitHub to list the build ..."
+      n=0
+      while [ "$n" -lt 24 ]; do
+        list_builds
+        found="$(good_build_on "$KREF")"
+        [ -z "$found" ] || break
+        n=$((n + 1))
+        sleep "${CANCEL_POLL:-5}"
+      done
+    fi
+    kask "workflows GitHub knows, after" gh api "repos/$REPO/actions/workflows" --jq '.total_count, (.workflows[] | [.name, .path, .state] | @tsv)'
+    kask "builds GitHub lists, after" gh run list --repo "$REPO" --limit 10
+    if [ -n "$found" ]; then
+      if [ "$KREF" = "$TAGNAME" ]; then
+        BR=same
+        drop_branch_build 0 # one build per commit: a build of the branch push that is running beside it is stopped
+      fi
+      knote "GitHub is building now: $(build_url "$found")"
+      knote "when it has ended:   bash \"$HERE/deploy.sh\" wait"
+    else
+      knote "no build of this commit was started."
+      knote "Open https://github.com/$REPO/actions in a browser, logged in: a notice or a button there about enabling workflows is the answer."
+      knote "What GitHub said is in $KLOG"
+      exit 1
+    fi
     ;;
 
   deploy)
@@ -829,10 +1128,37 @@ case "$CMD" in
     confirm
 
     step "5/5 doing it"
+    PUSHED_BRANCH=0
+    PUSHED_TAG=0
     do_repo
     do_push
     do_secret
     do_tag
+
+    # The build to expect: the release tag's when the tag is on this commit now, else the branch's.
+    case "$TAG_STATE" in
+      "$TAGNAME"*)
+        BUILD_REF="$TAGNAME"
+        BUILD_PUSHED="$PUSHED_TAG"
+        ;;
+      *)
+        BUILD_REF="$BRANCH"
+        BUILD_PUSHED="$PUSHED_BRANCH"
+        ;;
+    esac
+    BUILD_OK=1
+    ensure_build "$BUILD_REF" "$BUILD_PUSHED" || BUILD_OK=0
+    if [ "$BUILD_OK" = 1 ] && [ "$BUILD_HOW" = asked ] && [ "$BUILD_REF" = "$TAGNAME" ]; then
+      drop_branch_build "$WAITED" # GitHub may have started the branch's build and not the tag's: one build per commit
+    fi
+    B_URL=""
+    B_STATUS=""
+    B_CONCLUSION=""
+    if [ "$BUILD_OK" = 1 ]; then
+      B_URL="$(build_url "$BUILD_LINE")"
+      B_STATUS="$(printf '%s' "$BUILD_LINE" | cut -f2)"
+      B_CONCLUSION="$(printf '%s' "$BUILD_LINE" | cut -f3)"
+    fi
 
     mkdir -p "$OUT"
     {
@@ -845,15 +1171,49 @@ case "$CMD" in
       say "package: $PKG@$VERSION"
       say "tag: $TAG_STATE"
       say "npm token: $NPM_STATE"
+      if [ "$BUILD_OK" = 1 ]; then
+        say "build: $B_URL ($B_STATUS, $B_CONCLUSION; on $BUILD_REF; $BUILD_HOW)"
+      else
+        say "build: none ($DISPATCH_ERR)"
+      fi
       say "git: $(git --version)"
       say "gh: $(gh --version 2> /dev/null | sed -n '1p')"
       say "bash: ${BASH_VERSION:-?}"
       say "system: $(uname -sm 2> /dev/null || echo '?')"
     } > "$OUT/deploy.txt"
 
+    if [ "$BUILD_OK" != 1 ]; then
+      case "$TAG_STATE" in
+        "$TAGNAME"*) HAS="the branch and the tag $TAGNAME" ;;
+        *) HAS="the branch" ;;
+      esac
+      if [ "$BUILD_UNKNOWN" = 1 ]; then
+        step "pushed; whether it is building is not known"
+        say "GitHub has $HAS. $DISPATCH_ERR, so no build was asked for either."
+        say ""
+        say "  to look again:       bash \"$HERE/deploy.sh\" status"
+        say "  if none is listed:   bash \"$HERE/deploy.sh\" kick"
+        exit 1
+      fi
+      step "NOT building"
+      say "GitHub has $HAS, and it has started no build of this commit."
+      say "$DISPATCH_ERR"
+      say ""
+      say "  to try again:        bash \"$HERE/deploy.sh\" kick      (asks GitHub what it knows about the workflow, into $OUT/kick.txt, and starts the build another way)"
+      say "  and look here:       https://github.com/$REPO/actions      (in a browser, logged in: a notice or a button about enabling workflows is the answer)"
+      say "  a build that shows up late after all:   bash \"$HERE/deploy.sh\" status"
+      exit 1
+    fi
+
     step "done"
-    say "GitHub is building now: https://github.com/$REPO/actions"
-    say "It takes one to two hours the first time (four platforms, each tested; later runs reuse the compiler caches)."
+    if [ "$B_STATUS" = completed ]; then
+      say "GitHub has built this commit already ($B_CONCLUSION): $B_URL"
+      [ "$B_CONCLUSION" = success ] || say "(its failed jobs again: bash \"$HERE/deploy.sh\" rerun)"
+    else
+      say "GitHub is building now: $B_URL"
+      [ "$BUILD_HOW" != asked ] || say "(GitHub started nothing for the push itself; this build was started by asking for it, on $BUILD_REF)"
+      say "It takes one to two hours the first time (four platforms, each tested; later runs reuse the compiler caches)."
+    fi
     say ""
     say "  when it has ended:   bash \"$HERE/deploy.sh\" wait      (blocks until then, then writes the result to $OUT/)"
     say "  to look right now:   bash \"$HERE/deploy.sh\" status"
@@ -867,6 +1227,6 @@ case "$CMD" in
     ;;
 
   *)
-    die "deploy.sh knows: (nothing), status, wait, logs, rerun, help; not: $CMD"
+    die "deploy.sh knows: (nothing), status, wait, logs, rerun, kick, help; not: $CMD"
     ;;
 esac

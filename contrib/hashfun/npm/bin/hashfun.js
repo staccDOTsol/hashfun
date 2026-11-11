@@ -11,7 +11,7 @@ const py = path.join(__dirname, '..', 'py');
 if (process.argv[2] === 'book') { require(path.join(py, 'hashfun', 'web', 'maker.cjs')); return; }
 // macOS ships /usr/bin/python3 = 3.9 built against LibreSSL (no hashlib.scrypt, which the wallet
 // file needs), so look past it: versioned names and Homebrew's usual places.
-const candidates = [process.env.HASHFUN_PYTHON, 'python3', 'python3.14', 'python3.13', 'python3.12', 'python3.11', 'python3.10',
+const candidates = [process.env.HASHFUN_PYTHON, 'python3', 'python3.16', 'python3.15', 'python3.14', 'python3.13', 'python3.12', 'python3.11', 'python3.10',
   '/opt/homebrew/bin/python3', '/usr/local/bin/python3', 'python'].filter(Boolean);
 const probe = 'import sys, hashlib; sys.exit(0 if sys.version_info >= (3, 10) and hasattr(hashlib, "scrypt") else 1)';
 let python = null;
@@ -25,7 +25,14 @@ if (!python) {
     'Or point at one: HASHFUN_PYTHON=/path/to/python hashfun ...');
   process.exit(1);
 }
-const env = { ...process.env, PYTHONPATH: py + (process.env.PYTHONPATH ? path.delimiter + process.env.PYTHONPATH : '') };
-const child = spawn(python, ['-m', 'hashfun.cli', ...process.argv.slice(2)], { stdio: 'inherit', env });
+// Run the copy shipped in this package, whatever directory the command is typed in. `python -m`
+// looks in the current directory before PYTHONPATH, so in a folder that holds a `hashfun` package
+// of its own (a source checkout) it would run that one instead, with that one's idea of where the
+// node binary is. So the shipped copy goes to the front of the module path by hand, and the module
+// is then run the way -m runs it. PYTHONSAFEPATH keeps the current directory out altogether on
+// Python 3.11 and newer.
+const env = { ...process.env, PYTHONSAFEPATH: '1', PYTHONPATH: py + (process.env.PYTHONPATH ? path.delimiter + process.env.PYTHONPATH : '') };
+const boot = 'import sys, runpy; sys.path.insert(0, sys.argv.pop(1)); runpy.run_module("hashfun.cli", run_name="__main__", alter_sys=True)';
+const child = spawn(python, ['-c', boot, py, ...process.argv.slice(2)], { stdio: 'inherit', env });
 for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => child.kill(sig));
 child.on('exit', (code, signal) => process.exit(signal ? 1 : code));
