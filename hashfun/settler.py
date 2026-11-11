@@ -4,7 +4,8 @@ Every curve coinbase is locked until its Bitcoin payment is proven on the launch
 Settler does the whole loop for the blocks its owner mined:
 
   1. relay Bitcoin headers the launch has not seen (HFH1)
-  2. once a block's draw is known and buried, pay the drawn payee on Bitcoin (tagged transaction)
+  2. once a block's draw is known and buried, pay the script the draw fixed on Bitcoin (tagged
+     transaction: one tag list, tag i for output i)
   3. when that payment has enough confirmations, publish the SPV proof (HFP1)
 
 All three ride in the coinbase of the owner's next block, so no spendable launch coins are
@@ -17,8 +18,13 @@ Reorgs are the dangerous part, because Bitcoin that was paid stays paid:
     between the two cannot pay twice;
   - a settlement is only forgotten once it is `pay_depth` deep; if the block carrying the proof
     is reorged out the proof is published again;
-  - if a reorg changed the draw after payment, the old payment no longer counts. That is
-    reported as lost and the block is paid again."""
+  - the draw fixes who is paid and nothing later changes it, except a reorg of the draw block
+    itself. If that happens after payment, the old payment no longer counts: it is reported as
+    lost and the block is paid again.
+
+Two things it never does: pay for a block whose settlement deadline can no longer be met (the
+Bitcoin would buy nothing: that coinbase is lost), and relay headers once the sats leg is over
+(settle_deadline blocks after the last curve block the node no longer looks at them)."""
 import json
 import logging
 import os
@@ -49,19 +55,41 @@ def merkle_branch(txids: List[bytes], pos: int) -> List[bytes]:
     return branch
 
 
+class NodeMismatch(RuntimeError):
+    """The node does not answer getmintobligation the way this settler reads it."""
+
+
+_ALWAYS = ("height", "hash", "curve", "owed", "draw_known", "settled", "deadline_height", "tag")
+
+
+def checked_obligation(ob: dict) -> dict:
+    """getmintobligation's answer, or NodeMismatch. Paying on a field read wrong costs real Bitcoin,
+    so an answer in another shape stops the settler with one message instead of a guess."""
+    if not isinstance(ob, dict):
+        raise NodeMismatch("getmintobligation did not return an object: is this a hashfund node?")
+    if "candidates" in ob or "candidate" in ob:
+        raise NodeMismatch("the node answers getmintobligation with the earlier sats-leg rules (it lists 'candidates' to "
+                           "pay in turn). Under the current rules the draw fixes one script to pay ('pay_script') and a "
+                           "payment to anyone else settles nothing. Update hashfund to the version of this package; "
+                           "nothing is paid until then")
+    missing = [k for k in _ALWAYS if k not in ob]
+    if not missing and ob["draw_known"]:
+        missing = [k for k in ("pay", "payee") if k not in ob]
+        if not missing and ob["pay"] > 0 and "pay_script" not in ob:
+            missing = ["pay_script"]
+    if missing:
+        raise NodeMismatch(f"getmintobligation {ob.get('height', '?')} has no {', '.join(repr(k) for k in missing)}: this "
+                           "hashfund and this package speak different versions of the sats leg. Update both; nothing "
+                           "is paid until then")
+    return ob
+
+
 def payment_matches(ob: dict, p: dict) -> bool:
     """Does the payment recorded in p still satisfy the obligation as the chain sees it now?
-    Mirrors consensus: the payee class and amount come from the draw; a holder payment to
-    candidate c counts while every earlier candidate is spent (c itself may be spent since)."""
-    if not ob.get("draw_known") or ob.get("payee") != p["payee"] or ob.get("pay", 0) > p["sats"]:
-        return False
-    if ob["payee"] != "holder":
-        return ob.get("pay_script") == p["pay_script"]
-    cands, c = ob.get("candidates", []), p["candidate"]
-    if c < len(cands):
-        return cands[c]["btc_script"] == p["pay_script"] and not any(x["unspent"] for x in cands[:c])
-    # Past the last candidate the creator stands in; only valid while no candidate is unspent.
-    return ob.get("candidate") == c and ob.get("pay_script") == p["pay_script"]
+    Mirrors consensus: the draw fixes the amount due and the one Bitcoin script it is due to
+    (the drawn coin may be spent since: that changes nothing). Only another draw, after a reorg
+    of the draw block, makes a payment stop counting."""
+    return bool(ob.get("draw_known")) and 0 < ob.get("pay", 0) <= p["sats"] and ob.get("pay_script") == p["pay_script"]
 
 
 class Settler:
@@ -112,8 +140,23 @@ class Settler:
         self.st["lost"].append({"block": key, "txid": p["txid"], "sats": p["sats"], "why": why})
         log.error("block %s: the %d sats paid in %s no longer count (%s)", key, p["sats"], p["txid"], why)
 
+    def _obligation(self, height: int) -> dict:
+        return checked_obligation(self.launch.getmintobligation(height))
+
+    def sats_leg_over(self) -> bool:
+        """settle_deadline blocks after the last curve block (the graduation block) nothing can be
+        drawn or settled any more, and the node stops looking at headers and proofs. A reorg below
+        that height reopens it, so this is asked again every round."""
+        info = self.launch.getlaunchinfo()
+        try:
+            return bool(info["graduated"]) and info["height"] >= info["graduation_height"] + info["descriptor"]["settle_deadline"]
+        except (KeyError, TypeError):
+            return False  # a node that does not say: keep relaying
+
     # ------------------------------------------------------------ steps
     def relay_outputs(self) -> List[TxOut]:
+        if self.sats_leg_over():
+            return []
         have = self.launch.getbtcrelay()
         tip = self.btc.getblockcount()
         start = have["height"]
@@ -141,8 +184,8 @@ class Settler:
         for vout, ob in enumerate(group):
             key = f"{ob['height']}:{ob['hash']}"
             keys.append(key)
-            self.st["paid"][key] = {"txid": txid, "vout": vout, "candidate": ob.get("candidate", 0), "sats": ob["pay"],
-                                    "payee": ob["payee"], "pay_script": ob["pay_script"], "hex": signed["hex"]}
+            self.st["paid"][key] = {"txid": txid, "vout": vout, "sats": ob["pay"], "payee": ob["payee"],
+                                    "pay_script": ob["pay_script"], "hex": signed["hex"]}
         self._save()
         try:
             self.btc.sendrawtransaction(signed["hex"])
@@ -164,7 +207,7 @@ class Settler:
                 if f"{height}:{bhash}" in self.st["paid"]:
                     continue
                 try:
-                    ob = self.launch.getmintobligation(height)
+                    ob = self._obligation(height)
                 except RPCError:
                     continue  # above the tip right now (reorg in progress)
                 if ob["hash"] != bhash:  # reorged out; nothing was paid for it
@@ -178,9 +221,17 @@ class Settler:
                 if not ob["draw_known"] or not buried:
                     continue
                 if ob["pay"] == 0 or ob["settled"]:
-                    self._finish(height, bhash)
+                    self._finish(height, bhash)  # nothing due (the lottery, or nobody held yet), or already proven
                     continue
-                if "pay_script" not in ob:
+                if tip >= ob["deadline_height"]:
+                    # The proof would have to be in a block at or below deadline_height, and the next
+                    # block is already past it: a payment now would buy nothing. (A reorg could bring
+                    # the chain back under the deadline, so the block is only given up once that
+                    # height is buried, like everything else here.)
+                    if tip - ob["deadline_height"] >= self.pay_depth:
+                        log.error("block %d: its settlement deadline (height %d) passed unpaid; the coinbase is "
+                                  "unspendable and nothing is paid for it", height, ob["deadline_height"])
+                        self._finish(height, bhash)
                     continue
                 if self.max_pay is not None and ob["pay"] > self.max_pay:
                     log.warning("block %d owes %d sats, above the configured cap; not paying", height, ob["pay"])
@@ -206,7 +257,7 @@ class Settler:
             for key, p in list(self.st["paid"].items()):
                 height, bhash = int(key.split(":")[0]), key.split(":")[1]
                 try:
-                    ob = self.launch.getmintobligation(height)
+                    ob = self._obligation(height)
                 except RPCError:
                     continue
                 if ob["hash"] != bhash:
@@ -228,7 +279,7 @@ class Settler:
                     self._finish(height, bhash)
                     continue
                 if not payment_matches(ob, p):
-                    # The draw moved under us (reorg of the draw block or of a candidate's spend).
+                    # The draw moved under us (a reorg of the draw block: nothing else can move it).
                     # Give the old branch pay_depth blocks to come back before paying again.
                     p.setdefault("bad", tip)
                     if tip - p["bad"] >= max(self.pay_depth, 1):
@@ -257,8 +308,9 @@ class Settler:
                 txids = [bytes.fromhex(x)[::-1] for x in blk["tx"]]
                 pos = blk["tx"].index(p["txid"])
                 raw = Tx.parse(bytes.fromhex(tx["hex"])).serialize(witness=False)
+                # (the proof's candidate byte is always 0: the payee is the one the draw fixed)
                 proof = Y.PaymentProof(height, bytes.fromhex(tx["blockhash"])[::-1], pos, merkle_branch(txids, pos),
-                                       p["vout"], p["candidate"], raw)
+                                       p["vout"], 0, raw)
                 outs.append(TxOut(0, Y.op_return(proof.payload())))
             self._save()
             return outs

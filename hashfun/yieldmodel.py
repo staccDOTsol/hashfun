@@ -1,9 +1,10 @@
-"""Python model of the sats leg (mirrors src/launchyield.{h,cpp}; test_diff_cpp compares them).
+"""Python model of the sats leg's pure functions (mirrors src/launchyield.{h,cpp}; test_diff_cpp
+compares them). The state machine built on them is hashfun/yieldstate.py.
 
 A curve block owes real BTC on top of its hash. Six blocks later the draw fixes how much is
-due and to whom (80% a holder who has not moved, 10% creator, 10% dev). The miner pays on
-Bitcoin with a tagged transaction and proves it on the launch chain by SPV against Bitcoin
-headers relayed inside launch blocks."""
+due and to whom: 80% a holder, drawn by value over the coins that are live at the draw, 10%
+the creator, 10% the dev. The miner pays on Bitcoin with a tagged transaction and proves it on
+the launch chain by SPV against Bitcoin headers relayed inside launch blocks."""
 import struct
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -13,10 +14,12 @@ from .ser import Tx, bits_to_target, target_to_bits
 
 MAX_MONEY = 21_000_000 * 100_000_000
 DRAW_DELAY = 6
-MAX_CANDIDATES = 64
 HOLDER_BPS, CREATOR_BPS = 8000, 1000
 HOLDER, CREATOR, DEV = 0, 1, 2
 OP_RETURN = 0x6A
+# The dev's 10% of the sats leg: bc1pctxxt9z57ypwrvdws45hgpgkx922e39gj3hkqe0hsgv3863f4ffsu7p7x3 (P2TR).
+# Consensus-critical; the node's copy is HASHFUN_DEV_BTC_SCRIPT in src/kernel/chainparams.cpp.
+DEV_BTC_SCRIPT = bytes.fromhex("5120c2cc659454f102e1b1ae85697405163154acc4a8946f6065f7821913ea29aa53")
 
 
 def owed(work: int, num: int, shift: int) -> int:
@@ -44,8 +47,9 @@ def compute_draw(owed_sats: int, min_payment: int, seed: bytes) -> Tuple[int, in
     return pay, (HOLDER if r < HOLDER_BPS else CREATOR if r < HOLDER_BPS + CREATOR_BPS else DEV)
 
 
-def candidate_point(seed: bytes, i: int, registered_total: int) -> int:
-    return int.from_bytes(sha256(seed + b"c" + struct.pack("<I", i)), "little") % registered_total
+def candidate_point(seed: bytes, i: int, total: int) -> int:
+    """A point in [0, total). The holder draw uses i = 0 over the live value at the draw."""
+    return int.from_bytes(sha256(seed + b"c" + struct.pack("<I", i)), "little") % total
 
 
 def pay_tag(launch_id: bytes, mint_block_hash: bytes) -> bytes:
@@ -96,22 +100,32 @@ def earns_yield(script: bytes) -> bool:
     return 4 <= n <= 42 and (script[0] == 0 or 0x51 <= script[0] <= 0x60) and script[1] == n - 2
 
 
+def is_coinbase(tx: Tx) -> bool:
+    return len(tx.vin) == 1 and tx.vin[0].prev_txid == bytes(32) and tx.vin[0].prev_vout == 0xFFFFFFFF
+
+
 def registered_outputs(tx: Tx, coinbase: bool) -> List[Tuple[int, int, bytes]]:
-    """[(vout, value, btc_script)]: every earning output, paid at its own script on Bitcoin unless
-    the tx redirects with OP_RETURN "HFY1"<script> (coinbase: redirect covers vout 0 only)."""
+    """The coins of a transaction: [(vout, value, yield script)]. Every output with a positive value
+    and an earning script is a coin, and its yield is paid at its own script on Bitcoin.
+
+    One exception: a coinbase may redirect its output 0. The first output of the coinbase that is
+    OP_RETURN "HFY1"<payload> counts, and only if the payload is itself an earning script; then
+    output 0's yield script is the payload. A first HFY1 with any other payload redirects nothing,
+    and later HFY1 outputs are never looked at. HFY1 in any other transaction is ignored: whoever
+    pays coins to someone does not get to name where their yield goes."""
     redirect = b""
-    for o in tx.vout:
-        data = tagged_return(o.script_pubkey, b"HFY1")
-        if data is not None:
-            if 5 <= len(data) <= 84:
-                redirect = data[4:]
-            break
+    if coinbase:
+        for o in tx.vout:
+            data = tagged_return(o.script_pubkey, b"HFY1")
+            if data is not None:
+                if earns_yield(data[4:]):
+                    redirect = data[4:]
+                break
     out = []
     for i, o in enumerate(tx.vout):
         if o.value <= 0 or not earns_yield(o.script_pubkey):
             continue
-        redirected = redirect and (not coinbase or i == 0)
-        out.append((i, o.value, redirect if redirected else o.script_pubkey))
+        out.append((i, o.value, redirect if (redirect and i == 0) else o.script_pubkey))
     return out
 
 
@@ -179,14 +193,25 @@ def verify_btc_payment(proof: PaymentProof, merkle_root: bytes, tag: bytes, reci
     out = tx.vout[proof.pay_vout]
     if out.value < pay or out.script_pubkey != recipient_script:
         return False, "btc output does not pay the drawn recipient enough"
+    # Only the first tag list of the transaction counts. If every list counted, a transaction
+    # with several lists could bind one paying output to several mint blocks, and one payment
+    # would settle them all.
     for o in tx.vout:
         data = tagged_return(o.script_pubkey, b"HF")
-        if data is None or (len(data) - 2) % 20:
+        if data is None:
             continue
         pos = 2 + 20 * proof.pay_vout
-        if data[pos:pos + 20] == tag and len(data) >= pos + 20:
+        if (len(data) - 2) % 20 == 0 and len(data) >= pos + 20 and data[pos:pos + 20] == tag:
             return True, ""
+        break
     return False, "btc tx does not bind this output to the mint block"
+
+
+def parse_btc_headers(payload: bytes) -> Optional[List[bytes]]:
+    """Payload of OP_RETURN "HFH1": the tag, then n >= 1 Bitcoin headers of 80 bytes."""
+    if len(payload) < 4 + 80 or (len(payload) - 4) % 80:
+        return None
+    return [payload[i:i + 80] for i in range(4, len(payload), 80)]
 
 
 # ------------------------------------------------------------ Bitcoin headers

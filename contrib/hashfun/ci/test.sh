@@ -12,6 +12,7 @@
 #           with `hashfun doctor --replay` and must reach the same conclusions
 #   core    Bitcoin Core's own unit tests, when dist/build.sh built them (TESTS=1)
 #   e2e     one launch end to end on regtest: curve, graduation, merge mining, sats owed, swaps
+#   yield   the sats leg, a real node against the Python model of its rules, block by block
 #   fleet   several nodes, miners and a settler talking to each other
 #   book    peer-to-peer swaps on the shipped 4 h and 8 h timelocks (the test moves the clock)
 #   web     the site in two real browsers (needs Python's playwright with its chromium)
@@ -37,7 +38,7 @@ while [ $# -gt 0 ]; do
     *) SUITES+=("$1"); shift ;;
   esac
 done
-[ ${#SUITES[@]} -gt 0 ] || SUITES=(unit diff web_js doctor core e2e fleet book web smoke)
+[ ${#SUITES[@]} -gt 0 ] || SUITES=(unit diff web_js doctor core e2e yield fleet book web smoke)
 mkdir -p "$LOGS"
 LOGS="$(cd "$LOGS" && pwd)"
 
@@ -122,13 +123,14 @@ suite_core() {
 
 for s in "${SUITES[@]}"; do
   case "$s" in
-    unit)   HASHFUND="$HF" run unit "$PY" -W ignore -m unittest hashfun.tests.test_core hashfun.tests.test_stack hashfun.tests.test_book hashfun.tests.test_cli ;;
+    unit)   HASHFUND="$HF" run unit "$PY" -W ignore -m unittest hashfun.tests.test_core hashfun.tests.test_yieldstate hashfun.tests.test_stack hashfun.tests.test_book hashfun.tests.test_cli ;;
     diff)   run diff suite_diff ;;
     web_js) if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then run web_js suite_web_js; else skip web_js "node and npm are not installed"; fi ;;
     doctor) HASHFUND="$HF" run doctor "$PY" -m hashfun.cli doctor --mine "$LOGS/chain-$HOST.json" ;;
     core)   if [ -x "$DIST/tests/$HOST/test_bitcoin" ]; then run core suite_core "$DIST/tests/$HOST/test_bitcoin"
             else printf 'skip  %-7s not built (TESTS=1 bash contrib/hashfun/dist/build.sh)\n' core; fi ;;
     e2e)    if need_btc; then run e2e "$PY" -m hashfun.tests.e2e_regtest --hashfund "$HF" --bitcoind "$BTC"; else skip e2e "no bitcoind"; fi ;;
+    yield)  if need_btc; then run yield "$PY" -m hashfun.tests.yield_regtest --hashfund "$HF" --bitcoind "$BTC"; else skip yield "no bitcoind"; fi ;;
     fleet)  if need_btc; then run fleet "$PY" -m hashfun.tests.fleet_regtest --hashfund "$HF" --bitcoind "$BTC"; else skip fleet "no bitcoind"; fi ;;
     book)   if ! need_btc; then skip book "no bitcoind"; elif ! command -v node >/dev/null 2>&1; then skip book "node is not installed"
             else run book suite_book; fi ;;
