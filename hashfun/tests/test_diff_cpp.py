@@ -12,6 +12,7 @@ Skipped when HFDIFF is unset. HFDIFF_SEED / HFDIFF_N tune the random cases.
 import json
 import os
 import random
+import struct
 import subprocess
 import unittest
 
@@ -631,6 +632,46 @@ class DiffCpp(unittest.TestCase):
             self.assertEqual(r["results"], py, (i, hex(bits), t1 - t0, height))
             self.assertIn(r["results"][0], ("btc header lacks proof of work", ""))
             self.assertEqual(r["results"][1], "btc header has wrong difficulty")
+
+    def test_btc_mainnet_rules_against_core(self):
+        """2,017 headers of an alternate mainnet chain produced and validated by stock Bitcoin Core
+        32.1 (its own test/functional/mining_mainnet.py): difficulty 1 for one period, then the
+        retarget at height 2016 to 0x1c3fffc0. Both implementations must follow it, from the genesis
+        anchor and from an anchor in the middle of the period, and reject any other difficulty."""
+        from hashfun import yieldmodel as Y
+        from hashfun.crypto import sha256d
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "mainnet_alt_headers.hex")
+        with open(path) as f:
+            hdrs = [bytes.fromhex(x) for x in f.read().split()]
+        self.assertEqual(len(hdrs), 2017)
+        self.assertEqual(sha256d(hdrs[0])[::-1].hex(), "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
+        t0 = struct.unpack("<I", hdrs[0][68:72])[0]
+        self.assertEqual([struct.unpack("<I", hdrs[i][72:76])[0] for i in (2015, 2016)], [0x1D00FFFF, 0x1C3FFFC0])
+        for anchor_at, period_time in ((0, t0), (1500, t0), (2015, t0)):
+            model = Y.BtcChain(hdrs[anchor_at], anchor_at, period_time, False)
+            ops = []
+            for hdr in hdrs[anchor_at + 1:]:
+                self.assertEqual(model.accept(hdr), (True, ""))
+                ops.append(["add", hdr.hex()])
+            self.assertEqual(model.best, sha256d(hdrs[-1]))
+            r = self.drv(op="btc", anchor=hdrs[anchor_at].hex(), height=anchor_at, period_time=period_time, regtest=False, ops=ops)
+            self.assertEqual(r["results"], [""] * len(ops))
+            self.assertEqual((r["best"], r["best_height"]), (sha256d(hdrs[-1]).hex(), 2016))
+        # A wrong period start (anchor mid-period) or any other nBits at the boundary is refused.
+        bad = bytearray(hdrs[2016])
+        bad[72:76] = struct.pack("<I", 0x1D00FFFF)
+        # (This chain's period ran in under 3.5 days, so its span is clamped; a period start ten days
+        # earlier gives an unclamped, different target.)
+        for anchor_at, period_time, last, why in ((1500, t0 - 86400 * 10, hdrs[2016], "btc header has wrong difficulty"),
+                                                 (0, t0, bytes(bad), "btc header has wrong difficulty")):
+            model = Y.BtcChain(hdrs[anchor_at], anchor_at, period_time, False)
+            ops = [["add", x.hex()] for x in hdrs[anchor_at + 1:2016]] + [["add", last.hex()]]
+            for x in hdrs[anchor_at + 1:2016]:
+                model.accept(x)
+            self.assertEqual(model.accept(last)[1], why)
+            r = self.drv(op="btc", anchor=hdrs[anchor_at].hex(), height=anchor_at, period_time=period_time, regtest=False, ops=ops)
+            self.assertEqual(r["results"][-1], why)
+            self.assertEqual(r["best_height"], 2015)
 
     def test_tail_minted(self):
         rng = random.Random(SEED + 4)
