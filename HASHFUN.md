@@ -325,6 +325,8 @@ Amounts are sats for Bitcoin and whole coins (decimals allowed) for launch coins
 
 ## CI and releases
 
+One command ships it: `bash contrib/hashfun/deploy.sh` (in a delivery: `bash deploy.sh`, next to `patches/` and `make_repo.sh`). It rebuilds the source repository from the patches, looks at what GitHub and npm already have, prints what it is about to do and asks once, then: creates or reuses the GitHub repository (public unless `VISIBILITY=private`), pushes branch `hashfun`, stores the npm token from a file as the repository's `NPM_TOKEN` secret (piped, never printed; `NPM=0` leaves it alone) and tags `v<version>`, which is what makes the workflow below release and publish. A version that is on npm is never tagged again. Running it again after new patches replaces the branch and moves the tag. `deploy.sh status`, `wait`, `logs` and `rerun` follow the build and write its state and the failed jobs' last lines to `ci/`. `make_repo.sh` alone rebuilds the repository without touching GitHub; the same patches give the same commit ids on every machine.
+
 `.github/workflows/hashfun.yml` runs on a push to `hashfun`, `main` or `master`, on a `v*` tag, and by hand. It only calls scripts that also run on a developer's machine.
 
 | Job | Where | What |
