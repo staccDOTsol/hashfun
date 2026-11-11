@@ -559,7 +559,7 @@ class E2E:
             with open(path, "w") as f:
                 f.write(d.dumps())
         creator_btc_spk = d.creator_btc_script
-        dev_spk = bytes.fromhex("00143c389aeef4eec79f9c7eec3afe71de98805e7e3f")
+        dev_spk = bytes.fromhex("5120c2cc659454f102e1b1ae85697405163154acc4a8946f6065f7821913ea29aa53")
         args = [f"-launch={path}", "-datacarriersize=1000000"]
         n3 = Node(a.hashfund, os.path.join(self.dir, "n3"), args, free_port())
         self.nodes.append(n3)

@@ -47,7 +47,7 @@ With `sats_num > 0` a curve block owes real BTC on top of its hash: `owed = (wor
 
 | Step | Rule |
 |---|---|
-| Draw | the hash of block `h+6` seeds block `h`'s draw. Debts under `sats_min_payment` pay the minimum with probability owed/min. Payee class: 80% holder, 10% creator (`creator_btc_script`), 10% dev (compiled-in script, currently a placeholder nobody can spend) |
+| Draw | the hash of block `h+6` seeds block `h`'s draw. Debts under `sats_min_payment` pay the minimum with probability owed/min. Payee class: 80% holder, 10% creator (`creator_btc_script`), 10% dev (compiled-in script, `bc1pctxxt9z57ypwrvdws45hgpgkx922e39gj3hkqe0hsgv3863f4ffsu7p7x3`) |
 | Holder | hold and you earn, no opt-in. 64 candidate points into the value of every P2PKH / P2SH / witness-program output created before block `h`; the payee is the first candidate still unspent (coin-weighted over current holders), paid at that output's own scriptPubKey on Bitcoin (same key, since a launch is a Bitcoin fork). All spent or none yet: creator |
 | Redirect | optional: a tx with `OP_RETURN "HFY1"<btc scriptPubKey>` sends its outputs' yield to that script instead (coinbase: vout 0 only) |
 | Pay | a Bitcoin tx whose output `i` pays the payee and whose `OP_RETURN "HF"<20-byte tags>` has `SHA256("hashfun-pay"||launch_id||block_hash)[:20]` at position `i` |
