@@ -22,7 +22,8 @@ def test_launch(**kw):
     base = dict(name="Test Launch", ticker="TST", genesis_time=1_800_000_000, virtual_work=71,
                 virtual_tokens=15_000_000 * COIN, graduation_tokens=11_086_000 * COIN, pow_limit_bits=0x207FFFFF,
                 target_spacing=60, lwma_window=10, ftl=60, tail_reward=10 * COIN, tail_halving_interval=1000,
-                creator_script=bytes.fromhex("0014" + "11" * 20), creator_fee_bps=100, test=True, hrp="tst")
+                creator_script=bytes.fromhex("0014" + "11" * 20), creator_fee_bps=100, test=True, hrp="tst",
+                btc_anchor_header=D.REGTEST_GENESIS_HEADER, sats_num=5000, creator_btc_script=D.TEST_BTC_SCRIPT)
     base.update(kw)
     d = D.Launch(**base)
     D.validate(d)
@@ -257,7 +258,9 @@ class Descriptor(unittest.TestCase):
             test_launch(tail_reward=21_000_000 * COIN, tail_halving_interval=10)
 
     def test_make_pump_shape(self):
-        d = D.make("Pumpish", "PMP", bytes.fromhex("0014" + "22" * 20), 10**22)
+        d = D.make("Pumpish", "PMP", bytes.fromhex("0014" + "22" * 20), 10**22,
+                   btc_anchor=(0, D.REGTEST_GENESIS_HEADER.hex()), sats_total=70_000_000,
+                   creator_btc_script=D.TEST_BTC_SCRIPT)
         self.assertAlmostEqual(d.graduation_tokens / d.virtual_tokens, 0.7391, places=3)
         self.assertAlmostEqual(d.graduation_work / 10**22, 1.0, places=3)
         # pump.fun: price at graduation / price at start = (T0/(T0-G))^2 ~ 14.7

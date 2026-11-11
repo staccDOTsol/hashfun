@@ -13,7 +13,7 @@ Phases, in order (each check prints PASS/FAIL):
   7  merged mining through the pool against stock bitcoind (real CAuxPow::check)
   8  standalone pool mining on the second (presale) launch
   9  Electrum servers + HD wallet + maker: atomic swap BTC -> launch coins
-  10 sats leg on a third launch: curve blocks owe real BTC to a drawn payee; Bitcoin headers
+  10 sats leg in detail on a third launch: curve blocks owe real BTC to a drawn payee; Bitcoin headers
      and SPV payment proofs ride in coinbases; unsettled coinbases cannot be spent
   11 the pool settles on its own: Settler relays headers, pays each drawn payee from a Bitcoin
      wallet and publishes the proofs while a stratum miner mines a fresh sats-leg launch
@@ -263,13 +263,39 @@ class E2E:
         when it runs out of tries, so every block is retried until it lands."""
         for _ in range(n):
             for _attempt in range(20):
-                tip = node.rpc.getblockheader(node.rpc.getbestblockhash())
-                heavy = int(node.rpc.getlaunchinfo()["next"]["work"], 16) > 100_000
-                node.rpc.setmocktime(max(int(time.time()), tip["time"] + (6 if heavy else 1) * spacing))
+                self.pace(node, spacing)
                 if w.generatetoaddress(1, addr, 50_000_000):
                     break
             else:
                 raise RuntimeError("paced mining made no progress")
+
+    @staticmethod
+    def pace(node, spacing):
+        tip = node.rpc.getblockheader(node.rpc.getbestblockhash())
+        heavy = int(node.rpc.getlaunchinfo()["next"]["work"], 16) > 100_000
+        node.rpc.setmocktime(max(int(time.time()), tip["time"] + (6 if heavy else 1) * spacing))
+
+    def settle_curve(self, node, d, payout_spk) -> bool:
+        """Every launch has a sats leg, so curve coinbases are locked until their Bitcoin payment
+        is proven. Run the Settler for all of this chain's curve blocks, carrying its headers and
+        proofs in hand-built blocks, until every one of them is spendable."""
+        settler = Settler(node.rpc, self.wb, os.path.join(self.dir, f"settler-{d.ticker}-{int(time.time())}.json"))
+        grad = node.rpc.getlaunchinfo()["graduation_height"]
+        last = grad if grad > 0 else node.rpc.getblockcount()
+        for h in range(1, last + 1):
+            settler.add_block(h, node.rpc.getblockhash(h))
+        for _ in range(40):
+            if all(node.rpc.getmintobligation(h)["spendable"] for h in range(1, last + 1)):
+                print(f"   {d.ticker}: {last} curve blocks settled, {settler.status()}", flush=True)
+                return True
+            outs = settler.coinbase_outputs()
+            self.wb.generatetoaddress(1, self.btc_addr)
+            self.pace(node, d.target_spacing)
+            t = node.rpc.getblocktemplate({"rules": ["segwit"]})
+            r = node.rpc.submitblock(ser_block(*block_from_gbt(t, payout_spk, extra_outs=outs)))
+            if r is not None:
+                raise RuntimeError(f"settlement block rejected: {r}")
+        return False
 
     # ------------------------------------------------------------ phases
     def p1(self):
@@ -475,6 +501,7 @@ class E2E:
         # Coinbase maturity on both chains. BTC regtest never retargets; GRAD is paced.
         wb.generatetoaddress(101, self.btc_addr)
         self.mine_paced(n1, w1, max(2, 102 - n1.rpc.getblockcount()), self.addr1, d1.target_spacing)
+        check("9 curve coinbases unlocked by proven Bitcoin payments (settler)", self.settle_curve(n1, d1, self.spk1))
         for _ in range(20):  # the maker needs mature launch coins before it can lock its leg
             if w1.getbalance() >= 1000:
                 break

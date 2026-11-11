@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Smoke test of the `hashfun` CLI against real binaries: create two launches (one hash-only that
-# graduates at once, one with a sats leg), run their nodes, mine both through the CLI's pool with
+# Smoke test of the `hashfun` CLI against real binaries: create two launches (one that graduates
+# at once, one with a long curve), run their nodes, mine both through the CLI's pool with
 # the CPU miner, and check merge mining + automatic sats settlement happened.
 #   HASHFUND=/path/hashfund BITCOIND=/path/bitcoind bash contrib/hashfun/cli_smoke.sh
 set -euo pipefail
@@ -52,13 +52,13 @@ for t in GRD STS; do hf node rpc $t createwallet w >/dev/null; done
 GA=$(hf node rpc GRD getnewaddress "" bech32); SA=$(hf node rpc STS getnewaddress "" bech32)
 
 # 1. mine GRD past graduation with the CLI pool + CPU miner
-hf mine GRD --payout "$GA" --listen 127.0.0.1:$(port) --difficulty 1e-6 --duration 6 > "$W/mine1.log" 2>&1
+hf mine GRD --payout "$GA" --btc-rpc "$BTC" --btc-cookie "$COOKIE" --btc-wallet w --btc-hrp bcrt --listen 127.0.0.1:$(port) --difficulty 1e-6 --duration 6 > "$W/mine1.log" 2>&1
 hf node ls GRD > "$W/ls1.json"
 echo "GRD: height $(j "d[0]['height']" < "$W/ls1.json") graduated $(j "d[0]['graduated']" < "$W/ls1.json")"
 [ "$(j "d[0]['graduated']" < "$W/ls1.json")" = "True" ]
 G0=$(hf node rpc GRD getblockcount)
 
-# 2. mine STS (sats leg): must merge-mine GRD and settle its own Bitcoin obligations
+# 2. mine STS: must merge-mine GRD and settle its own Bitcoin obligations
 ( for _ in $(seq 14); do sleep 1; b w generatetoaddress 1 "$BA" >/dev/null 2>&1 || true; done ) &
 hf mine STS --payout "$SA" --btc-rpc "$BTC" --btc-cookie "$COOKIE" --btc-wallet w --btc-hrp bcrt \
   --listen 127.0.0.1:$(port) --difficulty 1e-6 --duration 14 > "$W/mine2.log" 2>&1

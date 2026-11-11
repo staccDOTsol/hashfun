@@ -335,13 +335,18 @@ std::optional<LaunchDescriptor> ParseLaunchDescriptor(const std::string& json, s
             error = "btc_anchor_header: required with btc_anchor_height / btc_anchor_period_time";
             return std::nullopt;
         }
-        if (d.sats_num != 0) {
+        // Every launch has a sats leg: one kind of coin.
+        if (d.sats_num == 0) {
+            error = "sats_num: required (every launch has a sats leg)";
+            return std::nullopt;
+        }
+        {
             if (!has_anchor) {
-                error = "btc_anchor_header: required when sats_num > 0";
+                error = "btc_anchor_header: required";
                 return std::nullopt;
             }
             if (d.creator_btc_script.empty()) {
-                error = "creator_btc_script: required when sats_num > 0";
+                error = "creator_btc_script: required";
                 return std::nullopt;
             }
             if (d.sats_min_payment < 546) {

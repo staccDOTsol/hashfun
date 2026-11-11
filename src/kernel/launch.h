@@ -48,13 +48,13 @@ struct LaunchDescriptor {
     //! was made. It is hashed into the launch id, so no block of this chain can
     //! predate that Bitcoin block, and it is the checkpoint the in-chain
     //! Bitcoin header relay starts from. period_time is the timestamp of the
-    //! first block of the anchor's 2016-block difficulty period. All-zero = none.
+    //! first block of the anchor's 2016-block difficulty period. Mandatory.
     uint32_t btc_anchor_height{0};
     std::array<unsigned char, 80> btc_anchor_header{};
     uint32_t btc_anchor_period_time{0};
     //! Sats leg: a curve block owes (work * sats_num) >> sats_shift satoshis of
     //! real BTC, paid on Bitcoin to a drawn recipient (80% holders, 10% creator,
-    //! 10% dev) and proven here before settle_deadline blocks. 0 = hash only.
+    //! 10% dev) and proven here before settle_deadline blocks. Mandatory (> 0).
     uint64_t sats_num{0};
     uint32_t sats_shift{0};
     int64_t sats_min_payment{10000};

@@ -63,13 +63,10 @@ def launch(rng, easy=True, **kw):
         ftl=rng.choice([1, 300, 7200]), tail_reward=tail, tail_halving_interval=ihl if tail else rng.choice([0, ihl]),
         creator_script=script, creator_fee_bps=rng.choice([0, 1, 100, 1000]) if script else 0,
         test=rng.random() < 0.5,
-        **rng.choice([{}, {}, {"btc_anchor_height": rng.randrange(1, 2**32), "btc_anchor_period_time": rng.randrange(2**32),
-                               "btc_anchor_header": rng.randbytes(80)},
-                      {"btc_anchor_header": rng.randbytes(80), "sats_num": rng.randrange(1, 2**62),
-                       "sats_shift": rng.randrange(129), "sats_min_payment": rng.choice([546, 10_000, 10**8]),
-                       "settle_deadline": rng.choice([110, 720, 10**6]), "btc_confs": rng.choice([1, 6, 100]),
-                       "creator_btc_script": rng.randbytes(rng.choice([1, 22, 34, 80]))}]),
-        p2p_port=rng.choice([0, 0, 18444]), rpc_port=rng.choice([0, 0, 18445]),
+        btc_anchor_height=rng.choice([0, rng.randrange(1, 2**32)]), btc_anchor_period_time=rng.choice([0, rng.randrange(2**32)]),
+        btc_anchor_header=rng.randbytes(80), sats_num=rng.randrange(1, 2**62), sats_shift=rng.randrange(129),
+        sats_min_payment=rng.choice([546, 10_000, 10**8]), settle_deadline=rng.choice([110, 720, 10**6]),
+        btc_confs=rng.choice([1, 6, 100]), creator_btc_script=rng.randbytes(rng.choice([1, 22, 34, 80])),
     )
     base.update(kw)
     d = D.Launch(**base)
@@ -187,7 +184,8 @@ class DiffCpp(unittest.TestCase):
             {"btc_anchor_height": 5, "btc_anchor_header": "ab" * 80}, {"btc_anchor_header": "AB" * 80},
             {"btc_anchor_header": "ab" * 79}, {"btc_anchor_header": "ab" * 81}, {"btc_anchor_header": "zz" * 80},
             {"btc_anchor_header": " " + "ab" * 79 + "a"}, {"btc_anchor_header": 5}, {"btc_anchor_header": None},
-            {"btc_anchor_header": ""}, {"sats_num": 1}, {"sats_num": 1, "btc_anchor_header": "ab" * 80},
+            {"btc_anchor_header": ""}, {"sats_num": 0}, {"sats_num": DELETE}, {"creator_btc_script": DELETE},
+            {"btc_anchor_header": DELETE}, {"btc_anchor_header": "00" * 80},
             {**SATS}, {**SATS, "sats_num": 2**62}, {**SATS, "sats_num": 2**62 + 1}, {**SATS, "sats_shift": 128},
             {**SATS, "sats_shift": 129}, {**SATS, "sats_min_payment": 545}, {**SATS, "sats_min_payment": 546},
             {**SATS, "settle_deadline": 109}, {**SATS, "settle_deadline": 110}, {**SATS, "settle_deadline": 10**6 + 1},

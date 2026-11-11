@@ -31,19 +31,19 @@ All arithmetic is 256-bit integer. Validation bounds (`V0 <= 2^160`, `G <= 99.9%
 ```
 pip install .                                   # provides `hashfun`; HASHFUND=/path/to/hashfund or hashfund on PATH
 hashfun launch new --name "My Coin" --ticker MYC --creator-address myc1... -o myc.json \
-        [--btc-rpc URL --sats-total 0.7 --creator-btc-address bc1...]      # sats leg + Bitcoin anchor
+        --btc-rpc URL --sats-total 0.7 --creator-btc-address bc1...        # Bitcoin anchor + sats leg (required)
 hashfun node add myc.json && hashfun node up    # one hashfund per registered launch, state in ~/.hashfun
 hashfun node ls                                 # height, curve %, graduated, peers
-hashfun mine MYC --payout myc1... [--btc-rpc URL --btc-wallet NAME]   # pool + CPU miner (or --no-cpu for ASICs)
+hashfun mine MYC --payout myc1... --btc-rpc URL --btc-wallet NAME     # pool + CPU miner (or --no-cpu for ASICs)
 hashfun wallet yield | claim-yield              # BTC earned by holding, paid at your launch keys on Bitcoin
 hashfun wallet buy|sell ..., hashfun swap ..., hashfun electrum ..., hashfun board ...
 ```
 
-`hashfun mine` merge-mines every other registered launch that has graduated and, for a launch with a sats leg, runs the settler (relay Bitcoin headers, pay the drawn payee, publish the proof). `contrib/hashfun/cli_smoke.sh` drives all of this against real binaries.
+`hashfun mine` merge-mines every other registered launch that has graduated and runs the settler (relay Bitcoin headers, pay the drawn payee, publish the proof). `contrib/hashfun/cli_smoke.sh` drives all of this against real binaries.
 
-## Sats leg (optional per launch)
+## Sats leg
 
-With `sats_num > 0` a curve block owes real BTC on top of its hash: `owed = (work * sats_num) >> sats_shift`. No bridge and no reserve: the miner pays a drawn payee directly on Bitcoin and proves it on the launch chain.
+Every launch has one; there is a single kind of coin. A curve block owes real BTC on top of its hash: `owed = (work * sats_num) >> sats_shift` (`hashfun launch new --sats-total` sizes it as total BTC over the curve). No bridge and no reserve: the miner pays a drawn payee directly on Bitcoin and proves it on the launch chain.
 
 | Step | Rule |
 |---|---|

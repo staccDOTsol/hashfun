@@ -371,17 +371,19 @@ def validate(d: Launch):
     has_anchor = any(d.btc_anchor_header)
     if (d.btc_anchor_height or d.btc_anchor_period_time) and not has_anchor:
         raise DescriptorError("btc_anchor_header: required with btc_anchor_height / btc_anchor_period_time")
-    if d.sats_num:
-        if not has_anchor:
-            raise DescriptorError("btc_anchor_header: required when sats_num > 0")
-        if not d.creator_btc_script:
-            raise DescriptorError("creator_btc_script: required when sats_num > 0")
-        if d.sats_min_payment < 546:
-            raise DescriptorError("sats_min_payment: at least 546")
-        if d.settle_deadline < 110:
-            raise DescriptorError("settle_deadline: at least 110 blocks")
-        if d.btc_confs < 1:
-            raise DescriptorError("btc_confs: at least 1")
+    # Every launch has a sats leg: one kind of coin.
+    if not d.sats_num:
+        raise DescriptorError("sats_num: required (every launch has a sats leg)")
+    if not has_anchor:
+        raise DescriptorError("btc_anchor_header: required")
+    if not d.creator_btc_script:
+        raise DescriptorError("creator_btc_script: required")
+    if d.sats_min_payment < 546:
+        raise DescriptorError("sats_min_payment: at least 546")
+    if d.settle_deadline < 110:
+        raise DescriptorError("settle_deadline: at least 110 blocks")
+    if d.btc_confs < 1:
+        raise DescriptorError("btc_confs: at least 1")
     if d.version != 1:
         raise DescriptorError("unsupported descriptor version")
     try:
@@ -431,6 +433,13 @@ PUMP_RATIO_G = 7931
 PUMP_RATIO_T = 10730
 
 
+# Bitcoin regtest genesis header: the anchor of test launches.
+REGTEST_GENESIS_HEADER = bytes.fromhex(
+    "0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f"
+    "617fc81bc3888a51323a9fb8aa4b1e5e4adae5494dffff7f2002000000")
+TEST_BTC_SCRIPT = bytes.fromhex("0014" + "c1" * 20)  # creator payout of test launches (nobody's key)
+
+
 def set_sats_total(d: Launch, total_sats: int):
     """Size the sats leg so the whole curve owes ~total_sats of BTC (sum over blocks of
     (work * num) >> shift, with total work W_g). Picks the largest shift that keeps num precise."""
@@ -453,7 +462,8 @@ def btc_anchor_from_rpc(rpc, depth: int = 6):
 
 def make(name: str, ticker: str, creator_script: bytes, graduation_hashes: int, *, supply_coins=15_000_000,
          creator_fee_bps=100, target_spacing=5, lwma_window=90, ftl=None, test=False, tail_years=8,
-         pow_limit_bits=0x1E0FFFFF, genesis_time=None, hrp=None, btc_anchor=None) -> Launch:
+         pow_limit_bits=0x1E0FFFFF, genesis_time=None, hrp=None, btc_anchor=None, sats_total=None,
+         creator_btc_script=None, _validate=True) -> Launch:
     """Build a descriptor with pump.fun-proportioned curve and a tail that emits
     the rest of the supply over `tail_years` with 4 halvings-ish."""
     t0 = supply_coins * COIN
@@ -472,5 +482,13 @@ def make(name: str, ticker: str, creator_script: bytes, graduation_hashes: int, 
     if btc_anchor:  # (height, 80-byte header hex, period start time)
         d.btc_anchor_height, d.btc_anchor_header = int(btc_anchor[0]), bytes.fromhex(btc_anchor[1])
         d.btc_anchor_period_time = int(btc_anchor[2]) if len(btc_anchor) > 2 else 0
-    validate(d)
+    elif test:  # test launches follow a regtest Bitcoin: anchor at its genesis
+        d.btc_anchor_header = REGTEST_GENESIS_HEADER
+    d.creator_btc_script = creator_btc_script or (TEST_BTC_SCRIPT if test else b"")
+    if sats_total is not None:
+        set_sats_total(d, sats_total)
+    elif test:
+        d.sats_num, d.sats_shift = 5000, 0  # 10,000 sats per 2-hash block at the regtest floor
+    if _validate:
+        validate(d)
     return d

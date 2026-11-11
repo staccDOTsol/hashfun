@@ -97,7 +97,8 @@ def main(argv=None):
     if a.cmd == "new":
         hrp = a.hrp or a.ticker.lower()
         creator = address_to_script(a.creator_address, hrp)
-        d = D.make(a.name, a.ticker, creator, int(a.graduation_hashes), supply_coins=a.supply,
+        need_late = not a.test  # sats leg and anchor are filled in below, then validated
+        d = D.make(a.name, a.ticker, creator, int(a.graduation_hashes), supply_coins=a.supply, _validate=not need_late,
                    creator_fee_bps=a.fee_bps, target_spacing=a.spacing, lwma_window=a.window, test=a.test,
                    tail_years=a.tail_years, pow_limit_bits=int(a.pow_limit, 16), hrp=hrp,
                    btc_anchor=a.btc_anchor.split(":") if a.btc_anchor else None)
@@ -106,12 +107,15 @@ def main(argv=None):
             from .rpc import RPC
             h, hdr, period = D.btc_anchor_from_rpc(RPC(a.btc_rpc, cookie_file=a.btc_cookie))
             d.btc_anchor_height, d.btc_anchor_header, d.btc_anchor_period_time = h, bytes.fromhex(hdr), period
-        if a.sats_total:
-            if not a.creator_btc_address:
-                ap.error("--sats-total needs --creator-btc-address")
+        if a.creator_btc_address:
             d.creator_btc_script = address_to_script(a.creator_btc_address, a.btc_hrp)
+        if a.sats_total:
             D.set_sats_total(d, int(round(a.sats_total * D.COIN)))
-        D.validate(d)
+        try:
+            D.validate(d)
+        except D.DescriptorError as e:
+            ap.error(f"{e}. Every launch needs --sats-total, --creator-btc-address and a Bitcoin anchor "
+                     "(--btc-rpc or --btc-anchor); --test fills regtest defaults.")
         t0 = time.time()
         expected = 2**256 / (bits_to_target(d.pow_limit_bits) + 1)
         print(f"mining genesis (~{fmt_hashes(expected)} expected)...", file=sys.stderr)

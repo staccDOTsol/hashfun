@@ -7,8 +7,8 @@
   hashfun node rpc TICKER METHOD [ARGS ...]
   hashfun node down [TICKER ...]
   hashfun mine TICKER --payout ADDR start a pool for the launch and (optionally) a CPU miner on it;
-                                    merge-mines every other registered launch that has graduated and,
-                                    for launches with a sats leg, pays and proves the Bitcoin owed
+                                    merge-mines every other registered launch that has graduated and
+                                    pays and proves the Bitcoin each block owes (needs --btc-rpc)
   hashfun wallet ... | swap ... | pool ... | proxy ... | electrum ... | board ... | miner ...
                                     the individual tools (same arguments as hashfun-<tool>)
 
@@ -155,7 +155,7 @@ class Registry:
     def status(self, ticker: str) -> dict:
         d = self.desc(ticker)
         row = {"ticker": ticker, "id": d.id_hex[:16], "running": False, "rpcport": self.get(ticker)["rpcport"],
-               "sats_leg": bool(d.sats_num)}
+               }
         r = self.rpc(ticker, timeout=5)
         if not r:
             return row
@@ -199,8 +199,8 @@ def cmd_node(a, reg: Registry):
 def build_source(reg: Registry, ticker: str, payout: Optional[str], btc_rpc: Optional[str], btc_hrp: str,
                  max_pay_sats: Optional[int] = None, btc_cookie: Optional[str] = None, btc_wallet: Optional[str] = None):
     """LaunchSource for `ticker`, carrying every other registered, running launch as an aux chain
-    (only graduated ones are merge-mined; the pool re-checks each round) and a Settler if the
-    launch has a sats leg."""
+    (only graduated ones are merge-mined; the pool re-checks each round) and the Settler that pays
+    and proves the Bitcoin each curve block owes."""
     from .settler import Settler
     from .stratum import LaunchSource
     d = reg.desc(ticker)
@@ -223,16 +223,15 @@ def build_source(reg: Registry, ticker: str, payout: Optional[str], btc_rpc: Opt
             addr = None
         if addr:  # merge-mined rewards need somewhere to go on that chain
             children[other] = {"rpc": orpc, "hrp": od.hrp, "payout": addr}
-    settler = None
-    if d.sats_num:
-        if not btc_rpc:
-            sys.exit(f"{ticker} has a sats leg: pass --btc-rpc URL of a funded Bitcoin Core wallet "
-                     "(http://user:pass@host:port/wallet/<name>) to pay and prove the Bitcoin owed per block")
-        btc = RPC(btc_rpc, cookie_file=btc_cookie)
-        if btc_wallet:
-            btc = btc.wallet(btc_wallet)
-        settler = Settler(rpc, btc, os.path.join(os.path.dirname(reg.get(ticker)["descriptor"]), "settler.json"),
-                          max_pay_sats=max_pay_sats)
+    # Every curve block owes Bitcoin, so mining always needs a funded Bitcoin wallet.
+    if not btc_rpc:
+        sys.exit("pass --btc-rpc URL of a funded Bitcoin Core wallet (http://user:pass@host:port, plus "
+                 "--btc-wallet NAME): each block mined on the curve owes sats, paid and proven automatically")
+    btc = RPC(btc_rpc, cookie_file=btc_cookie)
+    if btc_wallet:
+        btc = btc.wallet(btc_wallet)
+    settler = Settler(rpc, btc, os.path.join(os.path.dirname(reg.get(ticker)["descriptor"]), "settler.json"),
+                      max_pay_sats=max_pay_sats)
     return LaunchSource(rpc, d.hrp, d.ticker, default_payout=payout, children=children, settler=settler,
                         yield_hrp=btc_hrp), children, settler
 
@@ -248,7 +247,7 @@ def cmd_mine(a, reg: Registry):
     host, port = a.listen.rsplit(":", 1)
     user = a.payout + (f",{a.btc_address}" if a.btc_address else "")
     print(json.dumps({"stratum": f"stratum+tcp://{host}:{port}", "user": user, "launch": a.ticker,
-                      "merge_mining_candidates": sorted(children), "sats_leg": bool(settler),
+                      "merge_mining_candidates": sorted(children),
                       "cpu_miner": not a.no_cpu}), flush=True)
 
     async def run():
@@ -295,7 +294,7 @@ def main(argv=None):
     p.add_argument("ticker")
     p.add_argument("--payout", required=True, help="launch address that receives the coinbase")
     p.add_argument("--btc-address", help="send this miner's BTC yield here instead of to its launch key")
-    p.add_argument("--btc-rpc", help="Bitcoin Core wallet RPC URL; required for launches with a sats leg")
+    p.add_argument("--btc-rpc", required=True, help="Bitcoin Core RPC URL of a funded wallet (pays the sats each block owes)")
     p.add_argument("--btc-cookie", help="Bitcoin Core .cookie file, if the URL has no user:pass")
     p.add_argument("--btc-wallet", help="Bitcoin Core wallet name")
     p.add_argument("--btc-hrp", default="bc")
