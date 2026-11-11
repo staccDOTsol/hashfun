@@ -29,7 +29,8 @@ All arithmetic is 256-bit integer. Validation bounds (`V0 <= 2^160`, `G <= 99.9%
 ## One command
 
 ```
-pip install .                                   # provides `hashfun`; HASHFUND=/path/to/hashfund or hashfund on PATH
+npm i -g hashfun                                # the CLI and the hashfund for this machine (macOS or Linux, Intel/AMD or ARM)
+hashfun doctor                                  # which hashfund this machine runs, proven by running it
 hashfun launch new --name "My Coin" --ticker MYC --creator-address myc1... -o myc.json \
         --btc-rpc URL --sats-total 0.7 --creator-btc-address bc1...        # Bitcoin anchor + sats leg (required)
 hashfun node add myc.json && hashfun node up    # one hashfund per registered launch, state in ~/.hashfun
@@ -37,9 +38,13 @@ hashfun node ls                                 # height, curve %, graduated, pe
 hashfun mine MYC --payout myc1... --btc-rpc URL --btc-wallet NAME     # pool + CPU miner (or --no-cpu for ASICs)
 hashfun wallet yield | claim-yield              # BTC earned by holding, paid at your launch keys on Bitcoin
 hashfun wallet buy|sell ..., hashfun swap ..., hashfun electrum ..., hashfun board ...
+hashfun web --btc-rpc URL                       # the site
+hashfun book ...                                # peer-to-peer offers and swaps without a browser tab
 ```
 
 `hashfun mine` merge-mines every other registered launch that has graduated and runs the settler (relay Bitcoin headers, pay the drawn payee, publish the proof). `contrib/hashfun/cli_smoke.sh` drives all of this against real binaries.
+
+In a source checkout the same CLI is `python3 -m hashfun.cli` (or `pip install -e .`). Which `hashfund` it runs: see Platforms and the node binary.
 
 ## Running more than one node
 
@@ -92,6 +97,33 @@ JSON. The launch id is `SHA256d` of a canonical binary serialization of every co
 
 `test: true` launches allow `setmocktime` and nonstandard txs.
 
+## Platforms and the node binary
+
+The npm package carries one `hashfund` per system and processor, and the CLI runs the one for the machine it is on.
+
+| Target | Machine | The binary |
+|---|---|---|
+| `linux-x64`, `linux-arm64` | Linux on Intel/AMD or ARM, any distribution (on Windows: WSL, which is Linux) | fully static against musl, built with zig's clang: one file, no library of the system is used |
+| `darwin-arm64`, `darwin-x64` | macOS 14 or newer, Apple silicon or Intel | built on a Mac with Apple's clang, local symbols stripped, ad hoc signed |
+
+How the CLI picks (`hashfund_choice` in `hashfun/cli.py`); the first that exists wins:
+
+| Order | Where | When it applies |
+|---|---|---|
+| 1 | `$HASHFUND` | an order, not a hint: if it is set and the file is missing the CLI stops, nothing else is tried |
+| 2 | `prebuilt/<target>/hashfund` beside the CLI | installed from npm |
+| 3 | `contrib/hashfun/npm/prebuilt/<target>/hashfund` | a source checkout where `dist/build.sh` has run |
+| 4 | `build/bin/hashfund` | a source checkout with a plain cmake build |
+| 5 | `hashfund` on `PATH` | anything else, for example `pip install .`, which installs the Python only |
+
+`<target>` is `sys.platform` plus `platform.machine()`. An Intel build of Python on Apple silicon runs translated and reports x86_64; the CLI asks `sysctl.proc_translated` and takes the ARM binary. A file that lost its executable bit in unpacking gets it back. With nothing found the CLI exits saying which way out applies: install the package, build one, or set `$HASHFUND`.
+
+`hashfun doctor` prints the choice and proves it by running it: target, Python (version, scrypt), node (only `hashfun book` needs it), the chosen `hashfund` and why, its `-version`, then a self-test (`--quick` skips it). The self-test writes a throwaway test launch into a temporary directory, starts the node on it, requires the node's genesis hash to be the one the descriptor commits to, mines 5 blocks, and holds every block's mint (the sum of its coinbase outputs) to `Launch.subsidy` in the CLI's own Python copy of the rules, block by block. It then reads `getmintobligation` for block 1 (on the curve, sats owed) and stops the node. A binary for another kind of machine, a node that cannot start and curve arithmetic that differs from the model all fail here, in seconds, before a real launch depends on that binary. Exit status 1 on any failure.
+
+Two machines can check that their nodes agree, which is what matters once the node comes from four compilers: `hashfun doctor --mine FILE` mines a short test chain (up the curve, through graduation, into the tail), holds every mint against the CLI's own rules, and writes the blocks down with what the node concluded from them: tip, UTXO set hash, curve state, and the sats owed and drawn for every block. `hashfun doctor --replay FILE` on another machine feeds those blocks to its own node and requires the same conclusions, naming the first difference. A changed block is rejected by the node itself; a changed conclusion is reported as a disagreement.
+
+Python: 3.10 or newer, built against OpenSSL (the wallet vault needs `hashlib.scrypt`). The `python3` that comes with macOS is 3.9 on LibreSSL, has no scrypt and does not qualify. The npm wrapper looks past it: `$HASHFUN_PYTHON`, `python3`, `python3.14` down to `python3.10`, Homebrew's two usual paths, `python`; the first one that is new enough and has scrypt runs the CLI. On a Mac: `brew install python`.
+
 ## Build the node
 
 ```
@@ -99,6 +131,26 @@ cmake -B build -DBUILD_TESTS=OFF -DBUILD_GUI=OFF -DENABLE_IPC=OFF -DBUILD_KERNEL
 cmake --build build -j$(nproc)
 # -> build/bin/hashfund, build/bin/hashfun-cli
 ```
+
+That is a developer build: this machine's compiler against this machine's libraries. It needs what this Bitcoin Core needs (`doc/dependencies.md`: Clang 19, GCC 12.1 or the Xcode command line tools 26.3); Boost headers and SQLite are the only outside libraries. The CLI finds `build/bin/hashfund` by itself.
+
+The binaries the package ships come from one script:
+
+```
+bash contrib/hashfun/dist/build.sh [target ...]     # default: this machine's own target; "all" for the four
+# -> contrib/hashfun/npm/prebuilt/<target>/hashfund, stripped; prints size and SHA256
+```
+
+| Piece | How |
+|---|---|
+| `TOOLCHAIN=zig` | zig's clang carries the C library and libc++ of every target: any target from any machine, no SDK, no cross packages (`pip install ziglang`, or a `zig` on `PATH`). Linux targets link statically against musl; the binary asks for 8 MiB thread stacks because musl's default is 128 KiB. The compiler wrappers the script writes do three things CMake and zig do not agree on by themselves: pass `-UNDEBUG` (zig defines `NDEBUG` when optimizing, and Bitcoin Core refuses to build without its assertions); turn `-march=armv8-a+crypto` and the like into clang's own feature flags (zig reads `-march=` as a processor name, and the probe for the ARM SHA-256 and CRC instructions would otherwise fail and leave the node hashing in plain C); and keep CMake from recording zig's cached runtime libraries as "implicit" link libraries (it would name a non position independent copy on the link line of a position independent executable). The link itself strips the binary |
+| `TOOLCHAIN=native` | this machine's own compiler, for this machine's own system. On a Mac that is Apple's clang with the deployment target `depends/hosts/darwin.mk` names (14.0), then `strip -x` and an ad hoc signature, verified (an ARM Mac runs nothing unsigned) |
+| Default | native for a macOS target on a Mac, zig for everything else. The script also accepts a macOS target through zig (from Linux, or on a Mac without Xcode); that combination has never been built |
+| SQLite | the version and SHA256 that Bitcoin Core's own `depends/packages/sqlite.mk` pins: fetched, hash checked, compiled with the options `depends` uses, linked statically |
+| Boost | headers only (1.74 or newer, taken from the machine; `BOOST_INCLUDE` if they are somewhere unusual), shown to CMake through a private prefix so that nothing else under the machine's include directory reaches a cross compiler |
+| Options | wallet on; GUI, IPC, ZMQ, external signer and the other executables off. `TESTS=1` also builds Bitcoin Core's unit tests (`test_bitcoin`) with the same toolchain; `JOBS=n` sets the parallelism |
+
+`contrib/hashfun/build_and_test.sh` is the first run on a machine of one's own, from the patch series (next to `make_repo.sh` and `patches/`) or inside the tree: it checks the tools and installs nothing (`--check` stops there), runs `dist/build.sh` for this machine, then `ci/test.sh unit diff doctor`, with `e2e` added when a stock bitcoind is on `PATH` or named by `$BITCOIND`.
 
 `hashfund` refuses to run without `-launch` (its auxpow code is not a valid Bitcoin node). Use stock Bitcoin Core for BTC. Default datadir `~/.hashfun`, config `hashfun.conf`.
 
@@ -126,11 +178,11 @@ Version rolling is refused by the pool (`mining.configure`): ASICs rolling bits 
 
 ## The site
 
-`hashfun web --btc-rpc URL [--maker maker.json] [--allow-launch] [--listen 127.0.0.1:8080]` serves the board, coin pages, the launch form and Bags for every launch registered on the machine. Source in `hashfun/web/src` (`npm install && npm run build` writes `hashfun/web/static/app.js`; the built file and the fonts are committed, so running the site needs no Node).
+`hashfun web --btc-rpc URL [--maker maker.json] [--allow-launch] [--listen 127.0.0.1:8080]` serves the board, coin pages, the launch form and Bags for every launch registered on the machine. Source in `hashfun/web/src` (`npm install && npm run build` writes `hashfun/web/static/app.js` and the headless engine `hashfun/web/maker.cjs`; both built files and the fonts are committed, so running the site needs no Node).
 
 | Piece | How it works |
 |---|---|
-| Keys | the page asks the wallet (UniSat: `requestAccounts`, `signMessage`) for one signature over a fixed message and derives its own key from it (`SHA256("hashfun-key-v1" \|\| signature)`), kept in the browser. That key holds launch coins (P2WPKH on every launch) and receives BTC yield (the same script on Bitcoin). The server never sees a key |
+| Keys | the page asks the wallet (UniSat: `requestAccounts`, `signMessage`) for one signature over a fixed message and derives its own key from it (`SHA256("hashfun-key-v1" \|\| signature)`), kept in the browser. That key holds launch coins (P2WPKH on every launch) and receives BTC yield (the same script on Bitcoin). The server never sees a key. What the page checks about the wallet before it asks for a payment: next section |
 | Buy | atomic swap in the page: quote, HTLC built and checked in the browser, BTC paid into it with `sendBitcoin`, the maker locks coins on the launch chain, the page audits that contract (script, amount, confirmations, timelocks) and claims with the secret. Swap state is saved before any money moves; Bags can resume or, after the timelock, refund |
 | Instant | `instant_max_sats` in the maker config: buys up to that size are filled on the unconfirmed Bitcoin lock. The maker carries the double-spend risk; larger buys wait for `btc_confs` |
 | Sell | the page locks coins on the launch chain (it signs the P2WPKH spend), the maker locks BTC, the page claims it to the wallet address after one Bitcoin confirmation |
@@ -141,6 +193,19 @@ Version rolling is refused by the pool (`mining.configure`): ASICs rolling bits 
 `hashfun/tests/test_web_js.py` holds the browser's Bitcoin code to the Python byte for byte (addresses, HTLC scripts, signed redeem, refund and P2WPKH transactions). `hashfun/tests/web_regtest.py` drives the real site in Chromium against real nodes, pool, settler and maker; only the wallet is a stand-in (a mock `window.unisat` backed by a regtest wallet).
 
 The maker quotes `hashes_per_coin x (hashprice + sats owed per hash) x (1 +/- spread)` and refuses a quote it cannot fill from its wallet. The node wallet treats curve coinbases that are not settled as immature, so they stay out of its balance and coin selection.
+
+## The wallet (UniSat)
+
+The page asks the wallet for three things: accounts, one signature (the page key), and payments. Every payment it requests (a buy from the house maker, a deposit to the page key, a taker's lock in the book) goes through one function, `pay` in `hashfun/web/src/app.js`, and that function checks the wallet first.
+
+| Check | When | Rule |
+|---|---|---|
+| Network | at connect, and again before every payment | `getChain().enum` must be the site's Bitcoin network (`BITCOIN_MAINNET`, `BITCOIN_TESTNET`, `BITCOIN_TESTNET4`, `BITCOIN_SIGNET`). If it is not, the page asks the wallet to switch (`switchChain`) and refuses when it does not. UniSat also runs Fractal, whose addresses look exactly like Bitcoin's: a payment from there would fund a swap contract on a chain this site never reads. An older extension without `getChain` is held to `getNetwork` (livenet or not). A regtest site checks nothing: no real wallet runs there |
+| Account | before every payment | `getAccounts()[0]` must still be the address the page connected with |
+| Address | at connect | the wallet's address must parse as an address of the site's network |
+| Change | any time | `accountsChanged` to another account, `networkChanged` or `chainChanged` reload the page: another account is another page key, and offers, swap records and spent outputs are stored per key, so one account never sees or moves another's swaps |
+
+All of this was written against the extension's published source (`unisat-wallet/wallet`: method names, return shapes, chain enums, events), not against a running extension; the tests drive a stand-in `window.unisat`, which `web_regtest` also sets to Fractal to see the page refuse it. One more thing read there: the default `signMessage` is deterministic ECDSA (RFC 6979), so the same account signing the same fixed message derives the same page key in any browser. The key cached in a browser's storage is a convenience, not the only copy.
 
 ## Pictures and metadata
 
@@ -159,11 +224,11 @@ A launch can carry a picture (PNG, JPEG, GIF or WebP, at most 64 KB), a descript
 
 ## The peer-to-peer book
 
-`hashfun/book.py` (server) and `hashfun/web/src/book.js` (browser): holders trade with each other, any pair of chains the site follows (Bitcoin and every launch; they run the same script engine, so the same HTLC works on all of them). The server is a bulletin board and a mailbox. Orders, takes and every later message are short texts signed with the traders' page keys; contracts are built, checked and funded in the two browsers.
+`hashfun/book.py` (the board) and `hashfun/web/src/book.js` (a trader's engine, in the page or under node): holders trade with each other, any pair of chains the site follows (Bitcoin and every launch; they run the same script engine, so the same HTLC works on all of them). The server is a bulletin board and a mailbox. Orders, takes and every later message are short texts signed with the traders' keys; contracts are built, checked and funded by the two traders' own engines: the page in a browser tab, or the same code under node (`hashfun book`, next section).
 
     maker   posts an order     give 1,000 CAT, want 50,000 sats (any pair, either direction)
     taker   takes part of it   picks a secret, sends its hash and the timelock of its own lock
-    maker   accepts            its page reserves that part of the order
+    maker   accepts            its engine reserves that part of the order
     taker   locks              HTLC on the chain the maker wants, to the maker's key, refund at T
     maker   locks              HTLC on the chain it gives, to the taker's key, refund at T - lock
     taker   claims             reveals the secret on the maker's chain
@@ -171,17 +236,63 @@ A launch can carry a picture (PNG, JPEG, GIF or WebP, at most 64 KB), a descript
 
 | Rule | Why |
 |---|---|
-| Both contracts are fully determined by the signed take (keys, hash, timelocks) | each page rebuilds the other side's contract itself and accepts only that exact script, amount and confirmation count |
+| Both contracts are fully determined by the signed take (keys, hash, timelocks) | each engine rebuilds the other side's contract itself and accepts only that exact script, amount and confirmation count |
 | Taker locks first | a maker is never out of pocket for an order nobody completes |
-| Only live, backed orders are listed | a maker must be online to lock its side: its page sends a signed heartbeat, and the board checks the coins behind an order at the maker's key on launch chains (Bitcoin behind a bid is not checked; the taker's page checks the actual lock) |
+| Only live, backed orders are listed, and only those can be taken | a maker must be online to lock its side: its engine sends a signed heartbeat, and it counts as live for 20 s after the last one. The board also checks what stands behind every order at the maker's key: spendable coins on a launch chain, confirmed sats on Bitcoin. The sats come from one UTXO-set scan for all bidders, on its own thread so that the board never waits for it: soon after a key the site has not seen posts a bid, otherwise at most every 5 minutes on a real network, and never less than a minute after the previous scan ended (a stream of bids from fresh keys cannot keep the Bitcoin node scanning). A new bid is accepted but neither listed nor takeable until a scan has seen its sats |
+| An offer cannot promise the same coins twice | the engine refuses to post unless the key's spendable balance covers this offer plus what is left of its other open offers from the same chain, and the board applies the same sum: an order is backed only while the balance covers all of that maker's open orders giving that chain |
+| The maker locks only for the exact lock the take defines, confirmed, with time to spare | a contract with another timelock, a short payment or a payment to another script is answered by locking nothing. The maker also declines when the taker's lock confirms so late that less than half of the maker's own lock would be left: the taker needs that time to claim |
 | The taker claims only while `MTP + margin < maker locktime` | a claim confirming after the maker's refund would hand the maker both sides |
-| Records before broadcasts | every swap lives in the browser's storage and is advanced one step at a time: a reload or a closed tab loses nothing, and a lock whose other side stopped is refunded by the page after its timelock |
+| Records before broadcasts | every swap is a stored record advanced one step at a time, written before the transaction it describes is broadcast: a reload or a closed tab loses nothing, and a lock whose other side stopped is refunded by the engine after its timelock. Records, offers and spent outputs are kept per key |
 | Chains are named `btc:<net>` or by launch id in everything signed | no replay on another network or against another coin with the same ticker |
-| One tab runs the engine (a Web Lock), ticking from a worker timer | two tabs answering the same take would lock twice; a hidden tab's own timers are slowed to one a minute by browsers, a worker's are not. The page warns before it is closed mid-swap |
+| One tab runs the engine (a Web Lock held for the tab's life), ticking every 2.5 s from a worker timer | two tabs answering the same take would lock twice; a second tab waits and takes over when the first closes. Browsers slow a hidden tab's own timers to as little as one a minute, which would take a maker off the board; a worker's timers are not slowed (the mechanism as browsers document it: no tab has been left hidden for hours under test). The page warns before it is closed while a lock of its own is out |
 
-Sats offered by a maker are paid from its page key on Bitcoin (deposit from the wallet first: a page cannot ask the wallet to sign unattended); a taker paying sats pays from the wallet. `hashfun web --book-confs N --book-lock SECONDS` set what the page proposes (default 6 confirmations on a launch chain, 1 on Bitcoin, 4 h for the maker's lock, twice that for the taker's). Each page enforces its own numbers. The house maker (`--maker`) is unchanged and remains the instant path for small buys.
+The numbers, as the code computes them (`lock` is `hashfun web --book-lock`, default 14400 s; confirmations are `--book-confs`, default 6):
 
-API: `GET /api/book[?maker=PUB]`, `POST /api/book/{order,cancel,alive,take}`, `GET|POST /api/book/fill/ID`.
+| What | Value |
+|---|---|
+| Maker's lock | `lock`: 4 h. The board accepts orders asking between 10 min and 24 h |
+| Taker's locktime | `max(now, MTP of the chain it pays on) + 2*lock + min(600, lock/2)`: 8 h 10 min from the take. The board refuses less than `now + 2*lock`; the maker's engine refuses anything outside `now + 2*lock` to `now + 3*lock + 600` |
+| Maker's locktime | the taker's minus `lock`: 4 h 10 min from the take |
+| Confirmations before the other side acts | 1 on a Bitcoin lock, 6 on a launch-chain lock |
+| The maker locks only if | `maker locktime - now >= lock/2` once the taker's lock has its confirmations: 2 h |
+| The taker claims only while | `MTP + margin < maker locktime`, with `margin = min(max(600 s, 6 blocks of that chain), lock/4)`: 10 min on a launch chain (blocks up to 100 s apart), 1 h on Bitcoin |
+| Refund | by the owner's engine once the chain's MTP is past the lock's own locktime (MTP runs about 6 blocks behind the clock) |
+| Handshake | a take the maker has not answered expires within 45 s. An accepted take must be locked within 120 s (300 s when the taker pays on Bitcoin); the maker frees the reservation 20 s after that |
+| Sizes | both sides of an order and of every take at least 2,000 base units, and a lock must be worth at least 4 times its own claim fee at the current feerate |
+| Pair guard | on a real network the engine refuses to post when `lock < 12 blocks of the chain it gives + 6 blocks of the chain it gets` (Bitcoin: 600 s a block): the taker may claim right up to the maker's timelock as that chain's MTP sees it, and the maker then still has to claim the other side |
+| Board limits | 50 open orders per maker; an order lives at most 7 days (the page posts for 24 h) |
+
+Sats offered by a maker are paid from its page key on Bitcoin (deposit from the wallet first: a page cannot ask the wallet to sign unattended); a taker paying sats in the page pays from the wallet, through the checks in The wallet (UniSat). The site proposes the numbers; each engine enforces its own. The house maker (`--maker`) is unchanged and remains the instant path for small buys.
+
+API: `GET /api/book[?maker=PUB]` (with `maker`: that maker's own open orders, each with `backed`), `POST /api/book/{order,cancel,alive,take}`, `GET|POST /api/book/fill/ID`.
+
+## Without a browser tab: `hashfun book`
+
+The same engine hosted by node instead of a tab. `hashfun/web/src/maker.mjs` wraps `book.js` with a key in a file where the page has a wallet, a JSON file where the page has the browser's storage, and a loop where the page has a tab that must stay open. It talks to a hashfun site over HTTP exactly as the page does, so it needs no chain node of its own and works against anyone's site. It ships bundled as `hashfun/web/maker.cjs` (committed like the site's bundle; `test_web_js` fails when either is stale) and needs node 18 or newer; from npm the wrapper runs it directly, from a checkout `python3 -m hashfun.cli book` hands over to node.
+
+```
+hashfun book key                          # first run: create the key; prints where to send coins and sats
+hashfun book balances
+hashfun book post --give CAT --get btc --give-amount 1000 --get-amount 50000 [--hours 24]
+hashfun book offers | cancel ID | swaps
+hashfun book take ID [--pay AMOUNT]       # take someone's offer, paying from the key
+hashfun book run                          # keep offers live: answer takes, lock, claim, refund
+    --site URL             the hashfun site (default http://127.0.0.1:8080, or $HASHFUN_SITE)
+    --dir DIR              the key and the swap records (default ~/.hashfun/book, or $HASHFUN_BOOK_DIR)
+    --btc-payout ADDRESS   sats claimed or refunded go there instead of staying at the key
+```
+
+Amounts are sats for Bitcoin and whole coins (decimals allowed) for launch coins.
+
+| Piece | How it works |
+|---|---|
+| Key | `key.json` in the directory, mode 600: a fresh random key (no wallet is involved), encrypted under a password (`$HASHFUN_BOOK_PASSWORD`, or asked for on the terminal) with the wallet file's construction: scrypt (N=2^15, r=8, p=1) into ChaCha20-Poly1305. `--no-encrypt` on first use stores it in the clear. That file is the only copy of the key |
+| Funds | `key` prints the key's address on Bitcoin and on every launch the site follows. Everything the key holds is in play: the engine funds its locks from whatever is there, so fund it with what is meant to be traded |
+| Offers | `post` signs and posts. An offer is listed only while `run` is up (the heartbeat), and a bid only once the site has seen its sats; `offers` marks one the site has not seen coins behind |
+| `run` | one engine per key directory: `run.lock` holds the process id and the command (`run` or `take`), and a lock left by a dead process is taken over. About every 2.5 s it beats, answers takes on its offers and moves every swap one step: lock, claim, or refund once a timelock has passed. On Ctrl-C it first finishes any swap that has a lock out; a second Ctrl-C leaves anyway |
+| `take` | the id may be a prefix. It pays what is left of the offer, or `--pay`, from the key, and stays until the swap is over: exit status 0 when done, 2 when it failed or was refunded |
+| Restarts | the records live in `state.json`, written (temporary file, then rename) before the transaction they describe is broadcast. `run` picks every unfinished swap up where it stopped: a lock that was signed is broadcast again, a locked swap is claimed when the secret appears or refunded after its timelock, a take interrupted before anything was locked is dropped. Nothing is claimed or refunded while `run` is down: a maker whose lock has been claimed must be running again before the taker's own timelock, about `lock` (4 h) after that claim at the earliest, or the taker can take its payment back as well |
+| Several commands, one directory | `state.json` is shared by every command run on the directory, also at the same time. A read goes to the file; a write takes a lock file, reads again and changes only what that command itself changed since it last read, so an offer posted or cancelled while `run` is up is seen by the running process at its next beat and nothing is written over. Driving swaps is exclusive: `run` and `take` both hold `run.lock`, and a second one on the same directory stops with "this key is busy" (two engines would lock coins for the same swap twice). To make and take at once, give the taker its own key directory |
 
 ## Wallet file
 
@@ -189,7 +300,24 @@ API: `GET /api/book[?maker=PUB]`, `POST /api/book/{order,cancel,alive,take}`, `G
 
 ## npm
 
-`contrib/hashfun/npm` is the `hashfun` npm package: a small Node wrapper that runs the Python CLI shipped inside it (Python >= 3.10, standard library only). `cd contrib/hashfun/npm && npm pack` (or `npm publish`) copies the package and the built site in first. The node binary stays separate (`HASHFUND=/path/to/hashfund`).
+`contrib/hashfun/npm` is the `hashfun` npm package: a Node wrapper (`bin/hashfun.js`), the Python CLI (standard library only) with the built site and the bundled swap engine under `py/`, and the four node binaries under `prebuilt/<target>/`. The wrapper finds a usable Python and runs the CLI on it; `hashfun book` it runs itself, under node. `os` and `cpu` in `package.json` make npm refuse the install anywhere but macOS and Linux on x64 or arm64.
+
+`cd contrib/hashfun/npm && npm pack` first runs `scripts/copy-py.js`, which copies the Python package, the site and the engine in and refuses to pack unless all four binaries are there (a package without one does not work on that platform) and each file's own header says it is what its directory claims: the right system and processor, and for Linux statically linked. `HASHFUN_PACK_PARTIAL=1 npm pack` packs whatever `dist/build.sh` has built on this machine, for this machine; such a tarball is never for publishing.
+
+## CI and releases
+
+`.github/workflows/hashfun.yml` runs on a push to `hashfun`, `main` or `master`, on a `v*` tag, and by hand. It only calls scripts that also run on a developer's machine.
+
+| Job | Where | What |
+|---|---|---|
+| `build` | one runner per target: `ubuntu-24.04`, `ubuntu-24.04-arm`, `macos-15`, `macos-15-intel` | `ci/setup.sh`, then `dist/build.sh <target>` (zig on the Linux runners, Apple's clang on the macOS ones), then the whole regression (`ci/test.sh`) against that exact file. The binary, the logs and the short chain the regression's doctor step mined with it are kept; compiler caches (zig's own, ccache) shorten every run after the first |
+| `pack` | Linux | collects the four binaries, rebuilds the site bundle and the swap engine and requires both to equal the committed ones, runs `npm pack` (which refuses an incomplete set) and writes `SHA256SUMS` |
+| `install` | the same four runners | `ci/setup.sh --minimal` (a Python and the pinned bitcoind, nothing to build with), then `npm i -g` the tarball. `hashfun doctor` must show that the CLI took the packaged binary of that platform by itself, and pass its self-test; then that node replays the chains all four build jobs mined (`hashfun doctor --replay`) and must agree with each on every block, the UTXO set, the curve state and the sats owed; then `cli_smoke.sh` runs through the installed command |
+| `release` | Linux, only for a tag | the tag must be `v` plus the package's version. A GitHub release gets the tarball, the four binaries and their SHA256 sums. `npm publish` follows only if the repository has a secret named `NPM_TOKEN` (`gh secret set NPM_TOKEN < file-with-the-token`); without one the job ends at the release page. Both steps can be run again |
+
+Run by hand with `core_tests` on, the build jobs also build and run Bitcoin Core's own unit tests with the shipping toolchain. On a private repository the macOS jobs are most of the bill (a macOS minute counts as about ten Linux minutes); on a public one the runners are free.
+
+What has never run: this workflow (it needs a repository), anything on macOS (the native build, the macOS binaries, the suites on a Mac), and Bitcoin Core's own unit tests on this fork.
 
 ## Swaps
 
@@ -201,18 +329,46 @@ Taker rules (wallet): reveals the secret only after `N` confirmations on the mak
 
 ## Tests
 
+The regression is one command:
+
+```
+bash contrib/hashfun/ci/test.sh [--hashfund PATH] [--bitcoind PATH] [--logs DIR] [suite ...]
+```
+
+One line per suite on the terminal (PASS or FAIL, seconds, the suite's own last line), one log per suite (`build/test-logs/` unless `--logs`), exit status nonzero if any suite failed. `hashfund` is `--hashfund`, else `$HASHFUND`, else the one the CLI itself picks on this machine; `bitcoind` (a stock Bitcoin Core, for the Bitcoin side) is `--bitcoind`, else `$BITCOIND`, else the one on `PATH`. A suite whose tools are missing is skipped and says why; with `CI` set a skip counts as a failure.
+
+| Suite | What it runs | Needs |
+|---|---|---|
+| `unit` | `test_core`, `test_stack`, `test_book`, `test_cli` | Python |
+| `diff` | builds the differential driver and runs `test_diff_cpp`. When `dist/build.sh` has left its compiler in `build/dist/tc`, the driver is compiled with that one, so the arithmetic under test is the shipped binary's (`CXX` overrides) | a C++ compiler |
+| `web_js` | `test_web_js` | node, npm |
+| `doctor` | `hashfun doctor` on the binary under test; it also mines the short chain for the cross-machine check into the log directory (`chain-<target>.json`) | the binary |
+| `core` | Bitcoin Core's own unit tests, one process per test suite, in parallel | a `TESTS=1` build; passed over, not failed, without one |
+| `e2e`, `fleet` | `e2e_regtest`, `fleet_regtest` | bitcoind |
+| `book` | `book_regtest` | bitcoind, node |
+| `web` | `web_regtest`, screenshots into the log directory | bitcoind, Python's playwright with its chromium |
+| `smoke` | `contrib/hashfun/cli_smoke.sh` | bitcoind |
+
+`contrib/hashfun/ci/setup.sh` prepares a CI or throwaway machine for all of it (it installs system packages): build tools and Boost headers, a virtualenv with zig and playwright, the site's npm packages, and the official `bitcoind` of Bitcoin Core 32.1, pinned by the hash bitcoincore.org publishes for it.
+
+The suites one by one:
+
 ```
 python -m unittest hashfun.tests.test_core      # vectors (BIP32/39/143/173), curve, LWMA, descriptor, HTLC, AuxPoW
 python -m unittest hashfun.tests.test_stack     # pool+miner, merged mining gate, proxy split, electrum+wallet+reorg, swaps buy/sell/refund (simulator)
-python -m unittest hashfun.tests.test_book      # launch metadata; the peer-to-peer book's server side (signatures, reservations, expiry)
+python -m unittest hashfun.tests.test_book      # launch metadata; the peer-to-peer book's server side (signatures, reservations, backing, expiry)
+python -m unittest hashfun.tests.test_cli       # which node binary the CLI runs on which machine (the npm layout with stand-in binaries, $HASHFUND, the translated-Python case)
 bash contrib/hashfun/difftest/build.sh build/hfdiff && HFDIFF=build/hfdiff python -m unittest hashfun.tests.test_diff_cpp
 python -m hashfun.tests.e2e_regtest --hashfund build/bin/hashfund --bitcoind /path/to/stock/bitcoind
 python -m hashfun.tests.fleet_regtest --hashfund build/bin/hashfund --bitcoind /path/to/stock/bitcoind   # ~4.5 min, real time
-python -m unittest hashfun.tests.test_web_js    # browser code vs Python, bundle is current, lint (needs node; cd hashfun/web && npm install)
+python -m unittest hashfun.tests.test_web_js    # browser code vs Python, the site bundle and the swap engine bundle are current, lint (needs node; cd hashfun/web && npm install)
 python -m hashfun.tests.web_regtest --hashfund build/bin/hashfund --bitcoind /path/to/stock/bitcoind     # ~9 min, two browsers, needs playwright
+python -m hashfun.tests.book_regtest --hashfund build/bin/hashfund --bitcoind /path/to/stock/bitcoind    # the swap engine on its shipped timelocks, clock moved by the test; needs node
 ```
 
 `test_stack` runs against an in-process simulator whose consensus is the Python model, not the C++ node. `test_diff_cpp` compiles the node's own consensus sources (descriptor parser and identity, `CLaunchParams` + genesis, curve, LWMA, tail) without the rest of the node, in ~20 s, and compares them value by value with the Python model on random descriptors and adversarial header sequences (zero, negative and >6T solvetimes, off-schedule nBits, graduation crossings); it also requires both parsers to accept and reject exactly the same descriptor JSON. `e2e_regtest` covers what needs a running node: block acceptance (creator output, excess coinbase, nBits), the auxpow gate, GBT, merged mining against stock bitcoind and a swap over real nodes. With `--workdir` its phases can run in separate processes (`--phases 1-6`, `7-8`, `9`). `fleet_regtest` is the multi-node test: production-mode launches, P2P on localhost, real time; gating, state agreement (tip, UTXO set, Bitcoin relay, every obligation) across nodes, late joiner, restarts, partitions and reorgs in both directions including a forged Bitcoin header branch, two competing pools, AuxPoW blocks over P2P, the settlement lock in the mempool, transaction relay, `verifychain`, stall relief against the wall clock.
+
+`book_regtest` is the timelock test. `web_regtest` runs the swap engine in browsers on locks of 40 s to 4 min because it cannot wait hours; here the same engine (`book.js`, hosted by node through `tests/enginehost.mjs`) runs on the shipped numbers against a stock bitcoind and a hashfund test launch, with one clock for both nodes, the board and both traders, moved by the test. Every transaction goes through the nodes, so a refund tried before its timelock is refused by consensus, not by the engine. H1 drives `hashfun book` itself on the real clock (encrypted key file, post, run, take). S1 and S6 are the two directions done honestly: both contracts must carry exactly the timelocks and confirmation counts of the table in The peer-to-peer book. S2 to S5 are the stops (maker gone after the taker locked, taker gone after the maker locked, taker arriving too close to the maker's refund, taker's lock confirming too late): each lock goes back to its owner when its timelock says and not before, and nobody is out more than fees. S7 and S8 are dishonest counterparties: a taker's contract with a shorter timelock, an underfunded lock, a lock on another script; a maker's contract that refunds early or is short. The honest engine locks for none of the first, claims none of the second, and takes its own lock back.
 
 ## Files changed in the node
 
