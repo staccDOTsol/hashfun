@@ -427,13 +427,17 @@ class E2E:
         check("7 presale launch got no aux blocks", n2.rpc.getblockcount() == h_pre)
 
     def p8(self):
-        n2, d2 = self.n2, self.d2
+        n1, n2, d1, d2 = self.n1, self.n2, self.d1, self.d2
+        n1.rpc.setmocktime(0)
         n2.rpc.setmocktime(0)
-        h_pre = n2.rpc.getblockcount()
+        h_pre, h_grad = n2.rpc.getblockcount(), n1.rpc.getblockcount()
         port = free_port()
         addr2 = self.w2.getnewaddress("", "bech32")
-        asyncio.run_coroutine_threadsafe(StratumServer(LaunchSource(n2.rpc, d2.hrp, d2.ticker), "127.0.0.1", port,
-                                                       difficulty=1e-6, poll_interval=0.2).serve(), self.loop)
+        # PRE's own (presale) pool also carries GRAD: presale hash secures graduated launches.
+        src = LaunchSource(n2.rpc, d2.hrp, d2.ticker,
+                           children={"GRAD": {"rpc": n1.rpc, "hrp": d1.hrp, "payout": self.addr1}})
+        asyncio.run_coroutine_threadsafe(StratumServer(src, "127.0.0.1", port, difficulty=1e-6,
+                                                       poll_interval=0.2).serve(), self.loop)
         time.sleep(1)
         m = StratumMiner("127.0.0.1", port, addr2, batch=4096)
         t0 = time.time()
@@ -441,6 +445,16 @@ class E2E:
             asyncio.run_coroutine_threadsafe(m.run(duration=3), self.loop).result(60)
         check("8 pool-mined blocks accepted on presale launch", n2.rpc.getblockcount() >= h_pre + 3,
               f"+{n2.rpc.getblockcount() - h_pre}")
+        via_pre = 0
+        for h in range(h_grad + 1, n1.rpc.getblockcount() + 1):
+            blk = n1.rpc.getblock(n1.rpc.getblockhash(h), 1)
+            parent = (blk.get("auxpow") or {}).get("parentblock")
+            if parent:
+                version = parent["version"] if isinstance(parent, dict) else \
+                    int.from_bytes(bytes.fromhex(parent)[:4], "little", signed=True)
+                via_pre += version >> 16 == d2.chain_id
+        print(f"   GRAD +{n1.rpc.getblockcount() - h_grad}, {via_pre} with a PRE header as AuxPoW parent", flush=True)
+        check("8 presale blocks accepted as AuxPoW parents by a graduated launch", via_pre >= 1, f"{via_pre}")
 
     def p9(self):
         btc, n1, d1, wb, w1 = self.btc, self.n1, self.d1, self.wb, self.w1

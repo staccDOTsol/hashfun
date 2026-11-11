@@ -124,9 +124,76 @@ def _gbt_txs(tmpl):
     return [bytes.fromhex(t["txid"])[::-1] for t in tmpl["transactions"]], [t["data"] for t in tmpl["transactions"]]
 
 
+class AuxSet:
+    """Graduated launches merge-mined on top of whatever parent a source is mining.
+
+    The parent only has to be a SHA256d header whose coinbase carries the commitment and whose
+    chain id differs from the child's, so it can be a BTC block (MergedSource) or a presale
+    block of another launch (LaunchSource): hash paid for one launch's curve secures every
+    graduated launch for free."""
+
+    def __init__(self, children: Optional[Dict[str, dict]] = None):
+        """children: ticker -> {"rpc": RPC, "hrp": str, "payout": address}"""
+        self.children = children or {}
+        self.aux: Dict[str, dict] = {}
+
+    async def collect(self) -> bool:
+        """Fetch aux work from every graduated child. True if the set changed."""
+        aux = {}
+        for ticker, c in self.children.items():
+            try:
+                info = await asyncio.to_thread(c["rpc"].getlaunchinfo)
+                if info["graduated"]:
+                    aux[ticker] = await asyncio.to_thread(c["rpc"].createauxblock, c["payout"])
+            except Exception as e:  # a child node being down must not stop the parent
+                log.debug("[%s] no aux block: %s", ticker, e)
+        changed = {k: v["hash"] for k, v in aux.items()} != {k: v["hash"] for k, v in self.aux.items()}
+        self.aux = aux
+        return changed
+
+    def commit(self) -> (bytes, dict):
+        """(scriptSig commitment push, job ctx entries) for the current aux set."""
+        if not self.aux:
+            return b"", {"tree": None, "chain_map": {}, "aux": {}}
+        leaves, chain_map = {}, {}
+        for ticker, ab in self.aux.items():
+            leaves[ab["chainid"]] = bytes.fromhex(ab["hash"])[::-1]
+            chain_map[ab["chainid"]] = ticker
+        tree = AuxTree(leaves)
+        return tree.commitment_push(), {"tree": tree, "chain_map": chain_map,
+                                        "aux": {k: dict(v) for k, v in self.aux.items()}}
+
+    async def submit(self, job, header: bytes, coinbase: bytes, hash_int: int) -> List[dict]:
+        events = []
+        tree = job.ctx.get("tree")
+        if not tree:
+            return events
+        cbtx = witness_coinbase(coinbase, job.has_commitment)
+        for cid, ticker in job.ctx["chain_map"].items():
+            ab = job.ctx["aux"][ticker]
+            if hash_int > bits_to_target(int(ab["bits"], 16)):
+                continue
+            chain_branch, idx = tree.branch(cid)
+            apow = serialize_auxpow(cbtx, job.branch, chain_branch, idx, header)
+            ok, why = check_auxpow(bytes.fromhex(ab["hash"])[::-1], cid, apow)
+            if not ok:
+                log.error("[%s] local auxpow check failed: %s", ticker, why)
+                continue
+            try:
+                res = await asyncio.to_thread(self.children[ticker]["rpc"].submitauxblock, ab["hash"], apow.hex())
+            except RPCError as e:
+                res = str(e)
+            ev = {"chain": ticker, "kind": "auxblock", "height": ab["height"], "hash": ab["hash"], "result": res}
+            events.append(ev)
+            log.info("[%s] merge-mined block %s at %d: %s", ticker, ab["hash"], ab["height"], res)
+        return events
+
+
 class LaunchSource(JobSource):
-    def __init__(self, rpc: RPC, hrp: str, ticker: str, default_payout: str = None):
+    def __init__(self, rpc: RPC, hrp: str, ticker: str, default_payout: str = None,
+                 children: Optional[Dict[str, dict]] = None):
         super().__init__()
+        self.auxset = AuxSet({k: v for k, v in (children or {}).items() if k != ticker})
         self.rpc, self.hrp, self.ticker = rpc, hrp, ticker
         self.name = ticker
         self.default_payout = default_payout
@@ -140,6 +207,9 @@ class LaunchSource(JobSource):
     async def refresh(self) -> bool:
         best = await asyncio.to_thread(self.rpc.getbestblockhash)
         now = time.time()
+        aux_changed = await self.auxset.collect()
+        if aux_changed:
+            self.last_full = self.last_push = 0
         # nBits depends on the template's own time (stall relief doubles the target every 6T
         # without a block), so an unchanged tip still needs a fresh template every few seconds.
         if best == self.prev and now - self.last_full < self.refresh_secs:
@@ -150,7 +220,7 @@ class LaunchSource(JobSource):
                 and now - self.last_push < 30):
             return False  # same job, nothing to push
         self.last_push = now
-        if tmpl["previousblockhash"] != self.prev:
+        if tmpl["previousblockhash"] != self.prev or aux_changed:
             self.version_tag += 1
         self.prev = tmpl["previousblockhash"]
         self.tmpl = tmpl
@@ -174,15 +244,21 @@ class LaunchSource(JobSource):
         has_commit = "default_witness_commitment" in t
         if has_commit:
             outs.append(TxOut(0, bytes.fromhex(t["default_witness_commitment"])))
-        c1, c2 = coinbase_parts(t["height"], outs)
+        extra, auxctx = self.auxset.commit()
+        c1, c2 = coinbase_parts(t["height"], outs, extra=extra)
         txids, datas = _gbt_txs(t)
         return Job(job_id, self, bytes.fromhex(t["previousblockhash"])[::-1], c1, c2,
                    merkle_branch_for_first([b"\0" * 32] + txids), t["version"], int(t["bits"], 16), t["curtime"],
-                   t["height"], datas, has_commit, clean, {"target": int(t["target"], 16), "fixed_ntime": True})
+                   t["height"], datas, has_commit, clean,
+                   {"target": int(t["target"], 16), "fixed_ntime": True, **auxctx})
 
     async def on_solution(self, job, header, coinbase, hash_int):
+        aux_events = await self.auxset.submit(job, header, coinbase, hash_int)
+        self.blocks_found.extend(aux_events)
+        if aux_events:
+            self.last_full = 0
         if hash_int > job.ctx["target"]:
-            return []
+            return aux_events
         res = await asyncio.to_thread(self.rpc.submitblock, job.block_hex(header, coinbase))
         h = sha256d(header)[::-1].hex()
         ev = {"chain": self.ticker, "kind": "block", "height": job.height, "hash": h, "result": res}
@@ -199,33 +275,25 @@ class MergedSource(JobSource):
         """children: ticker -> {"rpc": RPC, "hrp": str, "payout": address}"""
         super().__init__()
         self.name = "BTC+aux"
-        self.parent, self.parent_hrp, self.children = parent, parent_hrp, children
+        self.parent, self.parent_hrp = parent, parent_hrp
+        self.auxset = AuxSet(children)
         self.default_payout = default_payout
         self.tmpl = None
         self.prev = None
-        self.aux: Dict[str, dict] = {}
         self.last_full = 0
         self.blocks_found = []
 
-    async def _child_aux(self, ticker, c, addr):
-        try:
-            info = await asyncio.to_thread(c["rpc"].getlaunchinfo)
-            if not info["graduated"]:
-                return None
-            ab = await asyncio.to_thread(c["rpc"].createauxblock, addr)
-            return ab
-        except RPCError as e:
-            log.debug("[%s] no aux block: %s", ticker, e)
-            return None
+    @property
+    def children(self):
+        return self.auxset.children
+
+    @property
+    def aux(self):
+        return self.auxset.aux
 
     async def refresh(self) -> bool:
         best = await asyncio.to_thread(self.parent.getbestblockhash)
-        aux = {}
-        for ticker, c in self.children.items():
-            ab = await self._child_aux(ticker, c, c["payout"])
-            if ab:
-                aux[ticker] = ab
-        aux_changed = {k: v["hash"] for k, v in aux.items()} != {k: v["hash"] for k, v in self.aux.items()}
+        aux_changed = await self.auxset.collect()
         now = time.time()
         if best == self.prev and not aux_changed and now - self.last_full < 30:
             return False
@@ -234,7 +302,7 @@ class MergedSource(JobSource):
         if tmpl["previousblockhash"] != self.prev or aux_changed:
             self.version_tag += 1
         self.prev = tmpl["previousblockhash"]
-        self.tmpl, self.aux = tmpl, aux
+        self.tmpl = tmpl
         self.template_tag += 1
         return True
 
@@ -250,55 +318,22 @@ class MergedSource(JobSource):
         has_commit = "default_witness_commitment" in t
         if has_commit:
             outs.append(TxOut(0, bytes.fromhex(t["default_witness_commitment"])))
-        extra, tree, chain_map = b"", None, {}
-        if self.aux:
-            leaves = {}
-            for ticker, ab in self.aux.items():
-                leaves[ab["chainid"]] = bytes.fromhex(ab["hash"])[::-1]
-                chain_map[ab["chainid"]] = ticker
-            tree = AuxTree(leaves)
-            extra = tree.commitment_push()
+        extra, auxctx = self.auxset.commit()
         c1, c2 = coinbase_parts(t["height"], outs, extra=extra)
         txids, datas = _gbt_txs(t)
-        all_txids = [b"\0" * 32] + txids
         return Job(job_id, self, bytes.fromhex(t["previousblockhash"])[::-1], c1, c2,
-                   merkle_branch_for_first(all_txids), t["version"], int(t["bits"], 16), t["curtime"], t["height"],
-                   datas, has_commit, clean,
-                   {"target": int(t["target"], 16), "tree": tree, "chain_map": chain_map,
-                    "aux": {k: dict(v) for k, v in self.aux.items()}})
+                   merkle_branch_for_first([b"\0" * 32] + txids), t["version"], int(t["bits"], 16), t["curtime"],
+                   t["height"], datas, has_commit, clean, {"target": int(t["target"], 16), **auxctx})
 
     async def on_solution(self, job, header, coinbase, hash_int):
-        events = []
-        tree: AuxTree = job.ctx["tree"]
-        if tree:
-            cbtx = witness_coinbase(coinbase, job.has_commitment)
-            cb_branch = job.branch  # branch of the coinbase in the parent block
-            for cid, ticker in job.ctx["chain_map"].items():
-                ab = job.ctx["aux"][ticker]
-                child_target = bits_to_target(int(ab["bits"], 16))
-                if hash_int > child_target:
-                    continue
-                chain_branch, idx = tree.branch(cid)
-                apow = serialize_auxpow(cbtx, cb_branch, chain_branch, idx, header)
-                ok, why = check_auxpow(bytes.fromhex(ab["hash"])[::-1], cid, apow)
-                if not ok:
-                    log.error("[%s] local auxpow check failed: %s", ticker, why)
-                    continue
-                try:
-                    res = await asyncio.to_thread(self.children[ticker]["rpc"].submitauxblock, ab["hash"], apow.hex())
-                except RPCError as e:
-                    res = str(e)
-                ev = {"chain": ticker, "kind": "auxblock", "height": ab["height"], "hash": ab["hash"], "result": res}
-                self.blocks_found.append(ev)
-                events.append(ev)
-                log.info("[%s] merge-mined block %s at %d: %s", ticker, ab["hash"], ab["height"], res)
+        events = await self.auxset.submit(job, header, coinbase, hash_int)
         if hash_int <= job.ctx["target"]:
             res = await asyncio.to_thread(self.parent.submitblock, job.block_hex(header, coinbase))
             h = sha256d(header)[::-1].hex()
             ev = {"chain": "BTC", "kind": "block", "height": job.height, "hash": h, "result": res}
-            self.blocks_found.append(ev)
             events.append(ev)
             log.info("[BTC] parent block %s at %d: %s", h, job.height, res or "accepted")
+        self.blocks_found.extend(events)
         if events:
             self.last_full = 0
         return events

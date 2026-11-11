@@ -28,7 +28,10 @@ def main(argv=None):
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO, format="%(asctime)s %(name)s %(message)s")
     if cfg["mode"] == "launch":
         l = cfg["launch"]
-        src = LaunchSource(RPC(l["rpc"]), l["hrp"], l["ticker"], l.get("default_payout"))
+        # Optional "children": graduated launches to merge-mine on top of this launch's blocks.
+        children = {t: {"rpc": RPC(c["rpc"]), "hrp": c["hrp"], "payout": c["payout"]}
+                    for t, c in cfg.get("children", {}).items()}
+        src = LaunchSource(RPC(l["rpc"]), l["hrp"], l["ticker"], l.get("default_payout"), children=children)
     elif cfg["mode"] == "merged":
         p = cfg["parent"]
         children = {t: {"rpc": RPC(c["rpc"]), "hrp": c["hrp"], "payout": c["payout"]} for t, c in cfg["children"].items()}

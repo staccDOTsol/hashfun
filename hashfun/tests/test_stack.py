@@ -140,6 +140,43 @@ class PoolTests(unittest.TestCase):
         curve_consistent(self, cg)
 
 
+    def test_presale_hash_secures_graduated_launches(self):
+        # A pool mining PRE's curve commits GRAD's aux block in its PRE coinbase: every share
+        # that meets GRAD's target extends GRAD with a PRE header as the AuxPoW parent.
+        grad = small_launch("GRAD", graduation_blocks=8)
+        pre = small_launch("PRE", graduation_blocks=10_000)
+        other = small_launch("OTH", graduation_blocks=10_000)
+        cg, cp, co = SimChain("GRAD", grad), SimChain("PRE", pre), SimChain("OTH", other)
+        cg.mine(12)
+        self.assertTrue(cg.graduated())
+        L = Loop()
+        port = free_port()
+        children = {"GRAD": {"rpc": cg, "hrp": grad.hrp, "payout": addr(grad.hrp)},
+                    "OTH": {"rpc": co, "hrp": other.hrp, "payout": addr(other.hrp)},
+                    "PRE": {"rpc": cp, "hrp": pre.hrp, "payout": addr(pre.hrp)}}
+        src = LaunchSource(cp, pre.hrp, pre.ticker, children=children)
+        self.assertNotIn("PRE", src.auxset.children)  # a chain never merge-mines itself
+        srv = StratumServer(src, "127.0.0.1", port, difficulty=1e-6, poll_interval=0.05)
+        L.spawn(srv.serve())
+        time.sleep(0.3)
+        h_grad, h_oth = cg.height, co.height
+        m = StratumMiner("127.0.0.1", port, addr(pre.hrp), batch=4096)
+        t0 = time.time()
+        while (cg.height < h_grad + 3 or cp.height < 3) and time.time() - t0 < 90:
+            L.run(m.run(duration=2))
+        self.assertGreaterEqual(cp.height, 3)
+        self.assertGreaterEqual(cg.height, h_grad + 3)
+        self.assertEqual(co.height, h_oth, "an ungraduated launch must not be merge-mined")
+        aux_blocks = [b for b in cg.blocks[h_grad + 1:] if b.auxpow]
+        self.assertTrue(aux_blocks)
+        pre_chain_id = pre.chain_id
+        for b in aux_blocks:
+            parent_version = int.from_bytes(b.auxpow[-80:-76], "little", signed=True)
+            self.assertEqual(parent_version >> 16, pre_chain_id, "the AuxPoW parent is a PRE header")
+        curve_consistent(self, cp)
+        curve_consistent(self, cg)
+
+
 class ProxyTests(unittest.TestCase):
     def test_weighted_split(self):
         L = Loop()
