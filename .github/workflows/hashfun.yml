@@ -1,0 +1,384 @@
+# hashfun: build the node for every platform, test it there, pack the npm package, prove the
+# package picks the right binary on every platform, and release on a version tag.
+#
+#   build    One job per platform, on a runner of that platform (Linux x64, Linux arm64, macOS on
+#            Apple silicon, macOS on Intel). Each builds the hashfund that ships
+#            (contrib/hashfun/dist/build.sh) and runs the whole regression against that exact
+#            file (contrib/hashfun/ci/test.sh): the consensus code against its Python model, a
+#            launch end to end on regtest, the node fleet, the swaps, the site in real browsers.
+#   pack     Puts the four binaries into the npm package and packs it. The pack step refuses an
+#            incomplete set, so a package without one platform's binary cannot come out of here.
+#   install  On every platform again: npm i -g the tarball, then `hashfun doctor` must show that
+#            the CLI picked the packaged binary for that platform by itself and that its
+#            self-test passes; then that node replays the short chain each of the four binaries
+#            mined in its build job and must reach the same conclusions (the binaries come from
+#            different compilers and processors, and a disagreement would split the network);
+#            then the CLI smoke test runs through the installed command.
+#   release  Only for a tag v<version>: a GitHub release carrying the tarball, the four binaries
+#            and their SHA-256 sums; then `npm publish`, only if the repository has a secret
+#            named NPM_TOKEN (gh secret set NPM_TOKEN < file-with-the-token).
+#
+# Cost. On a public repository GitHub's runners are free. On a private one the minutes come out
+# of the plan's allowance, and a macOS minute counts as about ten Linux minutes: the macOS jobs
+# are most of the bill. The compiler caches below are there to shorten every run after the first.
+#
+# Run it by hand (Actions tab, "Run workflow") with core_tests on to also build and run Bitcoin
+# Core's own unit tests with the shipping toolchain on every platform. That is off by default:
+# it lengthens the build a lot, and those tests have not been run on this fork yet.
+name: hashfun
+
+on:
+  push:
+    branches: [hashfun, main, master]
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      core_tests:
+        description: "Also build and run Bitcoin Core's own unit tests with the shipping toolchain"
+        type: boolean
+        default: false
+
+concurrency:
+  group: hashfun-${{ github.ref }}
+  # a newer push replaces a run in progress; a release run is never cut short
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash   # GitHub runs this as bash -e -o pipefail
+
+env:
+  NODE_VERSION: '22'
+
+jobs:
+  build:
+    name: build + test, ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: linux-x64, runner: ubuntu-24.04, cache: zig }
+          - { target: linux-arm64, runner: ubuntu-24.04-arm, cache: zig }
+          - { target: darwin-arm64, runner: macos-15, cache: ccache }
+          - { target: darwin-x64, runner: macos-15-intel, cache: ccache }
+    steps:
+      - name: Source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+
+      # zig keeps what it compiled under build/dist (the Linux binaries); ccache does the same for
+      # Apple's clang (the macOS ones). Paths that do not exist on a platform are skipped.
+      - name: Compiler cache, from the last run
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            build/dist/zig-global
+            build/dist/zig-local
+            build/ccache
+          key: ${{ matrix.cache }}-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ${{ matrix.cache }}-${{ matrix.target }}-
+
+      # puts its virtualenv (python with zig and playwright) and the pinned bitcoind on PATH
+      - name: Tools
+        run: bash contrib/hashfun/ci/setup.sh
+
+      - name: Build hashfund for ${{ matrix.target }}
+        env:
+          TESTS: ${{ inputs.core_tests && '1' || '0' }}
+          CCACHE_MAXSIZE: 1G
+        run: bash contrib/hashfun/dist/build.sh ${{ matrix.target }}
+
+      - name: Test that binary
+        run: bash contrib/hashfun/ci/test.sh --logs build/test-logs
+
+      - name: Keep the binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: hashfund-${{ matrix.target }}
+          path: contrib/hashfun/npm/prebuilt/${{ matrix.target }}/hashfund
+          if-no-files-found: error
+          retention-days: 14
+
+      # The regression's doctor step mined a short chain with this binary and wrote down what
+      # the node concluded from it. The install jobs replay it on every other platform.
+      - name: Keep the chain this binary mined
+        uses: actions/upload-artifact@v7
+        with:
+          name: chain-${{ matrix.target }}
+          path: build/test-logs/chain-${{ matrix.target }}.json
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Keep the logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: logs-${{ matrix.target }}
+          path: |
+            build/test-logs
+            build/dist/build/*.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Compiler cache, for the next run
+        if: always()
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            build/dist/zig-global
+            build/dist/zig-local
+            build/ccache
+          key: ${{ matrix.cache }}-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+  pack:
+    name: pack the npm package
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+
+      - name: hashfund for linux-x64
+        uses: actions/download-artifact@v8
+        with:
+          name: hashfund-linux-x64
+          path: contrib/hashfun/npm/prebuilt/linux-x64
+
+      - name: hashfund for linux-arm64
+        uses: actions/download-artifact@v8
+        with:
+          name: hashfund-linux-arm64
+          path: contrib/hashfun/npm/prebuilt/linux-arm64
+
+      - name: hashfund for darwin-arm64
+        uses: actions/download-artifact@v8
+        with:
+          name: hashfund-darwin-arm64
+          path: contrib/hashfun/npm/prebuilt/darwin-arm64
+
+      - name: hashfund for darwin-x64
+        uses: actions/download-artifact@v8
+        with:
+          name: hashfund-darwin-x64
+          path: contrib/hashfun/npm/prebuilt/darwin-x64
+
+      # What ships must be what is committed, and what is committed must be what the sources of
+      # this commit build: rebuild the site bundle and the swap engine and compare.
+      - name: The site bundle and the swap engine are the committed ones
+        run: |
+          (cd hashfun/web && npm ci --no-audit --no-fund && npm run build)
+          if [ -n "$(git status --porcelain -- hashfun/web/static hashfun/web/maker.cjs)" ]; then
+            git status --short -- hashfun/web/static hashfun/web/maker.cjs
+            echo "::error::hashfun/web/static or hashfun/web/maker.cjs is not what this commit's sources build: cd hashfun/web && npm run build, then commit the result"
+            exit 1
+          fi
+
+      # An artifact does not keep the executable bit. The pack script (npm's prepack) sets it
+      # again and refuses to pack unless all four binaries are there.
+      - name: Pack
+        run: |
+          chmod 755 contrib/hashfun/npm/prebuilt/*/hashfund
+          mkdir -p out
+          (cd contrib/hashfun/npm && npm pack --pack-destination "$GITHUB_WORKSPACE/out")
+          for t in linux-x64 linux-arm64 darwin-arm64 darwin-x64; do
+            cp "contrib/hashfun/npm/prebuilt/$t/hashfund" "out/hashfund-$t"
+          done
+          cd out
+          sha256sum -- *.tgz hashfund-* > SHA256SUMS
+          cat SHA256SUMS
+          ls -l
+
+      # The tarball, the four binaries under the names a release gives them, and their sums.
+      - name: Keep the package
+        uses: actions/upload-artifact@v7
+        with:
+          name: npm-package
+          path: out
+          if-no-files-found: error
+          retention-days: 14
+
+  install:
+    name: install + run, ${{ matrix.target }}
+    needs: pack
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: linux-x64, runner: ubuntu-24.04 }
+          - { target: linux-arm64, runner: ubuntu-24.04-arm }
+          - { target: darwin-arm64, runner: macos-15 }
+          - { target: darwin-x64, runner: macos-15-intel }
+    steps:
+      # the checkout is here for the smoke script and its helpers only: the CLI under test is the
+      # installed one
+      - name: Source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+
+      - name: The package
+        uses: actions/download-artifact@v8
+        with:
+          name: npm-package
+          path: pkg
+
+      # Python 3.10+ for the CLI and a stock bitcoind for the smoke test (the same pinned one
+      # the build job uses).
+      - name: Tools
+        run: bash contrib/hashfun/ci/setup.sh --minimal
+
+      - name: npm i -g
+        run: |
+          npm config set prefix "$RUNNER_TEMP/npm"
+          echo "$RUNNER_TEMP/npm/bin" >> "$GITHUB_PATH"
+          npm i -g ./pkg/*.tgz
+
+      # No HASHFUND here: the CLI has to find its own binary. The path proves which one it took.
+      - name: hashfun doctor picks the ${{ matrix.target }} binary of the package and it passes its self-test
+        run: |
+          command -v hashfun
+          hashfun doctor | tee doctor.txt
+          grep -E "^hashfund .*node_modules/.*prebuilt/${{ matrix.target }}/hashfund" doctor.txt
+
+      # Four compilers' worth of binaries must agree on every rule, or the network splits. Each
+      # build job mined a short chain (up the curve, through graduation, into the tail); this
+      # platform's node has to accept every block of each and reach the same tip, UTXO set,
+      # curve state and sats owed per block.
+      - name: The chains the four binaries mined
+        uses: actions/download-artifact@v8
+        with:
+          pattern: chain-*
+          path: chains
+          merge-multiple: true
+
+      - name: This platform's node agrees with all four on every block
+        run: |
+          set -- chains/chain-*.json
+          if [ $# -ne 4 ]; then
+            echo "::error::expected the chains of four platforms, found: $*"
+            exit 1
+          fi
+          for f in "$@"; do
+            hashfun doctor --quick --replay "$f"
+          done
+
+      - name: The CLI smoke test through the installed command
+        run: HASHFUN_CMD=hashfun bash contrib/hashfun/cli_smoke.sh
+
+  release:
+    name: release ${{ github.ref_name }}
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: install
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write   # the GitHub release
+      id-token: write   # npm provenance, used only when the repository is public (see the last step)
+    env:
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+
+      - name: The package and the binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: npm-package
+          path: out
+
+      - name: The tag is the package's version, and the files are the ones that were tested
+        run: |
+          version="$(node -p "require('./contrib/hashfun/npm/package.json').version")"
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::the tag is $GITHUB_REF_NAME but contrib/hashfun/npm/package.json says version $version: the tag for that version is v$version"
+            exit 1
+          fi
+          cd out
+          sha256sum -c SHA256SUMS
+          set -- *.tgz
+          if [ $# -ne 1 ] || [ ! -f "$1" ]; then
+            echo "::error::expected exactly one package tarball in the artifact, found: $*"
+            exit 1
+          fi
+
+      # Safe to run again: an existing release is kept and its files replaced.
+      - name: GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" --title "hashfun $GITHUB_REF_NAME" --generate-notes --verify-tag
+          fi
+          gh release upload "$GITHUB_REF_NAME" out/*.tgz out/SHA256SUMS out/hashfund-* --clobber
+
+      # The token never reaches a file or the log: the npmrc below holds the literal text
+      # ${NODE_AUTH_TOKEN}, which npm replaces from the environment when it reads the file.
+      - name: npm publish, only when the repository has an NPM_TOKEN secret
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          REPO_PRIVATE: ${{ github.event.repository.private }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "::notice::No NPM_TOKEN secret, so nothing went to npm; the tarball is on the release page. To publish from here: gh secret set NPM_TOKEN < file-with-the-token, then run this job again."
+            exit 0
+          fi
+          name="$(node -p "require('./contrib/hashfun/npm/package.json').name")"
+          version="$(node -p "require('./contrib/hashfun/npm/package.json').version")"
+          set -- out/*.tgz
+          tarball="$1"
+          # shellcheck disable=SC2016
+          printf '%s\n' '//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}' > "$RUNNER_TEMP/npmrc"
+          export NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/npmrc"
+          # Safe to run again: a version that is already there must be this very tarball.
+          published="$(npm view "$name@$version" dist.shasum 2> /dev/null || true)"
+          if [ -n "$published" ]; then
+            if [ "$published" = "$(sha1sum "$tarball" | cut -d' ' -f1)" ]; then
+              echo "$name@$version on npm is already this tarball"
+              exit 0
+            fi
+            echo "::error::$name@$version is on npm already and is not this tarball. A published version cannot be replaced: raise the version."
+            exit 1
+          fi
+          # Provenance needs a public repository and a package.json that names it.
+          args=(--access public)
+          if [ "$REPO_PRIVATE" = "false" ] && node -e "process.exit(require('./contrib/hashfun/npm/package.json').repository ? 0 : 1)"; then
+            args+=(--provenance)
+          fi
+          npm publish "$tarball" "${args[@]}"

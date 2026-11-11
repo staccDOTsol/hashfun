@@ -3,18 +3,22 @@
 # at once, one with a long curve), run their nodes, mine both through the CLI's pool with
 # the CPU miner, check merge mining + automatic sats settlement happened, and that the site
 # (`hashfun web`) serves both launches.
-#   HASHFUND=/path/hashfund BITCOIND=/path/bitcoind bash contrib/hashfun/cli_smoke.sh
+#   BITCOIND=/path/bitcoind bash contrib/hashfun/cli_smoke.sh
+# HASHFUND=/path/hashfund picks the node binary; without it the CLI picks its own for this machine.
+# HASHFUN_CMD=hashfun runs an installed CLI (npm i -g) instead of this checkout's; PYTHON names the
+# Python for the test's own helpers.
 set -euo pipefail
-: "${HASHFUND:?}" "${BITCOIND:?}"
-export HASHFUND
+: "${BITCOIND:?}"
+[ -z "${HASHFUND:-}" ] || export HASHFUND
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
+PY="${PYTHON:-python3}"
 W="$(mktemp -d)"
 export HASHFUN_HOME="$W/home"
-hf() { python3 -m hashfun.cli "$@"; }
-j() { python3 -c "import json,sys; d=json.load(sys.stdin); print(eval(sys.argv[1]))" "$1"; }
-port() { python3 -c "import socket; s=socket.socket(); s.bind(('127.0.0.1',0)); print(s.getsockname()[1])"; }
-addr() { python3 -c "
+hf() { ${HASHFUN_CMD:-"$PY" -m hashfun.cli} "$@"; }
+j() { "$PY" -c "import json,sys; d=json.load(sys.stdin); print(eval(sys.argv[1]))" "$1"; }
+port() { "$PY" -c "import socket; s=socket.socket(); s.bind(('127.0.0.1',0)); print(s.getsockname()[1])"; }
+addr() { "$PY" -c "
 import sys; sys.path.insert(0,'.')
 from hashfun.ser import segwit_encode, hash160
 from hashfun.crypto import pubkey_from_priv, random_priv
@@ -26,7 +30,7 @@ BP=$(port)
 "$BITCOIND" -regtest -datadir="$W" -server=1 -listen=0 -rpcport="$BP" -fallbackfee=0.0001 -printtoconsole=0 &
 BTCPID=$!
 BTC="http://127.0.0.1:$BP"; COOKIE="$W/regtest/.cookie"
-b() { python3 -c "
+b() { "$PY" -c "
 import sys, json; sys.path.insert(0,'.')
 from hashfun.rpc import RPC
 r = RPC(sys.argv[1], cookie_file=sys.argv[2])
@@ -44,7 +48,7 @@ b w generatetoaddress 110 "$BA" >/dev/null
 hf launch new --name "Grad smoke" --ticker GRD --creator-address "$(addr grd)" --graduation-hashes 30 \
   --pow-limit 207fffff --spacing 10 --window 10 --test -o "$W/grd.json" >/dev/null 2>&1
 # a 1x1 PNG as the coin's picture: its hash goes into the launch id
-python3 -c "
+"$PY" -c "
 import struct, sys, zlib
 c = lambda t, d: struct.pack('>I', len(d)) + t + d + struct.pack('>I', zlib.crc32(t + d))
 open(sys.argv[1], 'wb').write(b'\x89PNG\r\n\x1a\n' + c(b'IHDR', struct.pack('>IIBBBBB', 1, 1, 8, 2, 0, 0, 0)) + c(b'IDAT', zlib.compress(b'\x00\xff\x9a\x1f')) + c(b'IEND', b''))" "$W/sts.png"
@@ -54,7 +58,7 @@ hf launch new --name "Sats smoke" --ticker STS --creator-address "$(addr sts)" -
   --image "$W/sts.png" --description "smoke test coin" --x https://x.com/smoke -o "$W/sts.json" >/dev/null 2>&1
 [ "$(hf launch info "$W/sts.json" | j "d['meta']['verified'] and d['meta']['image_type'] == 'image/png' and d['meta']['x'] == 'https://x.com/smoke'")" = "True" ]
 # a launch file whose picture is not the committed one is refused
-python3 -c "
+"$PY" -c "
 import json, sys
 d = json.load(open(sys.argv[1])); d['metadata']['description'] = 'swapped'; json.dump(d, open(sys.argv[2], 'w'))" "$W/sts.json" "$W/bad.json"
 if hf node add "$W/bad.json" >/dev/null 2>&1; then echo "tampered metadata was accepted"; exit 1; fi
@@ -78,15 +82,10 @@ hf mine STS --payout "$SA" --btc-rpc "$BTC" --btc-cookie "$COOKIE" --btc-wallet 
 wait %2 2>/dev/null || true
 head -1 "$W/mine2.log"
 G1=$(hf node rpc GRD getblockcount); S1=$(hf node rpc STS getblockcount)
-SETTLED=$(python3 - "$S1" <<PY
-import json, subprocess, sys
-n = 0
-for h in range(1, min(int(sys.argv[1]), 40) + 1):
-    o = json.loads(subprocess.check_output([sys.executable, "-m", "hashfun.cli", "node", "rpc", "STS", "getmintobligation", str(h)]))
-    n += bool(o["settled"])
-print(n)
-PY
-)
+SETTLED=0
+for h in $(seq 1 $(( S1 < 40 ? S1 : 40 ))); do
+  if [ "$(hf node rpc STS getmintobligation "$h" | j "d['settled']")" = "True" ]; then SETTLED=$((SETTLED + 1)); fi
+done
 echo "STS: height $S1, blocks settled by Bitcoin payment: $SETTLED; GRD merge-mined +$((G1-G0)); relay $(hf node rpc STS getbtcrelay | j "d['height']")/$(b getblockcount)"
 [ "$S1" -ge 8 ] && [ "$((G1-G0))" -ge 1 ] && [ "$SETTLED" -ge 1 ]
 

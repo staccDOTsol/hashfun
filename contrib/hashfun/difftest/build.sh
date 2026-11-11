@@ -7,7 +7,9 @@
 #   HFDIFF=build/hfdiff python3 -m unittest hashfun.tests.test_diff_cpp -v
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-OUT="$(realpath -m "${1:-$ROOT/build/hfdiff}")"
+OUT="${1:-$ROOT/build/hfdiff}"
+case "$OUT" in /*) ;; *) OUT="$PWD/$OUT" ;; esac    # absolute, without GNU realpath (macOS has none with -m)
+mkdir -p "$(dirname "$OUT")"
 OBJ="$OUT-obj"
 CXX="${CXX:-g++}"
 mkdir -p "$OBJ"
@@ -32,6 +34,6 @@ compile() {
     -c "$ROOT/$1" -o "$o.tmp" && mv "$o.tmp" "$o"
 }
 export -f compile
-printf '%s\n' "${SRCS[@]}" | xargs -P "$(nproc)" -I{} bash -c 'compile {}'
+printf '%s\n' "${SRCS[@]}" | xargs -P "$(getconf _NPROCESSORS_ONLN)" -I{} bash -c 'compile {}'
 "$CXX" -o "$OUT" "$OBJ"/*.o
 echo "$OUT"

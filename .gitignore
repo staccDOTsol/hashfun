@@ -32,3 +32,4 @@ hashfun.egg-info/
 __pycache__/
 contrib/hashfun/npm/py/
 contrib/hashfun/npm/*.tgz
+contrib/hashfun/npm/prebuilt/
