@@ -4,8 +4,10 @@
   "description": "hashfun CLI: launch a proof-of-work coin on its own Bitcoin-fork chain, run its node, mine it, settle the BTC it owes, swap it, and serve the site",
   "license": "MIT",
   "bin": { "hashfun": "bin/hashfun.js" },
-  "files": ["bin", "py", "README.md"],
-  "engines": { "node": ">=16" },
+  "files": ["bin", "py", "prebuilt/*/hashfund", "README.md"],
+  "engines": { "node": ">=18" },
+  "os": ["darwin", "linux"],
+  "cpu": ["x64", "arm64"],
   "scripts": {
     "prepack": "node scripts/copy-py.js",
     "test": "node bin/hashfun.js --help"
