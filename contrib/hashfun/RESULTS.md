@@ -30,6 +30,28 @@ The workflow has never run and nothing has ever run on macOS, so expect the firs
 
 What was tested of the script: every path against stand-ins for `gh`, `npm` and `curl` and a local repository (177 checks: first run, rerun, new patches, a version already published, answering no, no terminal, six token file formats, the token appearing nowhere but on the pipes, a missing permission, someone else's push). What was not: the bash that macOS ships (3.2; the script avoids everything newer and was checked for it by reading), and real GitHub.
 
+## The first build on GitHub
+
+Run 43103032119, 2026-11-11, on GitHub's own machines. The first time this node was built or run on a Mac.
+
+| Platform | Build | Regression |
+|---|---|---|
+| `linux-arm64` (ubuntu-24.04-arm) | ok | **all of it passed**: unit, diff, web_js, doctor, e2e 67/67, yield 46/46, fleet 41/41, book 28/28, web 45/45, smoke |
+| `linux-x64` (ubuntu-24.04) | ok | all passed except `smoke`: the node could not listen on its P2P port |
+| `darwin-arm64` (macos-15) | ok | all passed except `yield`: the test ran the machine out of ports |
+| `darwin-x64` (macos-15-intel) | ok | the same as `darwin-arm64` |
+
+So on macOS, both architectures: the node builds with Apple's clang, and e2e 67/67, fleet 41/41, the swaps 28/28 and the site in real browsers 45/45 pass. `yield` had made 32 (Intel) and 20 (ARM) checks, with no difference between node and model, when it ran out of ports.
+
+Nothing was released: the release waits for all four. Three bugs of ours came out of it, and one of GitHub's. All fixed in this drop:
+
+1. **A new connection for every RPC call.** The Python RPC client opened and closed a TCP connection per call. `yield_regtest` made 48,242 of them in 27 s. A Mac has about 16,000 outgoing ports and keeps each one unusable for half a minute after its connection closes, so calls began to fail with "Can't assign requested address". A pool, a settler or the site did the same to a production machine, only slower. The client now keeps one connection per thread for calls that only read (the same test: 1,274 connections), and still never sends anything that changes state twice.
+2. **Default ports inside the range Linux uses for outgoing connections.** A launch's P2P port was derived into 20000..39998. From 32768 up, Linux hands those numbers to outgoing connections, and a port one of them just used cannot be listened on for a minute. With thousands of connections a minute (bug 1) a node start failed now and then: on GitHub's x64 runner, and once here earlier, which I had put down to two suites running at once. Ports are now derived into 20001..31999, and the tools pick every other listening port from under 32768 too.
+3. **A node with default settings could not start at all.** The default RPC port was the P2P port plus one, which is where the node itself listens for incoming Tor connections. The CLI always chose its own RPC port, so nothing ran into it until I made the CLI use the launch's own. RPC is now one under P2P, as in Bitcoin (8332, 8333, 8334), and `hashfund -launch=x.json` with nothing else starts.
+4. **GitHub accepted the push and the tag and started no build** (Actions enabled, no workflow registered, no run, for an hour) until the workflow was started by hand. `deploy.sh` now checks that a build of the commit exists, starts one if not, and says so plainly if it cannot (`deploy.sh kick` does the same on demand).
+
+The jobs after the builds (`pack`, `install`, `release`) have still never run on GitHub. They were walked through here step by step instead, with the real Linux binaries and stand-ins for the Mac ones, and that found a fifth bug that would have failed `install` on all four platforms: **the installed `hashfun` command ran whatever `hashfun/` folder was in the current directory** (Python looks there first), so inside a source checkout it ran the checkout's code, which has no node binary. The wrapper now runs its own copy wherever it is typed.
+
 ## The review's findings: what was done
 
 The third drop ended with an adversarial review of the sats leg that found it could be split and robbed. All critical, high and medium findings are fixed in consensus; each has a test that holds it.
@@ -60,7 +82,7 @@ The numbers behind "held by": `yield_regtest` drives a real node and a regtest b
 - **M1, what remains.** One block seeds each draw, so a miner can still re-roll by withholding a block it found. Inherent to a single-block seed.
 - **L4, what remains.** `genesis_nonce` is outside the launch id: two valid nonces are two chains with one id. A confusion, not a theft.
 - **L6.** No minimum chain work in the first blocks of a launch; LWMA costs two 256-bit divisions per window block per header; the parser accepts a `settle_deadline` of 110 blocks from a hand-written file (`launch new` and the form set a day).
-- **Not run:** the GitHub workflow, anything on macOS, Bitcoin Core's own unit tests on this fork. The deploy command above is what runs the first two.
+- **Not run:** the `pack`, `install` and `release` jobs on GitHub (walked through locally instead); Bitcoin Core's own unit tests on this fork; a full green run. The next `deploy.sh` is that run.
 
 ## What passes
 
@@ -87,7 +109,7 @@ Logs are in `logs/`.
 |---|---|---|
 | `linux-x64` | static (musl), zig's clang: 15,700,048 bytes, sha256 `26e0ebfae70516aae5c7e7e6b868b22893f9475a4836da1f1cabad981155f68d` | everything above |
 | `linux-arm64` | the same, cross-compiled: 14,227,080 bytes, sha256 `3ecc34e028ddfa2102e9cf7463baf8384909af2afb21881a73f5a00d352bee17` | on a real ARM machine (the Linux VM of this Mac): unpacked from the tarball, picked by the CLI by itself, `hashfun doctor` passed, it replayed the x86_64 binary's chain and mined its own. Not the full regression there: CI runs that |
-| `darwin-arm64`, `darwin-x64` | built by GitHub's macOS runners | **nothing yet**: the deploy command is what builds and tests them |
+| `darwin-arm64`, `darwin-x64` | built by GitHub's macOS runners (Apple's clang) | built and tested once on GitHub: everything passed except `yield`, for the reason above; see "The first build on GitHub" |
 
 **The binaries agree with each other**, again, on the new rules: the ARM binary accepted the x86_64 binary's 120-block chain (up the curve, through graduation, into the tail), and both the shipped x86_64 binary and a GCC/glibc build of the same source accepted the ARM binary's: same tip, same UTXO set, same curve state, same sats owed for every block. The chains are in `transfer/` (`chain-linux-x64.json`, `chain-linux-arm64.json`); `hashfun doctor --replay FILE` checks any other machine against them.
 
@@ -120,7 +142,7 @@ Swaps on the shipped timelocks (`book`, S1 to S8 and H1), `hashfun book`, the Un
 
 ## Not done
 
-- The workflow has never run and nothing has run on macOS. Expect the first run to show something on the macOS runners; `bash deploy.sh status` puts the failing logs where I can read them.
+- A green run on GitHub. The first one built all four binaries and failed in one suite on three platforms (above); the jobs after the builds have not run there yet. `bash deploy.sh wait` puts the failing logs where I can read them.
 - The open items above: memory and block weight under spam, the pool under full blocks, `btc_confs`.
 - Bitcoin Core's own unit tests on this fork (the workflow can: run it by hand with `core_tests` on).
 - A maker's browser tab in the background, not tested with a really hidden tab (`hashfun book run` is the answer for anything that matters).
