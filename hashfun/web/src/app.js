@@ -244,6 +244,7 @@ function coin(view, ticker) {
   const head = h('section'), stats = h('div'), chart = h('div', { class: 'panel chart' }), prog = h('div', { class: 'panel pad col', style: 'gap:10px' }), tabsBox = h('div', { class: 'panel' }), trade = h('div', { class: 'trade' }), bag = h('div');
   const quote = async () => {
     q = null; qerr = '';
+    paintQuote(); // the quote on screen is gone the moment a new one is asked for
     if (side === 'sell' && !(sell > 0)) { qerr = 'Enter how many coins to sell.'; return paintQuote(); }
     try { q = await api(side === 'sell' ? `/quote?ticker=${ticker}&side=sell&amount=${Math.round(sell * COIN)}` : `/quote?ticker=${ticker}&side=buy&sats=${spend}`); } catch (e) { qerr = e.message; }
     paintQuote();
@@ -253,7 +254,8 @@ function coin(view, ticker) {
   const out = h('div', { class: 'col', style: 'gap:10px' });
   const paintQuote = () => {
     if (side === 'mine') return;
-    const go = side === 'buy' ? () => flow(`Buy $${ticker}`, (ui) => startSwap(ticker, 'buy', q, ui)) : () => flow(`Sell $${ticker}`, (ui) => startSwap(ticker, 'sell', q, ui));
+    const shown = q, sd = side; // a click trades exactly the quote that was on screen
+    const go = () => shown && flow(`${sd === 'buy' ? 'Buy' : 'Sell'} $${ticker}`, (ui) => startSwap(ticker, sd, shown, ui));
     const leg = d ? d.sats_leg_per_coin : 0, share = q && q.price ? Math.min(1, leg / q.price) : 0;
     out.replaceChildren(
       h('span', { class: 'lab' }, 'You get about'),

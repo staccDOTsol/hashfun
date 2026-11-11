@@ -1,6 +1,6 @@
 # hashfun: status, 2026-11-11
 
-24 commits on `namecoin-core@70c6b36` (branch `auxpow`: Bitcoin Core 32.99 + AuxPoW). Everything below ran on Linux x86_64 (GCC 13.3) with `hashfund` built from this tree and **stock Bitcoin Core v32.1** built from its release tag as the Bitcoin side.
+25 commits on `namecoin-core@70c6b36` (branch `auxpow`: Bitcoin Core 32.99 + AuxPoW). Everything below ran on Linux x86_64 (GCC 13.3) with `hashfund` built from this tree and **stock Bitcoin Core v32.1** built from its release tag as the Bitcoin side.
 
 ## What passes
 
@@ -35,6 +35,7 @@ The only stand-in is the wallet: a mock `window.unisat` (same four calls the pag
 5. Maker: quotes ignored the sats each minted coin owes (it would have sold below cost), quoted more than it held, accepted zero-size orders.
 6. `hashfun launch new --help` crashed (unescaped `%`).
 7. Mainnet launches got a 1-hour settlement deadline, too tight for 10-minute Bitcoin blocks (about 1 in 400 coinbases would have been lost to a slow block alone). Launch tooling now sets one day.
+8. Site: a click on Buy could land while a new quote was in flight and start a swap with no quote (a page error; no funds moved). A click now trades exactly the quote on screen, and the button is off while one is being fetched.
 
 ## New in this drop
 
