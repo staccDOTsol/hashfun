@@ -396,7 +396,7 @@ jobs:
           name="$(node -p "require('./contrib/hashfun/npm/package.json').name")"
           version="$(node -p "require('./contrib/hashfun/npm/package.json').version")"
           set -- out/*.tgz
-          tarball="$1"
+          tarball="./$1"   # ./ : a bare dir/file.tgz is read by npm as a GitHub owner/repo
           # shellcheck disable=SC2016
           printf '%s\n' '//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}' > "$RUNNER_TEMP/npmrc"
           export NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/npmrc"
