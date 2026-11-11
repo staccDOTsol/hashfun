@@ -18,8 +18,9 @@ Base: Bitcoin Core master (32.99) + Namecoin's `auxpow` branch (AuxPoW only, no 
 | AuxPoW | valid only if the parent block's `W >= W_g` (`auxpow-before-graduation`); chain ID from the launch id, kept in `[1, 0x1FFE]` so a BIP9/version-rolled BTC parent never collides |
 | Difficulty | LWMA-1 every block, window N, solvetimes capped at 6T, monotonic-forced timestamps, overflow-guarded. Block times are whole seconds and every solvetime counts as at least 1 s, so `target_spacing >= 2` (with T = 1 difficulty could never rise). A hash surge raises difficulty a few percent per block; until it catches up blocks arrive as fast as timestamps allow (about 6 per second, pinned at the future limit), each minting only what its work is worth |
 | Stall relief | the target doubles for every full 6T a block's own timestamp sits past its parent's, up to the pow limit, so an abandoned chain decays to CPU-minable in minutes. Safe because issuance is priced by work. nBits is a function of (ancestors, own nTime): no nTime rolling. `getblocktemplate` and `createauxblock` rebuild their cached template when the clock enters the next relief step (a cached one would be invalid, or would keep a stalled chain stalled) |
-| BTC anchor | optional `btc_anchor_height` / `btc_anchor_hash` in the descriptor, hashed into the launch id: no block of the launch can predate that Bitcoin block |
-| FTL | per-descriptor future time limit (default 60 s with the 5 s / N=90 defaults) |
+| BTC anchor | mandatory `btc_anchor_height` / `btc_anchor_header` / `btc_anchor_period_time`, hashed into the launch id: no block of the launch can predate that Bitcoin block, and the in-chain Bitcoin header relay starts from it. The parser refuses what it can refute without a chain: the header's hash must meet its own bits, the bits may be no easier than Bitcoin's minimum, the period start must be set, not later than the anchor allows, and the anchor's own time when `height % 2016 == 0` (`btc_regtest` launches skip this). Whether the header really is the block at that height is a question for a Bitcoin node: see "Checking a launch file" below |
+| FTL | per-descriptor future time limit. Default `min(6T - 1, 7200, max(10, N*T/20))`: 22 s at T = 5, N = 90. Outside test launches it must be at least 10 s and less than `6T`: a stamp that may run 6T ahead buys a stall-relief step (or a capped solvetime) with no time passing, and a limit of a few seconds makes honest clock skew reject blocks |
+| Coinbase | `scriptSig` starts with the block height (BIP34), then a push of the first 16 bytes of the launch id (`bad-cb-launch-id`). A coinbase names its launch and every other transaction descends from coinbases, so no transaction can exist on two launches: nothing spent on one can be replayed on another, even when two launches share a preset, a creator and a miner (without the rule their empty blocks at equal heights had byte-identical coinbases). `getblocktemplate` gives the exact bytes as `launchcoinbase`; the node's own miner, `createauxblock` and the pool follow it |
 | Genesis | coinbase `scriptSig = PUSH32(launch_id)`, one zero-value `OP_RETURN` output, `nVersion=1`, must meet `pow_limit_bits` |
 
 Sniping does nothing: a low-difficulty block pays exactly its work at the curve price. Merge-mining pools cannot touch presale issuance because auxpow is invalid until graduation; after it, exahash secures the tail.
@@ -68,17 +69,19 @@ Every launch has one; there is a single kind of coin. A curve block owes real BT
 
 | Step | Rule |
 |---|---|
-| Draw | the hash of block `h+6` seeds block `h`'s draw. Debts under `sats_min_payment` pay the minimum with probability owed/min. Payee class: 80% holder, 10% creator (`creator_btc_script`), 10% dev (compiled-in script, `bc1pctxxt9z57ypwrvdws45hgpgkx922e39gj3hkqe0hsgv3863f4ffsu7p7x3`) |
-| Holder | hold and you earn, no opt-in. 64 candidate points into the value of every P2PKH / P2SH / witness-program output created before block `h`; the payee is the first candidate still unspent (coin-weighted over current holders), paid at that output's own scriptPubKey on Bitcoin (same key, since a launch is a Bitcoin fork). All spent or none yet: creator |
-| Redirect | optional: a tx with `OP_RETURN "HFY1"<btc scriptPubKey>` sends its outputs' yield to that script instead (coinbase: vout 0 only) |
-| Pay | a Bitcoin tx whose output `i` pays the payee and whose `OP_RETURN "HF"<20-byte tags>` has `SHA256("hashfun-pay"||launch_id||block_hash)[:20]` at position `i` |
+| Draw | block `h+6` seeds block `h`'s draw with the hash that carried its work: its own hash, or for a merge-mined block the parent chain's block hash (a merge-mined block's own hash can be re-rolled for free). Debts under `sats_min_payment` pay the minimum with probability owed/min. Payee class: 80% holder, 10% creator (`creator_btc_script`), 10% dev (compiled-in script, `bc1pctxxt9z57ypwrvdws45hgpgkx922e39gj3hkqe0hsgv3863f4ffsu7p7x3`) |
+| Holder | hold and you earn, no opt-in. One point into the value of the coins that are **live at the draw** (every unspent P2PKH / P2SH / witness-program output, as of the end of block `h+5`): the coin holding the point wins and is paid at its own scriptPubKey on Bitcoin (same key, since a launch is a Bitcoin fork). The payee is fixed there: moving the coin afterwards changes nothing for that draw, and a spent coin is never drawn again, so sending coins to yourself buys no weight. Nobody holds yet (the first blocks of a launch): the holders' share is owed to no one |
+| Earning starts | a curve coinbase that owes sats is not in the draw until its own block has settled (or its draw said nothing is due): hash that never pays never earns. Every other output earns from the block it is in |
+| Redirect | a coinbase may send its output 0's yield to another Bitcoin script with `OP_RETURN "HFY1"<btc scriptPubKey>` (the miner's own output; the first such tag, and only if that script is itself P2PKH / P2SH / a witness program). No other transaction can redirect: its author does not own every output it creates |
+| Pay | a Bitcoin tx whose output `i` pays the payee and whose `OP_RETURN "HF"<20-byte tags>` has `SHA256("hashfun-pay"||launch_id||block_hash)[:20]` at position `i`. One tag list per transaction: the first such output and no other, so one output settles one block |
 | Bitcoin view | `OP_RETURN "HFH1"<80-byte headers>` relays Bitcoin headers; the node keeps a validating header tree from `btc_anchor_header` (PoW, retarget, median time), so its view of Bitcoin is a function of launch blocks only |
-| Prove | `OP_RETURN "HFP1"<proof>`: merkle proof of the payment in a relayed Bitcoin block with `btc_confs` confirmations. Invalid proofs and headers are ignored, never block-invalidating |
-| Lock | a curve coinbase cannot be spent until settled (`bad-txns-unsettled-coinbase`, mempool and consensus); unsettled `settle_deadline` blocks after minting, it never can |
+| Prove | `OP_RETURN "HFP1"<proof>`: merkle proof of the payment in a relayed Bitcoin block with `btc_confs` confirmations. Invalid proofs and headers are ignored, never block-invalidating; so whether a proof counts is itself consensus state, and it is decided from the chain's blocks alone (no UTXO set, no clock): a node that replays the chain at start reaches the same answer as one that saw the blocks arrive |
+| Lock | a curve coinbase cannot be spent until settled (`bad-txns-unsettled-coinbase`, mempool and consensus); unsettled `settle_deadline` blocks after minting, it never can. A reorg that removes a settlement also removes spends of that coinbase from the mempool |
+| End | the sats leg is over `settle_deadline` blocks after the last curve block: no draw and no proof can count after that height, so nodes stop there. Later blocks are not looked at for coins, headers or proofs, a starting node replays the chain only that far, and `getlaunchinfo.earning` is 0. No rule changes (nothing after that height could have changed what a coinbase may do); it bounds the work and the memory of a graduated launch. A reorg below that height reopens the state and reconnecting closes it with the same contents |
 
 `settle_deadline` defaults to 720 blocks in the descriptor format; `hashfun launch new` and the launch form set it to one day of blocks when the sats leg follows real Bitcoin, where a confirmation can take an hour.
 
-HFH1/HFP1/HFY1 outputs are honoured in coinbases too, so a miner with no spendable coins can relay headers and settle from its own next block. RPCs: `getmintobligation <height>` (owed, payee, tag, candidates, script to pay), `getbtcrelay`. State lives in memory (`src/launchyieldstate.cpp`) and is rebuilt from blocks; pruned nodes are not supported with a sats leg.
+HFH1/HFP1 outputs are honoured in coinbases too, so a miner with no spendable coins can relay headers and settle from its own next block. RPCs: `getmintobligation <height>` (owed, payee class, tag, and once the draw is made: `pay`, the `pay_script` to pay, the `coin` that won a holder draw, `earning`: the value the draw was over), `getlaunchinfo` (`earning`: the value of live coins now), `getbtcrelay`. State lives in memory (`src/launchyieldstate.cpp`: the coin list with a Fenwick tree over live values, so a draw, a spend and a proof each cost O(log n)) and is rebuilt from blocks; pruned nodes are not supported with a sats leg.
 
 ## Descriptor
 
@@ -90,12 +93,28 @@ JSON. The launch id is `SHA256d` of a canonical binary serialization of every co
 || u32 genesis_time || u32 pow_limit_bits || u32 target_spacing || u32 lwma_window || u32 ftl
 || 32B virtual_work (big-endian) || i64 virtual_tokens || i64 graduation_tokens
 || i64 tail_reward || u32 tail_halving_interval || bytes creator_script || u16 creator_fee_bps || u8 test
-|| u32 btc_anchor_height || 32B btc_anchor_hash (as displayed)
+|| u32 btc_anchor_height || 80B btc_anchor_header || u32 btc_anchor_period_time
+|| i64 sats_num || u32 sats_shift || i64 sats_min_payment || u32 settle_deadline || u32 btc_confs
+|| bytes creator_btc_script || u8 btc_regtest || [32B meta, only when set]
 ```
 
 (`str`/`bytes` = CompactSize length + data; integers little-endian.) Derived from the id: P2P magic (`SHA256("hashfun-magic"||id)[:4] | 0x80` per byte), auxpow chain ID, default ports, datadir `launch_<ticker>_<id8>`.
 
 `test: true` launches allow `setmocktime` and nonstandard txs.
+
+`version` is 2. It is hashed into the id and names the rule set, so a file made for one rule set is never read under another. Version 1 was the pre-release set (the first sats leg, and a parser that took anchors, payout scripts and time limits it should have refused): both parsers refuse it and say to create the launch again.
+
+Two parsers read launch files: the node's (C++, `src/kernel/launch.cpp`) and the tools' (Python, `hashfun/descriptor.py`). A file that meant one launch to the node and another to the pool, the wallet or the site would be a split, so both refuse whatever JSON readers disagree about, with the same message: bytes that are not strict UTF-8, a key twice in one object (one reader takes the first, the other the last), a number of more than 40 characters, nesting deeper than 64, `NaN` and `Infinity`. Keys left out get the same default in both (`target_spacing` 5, `lwma_window` 90, `ftl` from the formula above). `tail_halving_interval` and `btc_anchor_height` are below 2^31. `creator_btc_script` must be P2PKH, P2SH or a witness program: every miner whose block draws the creator has to get a Bitcoin payment to it relayed. `test_diff_cpp` holds the two parsers together on random, mutated and byte-damaged files.
+
+### Checking a launch file
+
+The parser can tell that an anchor is a Bitcoin header; it cannot tell that it is the block at that height, or that the period start is right, and a launch with either wrong refuses real Bitcoin headers at the first retarget after the anchor (two weeks at most), after which nothing on it can settle. A Bitcoin node can tell, and is asked (`descriptor.check_anchor`):
+
+- `hashfun launch new --btc-rpc URL` takes the anchor from the node; with `--btc-anchor HEIGHT:HEADER[:PERIODTIME]` as well it checks the given one. `PERIODTIME` may be left out only when `HEIGHT` is a multiple of 2016.
+- `hashfun launch info X.json --btc-rpc URL` checks someone else's file.
+- `hashfun mine` checks before it serves work (it holds the Bitcoin RPC the settler pays through) and exits with the reason.
+- `hashfun node add X.json --btc-rpc URL [--btc-cookie FILE]` checks before registering; without `--btc-rpc` it says in one line that the anchor was not checked.
+- The site asks once per registered launch before serving it. Denied: the launch is off the board and the book and its page shows the reason. Bitcoin node not answering or still behind the anchor: not served yet, asked again every 30 s.
 
 ## Platforms and the node binary
 
@@ -339,12 +358,13 @@ One line per suite on the terminal (PASS or FAIL, seconds, the suite's own last 
 
 | Suite | What it runs | Needs |
 |---|---|---|
-| `unit` | `test_core`, `test_stack`, `test_book`, `test_cli` | Python |
+| `unit` | `test_core`, `test_yieldstate`, `test_stack`, `test_book`, `test_cli` | Python |
 | `diff` | builds the differential driver and runs `test_diff_cpp`. When `dist/build.sh` has left its compiler in `build/dist/tc`, the driver is compiled with that one, so the arithmetic under test is the shipped binary's (`CXX` overrides) | a C++ compiler |
 | `web_js` | `test_web_js` | node, npm |
 | `doctor` | `hashfun doctor` on the binary under test; it also mines the short chain for the cross-machine check into the log directory (`chain-<target>.json`) | the binary |
 | `core` | Bitcoin Core's own unit tests, one process per test suite, in parallel | a `TESTS=1` build; passed over, not failed, without one |
 | `e2e`, `fleet` | `e2e_regtest`, `fleet_regtest` | bitcoind |
+| `yield` | `yield_regtest`: the sats leg on a real node against the Python model of its rules, at every height after every block, restart and reorg | bitcoind |
 | `book` | `book_regtest` | bitcoind, node |
 | `web` | `web_regtest`, screenshots into the log directory | bitcoind, Python's playwright with its chromium |
 | `smoke` | `contrib/hashfun/cli_smoke.sh` | bitcoind |
@@ -355,11 +375,13 @@ The suites one by one:
 
 ```
 python -m unittest hashfun.tests.test_core      # vectors (BIP32/39/143/173), curve, LWMA, descriptor, HTLC, AuxPoW
+python -m unittest hashfun.tests.test_yieldstate  # the sats-leg state machine as a model: draws over live coins, held coinbases, one tag list, undo, the end of the leg
 python -m unittest hashfun.tests.test_stack     # pool+miner, merged mining gate, proxy split, electrum+wallet+reorg, swaps buy/sell/refund (simulator)
 python -m unittest hashfun.tests.test_book      # launch metadata; the peer-to-peer book's server side (signatures, reservations, backing, expiry)
 python -m unittest hashfun.tests.test_cli       # which node binary the CLI runs on which machine (the npm layout with stand-in binaries, $HASHFUND, the translated-Python case)
 bash contrib/hashfun/difftest/build.sh build/hfdiff && HFDIFF=build/hfdiff python -m unittest hashfun.tests.test_diff_cpp
 python -m hashfun.tests.e2e_regtest --hashfund build/bin/hashfund --bitcoind /path/to/stock/bitcoind
+python -m hashfun.tests.yield_regtest --hashfund build/bin/hashfund --bitcoind /path/to/stock/bitcoind   # ~30 s: node vs model, 270 blocks, every obligation at every height
 python -m hashfun.tests.fleet_regtest --hashfund build/bin/hashfund --bitcoind /path/to/stock/bitcoind   # ~4.5 min, real time
 python -m unittest hashfun.tests.test_web_js    # browser code vs Python, the site bundle and the swap engine bundle are current, lint (needs node; cd hashfun/web && npm install)
 python -m hashfun.tests.web_regtest --hashfund build/bin/hashfund --bitcoind /path/to/stock/bitcoind     # ~9 min, two browsers, needs playwright
@@ -367,6 +389,8 @@ python -m hashfun.tests.book_regtest --hashfund build/bin/hashfund --bitcoind /p
 ```
 
 `test_stack` runs against an in-process simulator whose consensus is the Python model, not the C++ node. `test_diff_cpp` compiles the node's own consensus sources (descriptor parser and identity, `CLaunchParams` + genesis, curve, LWMA, tail) without the rest of the node, in ~20 s, and compares them value by value with the Python model on random descriptors and adversarial header sequences (zero, negative and >6T solvetimes, off-schedule nBits, graduation crossings); it also requires both parsers to accept and reject exactly the same descriptor JSON. `e2e_regtest` covers what needs a running node: block acceptance (creator output, excess coinbase, nBits), the auxpow gate, GBT, merged mining against stock bitcoind and a swap over real nodes. With `--workdir` its phases can run in separate processes (`--phases 1-6`, `7-8`, `9`). `fleet_regtest` is the multi-node test: production-mode launches, P2P on localhost, real time; gating, state agreement (tip, UTXO set, Bitcoin relay, every obligation) across nodes, late joiner, restarts, partitions and reorgs in both directions including a forged Bitcoin header branch, two competing pools, AuxPoW blocks over P2P, the settlement lock in the mempool, transaction relay, `verifychain`, stall relief against the wall clock.
+
+`hashfun/yieldstate.py` is the sats-leg state machine written again from the rules, not from the node's code: the coin list, held coinbases, the draw over live coins, one tag list per payment, the settlement deadline, undo, the end of the leg. `test_yieldstate` exercises it alone. `yield_regtest` runs a real node and a regtest bitcoind through a scripted chain (the first blocks with nobody holding, five kinds of proof that must be ignored, a Bitcoin reorg, redirects, 60 self-transfers, a competing branch, the deadline, graduation, merge-mined blocks, the end of the leg) and compares `getmintobligation` at every height, `getlaunchinfo.earning` and the Bitcoin relay with the model after every block, after each of four restarts and after every reorg: 274 blocks, about 36,000 obligation comparisons, the first difference stops the run. The review's critical findings each have a named check there (C1: a restarted node against a live one; C2: one Bitcoin output with two tag lists; C3: self-transfers and the UTXO set against the live coins).
 
 `book_regtest` is the timelock test. `web_regtest` runs the swap engine in browsers on locks of 40 s to 4 min because it cannot wait hours; here the same engine (`book.js`, hosted by node through `tests/enginehost.mjs`) runs on the shipped numbers against a stock bitcoind and a hashfund test launch, with one clock for both nodes, the board and both traders, moved by the test. Every transaction goes through the nodes, so a refund tried before its timelock is refused by consensus, not by the engine. H1 drives `hashfun book` itself on the real clock (encrypted key file, post, run, take). S1 and S6 are the two directions done honestly: both contracts must carry exactly the timelocks and confirmation counts of the table in The peer-to-peer book. S2 to S5 are the stops (maker gone after the taker locked, taker gone after the maker locked, taker arriving too close to the maker's refund, taker's lock confirming too late): each lock goes back to its owner when its timelock says and not before, and nobody is out more than fees. S7 and S8 are dishonest counterparties: a taker's contract with a shorter timelock, an underfunded lock, a lock on another script; a maker's contract that refunds early or is short. The honest engine locks for none of the first, claims none of the second, and takes its own lock back.
 
