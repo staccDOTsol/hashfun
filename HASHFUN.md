@@ -325,6 +325,17 @@ Amounts are sats for Bitcoin and whole coins (decimals allowed) for launch coins
 
 `cd contrib/hashfun/npm && npm pack` first runs `scripts/copy-py.js`, which copies the Python package, the site and the engine in and refuses to pack unless all four binaries are there (a package without one does not work on that platform) and each file's own header says it is what its directory claims: the right system and processor, and for Linux statically linked. `HASHFUN_PACK_PARTIAL=1 npm pack` packs whatever `dist/build.sh` has built on this machine, for this machine; such a tarball is never for publishing.
 
+## Mining without installing anything
+
+Coins only come from blocks, and nobody installs a CLI to get one. `hashfun web --pool` makes the site the way in (`hashfun/sitepool.py`):
+
+- **Mine me a block.** The page puts the visitor's launch address in a queue; the server's CPU mines (only while someone waits) and the next block it finds pays the address at the head of the queue, output 0. With `--operator-pubkey` the operator's address on that launch takes `--pool-cut-bps` (default 5%) of those blocks, as output 1, in coins.
+- **The visitor pays the block's sats.** Once the block's draw is made the page lists what each of the visitor's blocks owes and to which Bitcoin script (`GET /api/coin/T/due?address=`), and pays up to three in one transaction from the page's own key: output i pays block i's drawn script, then the `HF` tag list. If the key is short, it asks UniSat for a top-up first. The site never receives the money: it goes to the holder, creator or dev the draw named.
+- **The site proves it.** `settler.WatchSettler` has no wallet. It keeps the obligations that are due, reads every new Bitcoin block for a transaction whose first tag list names one of them with an output paying the drawn script enough, and publishes the proof in a later block. A payment made from anywhere counts. While a block that owes waits for its draw, or a payment for its proof, the server mines the blocks that carry them (to the operator's address), so a quiet launch does not stall.
+- **A public stratum per launch** on P2P port + 2: `stratum+tcp://site:port`, username = a launch address. Whoever finds the block gets the whole coinbase at that address and unlocks it the same way on the page. A share is never harder than the block itself, so a miner on a young launch sends the blocks it finds.
+
+The server holds no Bitcoin and nobody's coins. What it spends is CPU; on ASIC presets its CPU finds nothing and the hash has to come through the stratum. `sitepool_regtest` runs the whole path, including a real browser: ask, mine, draw, pay from the page, proof, unlock.
+
 ## Running the public site
 
 `contrib/hashfun/server/install.sh` turns a fresh Ubuntu 22.04/24.04 box (x86_64 or arm64) into the site: `sudo DOMAIN=example.com EMAIL=you@example.com bash install.sh`. It installs Bitcoin Core 32.1 (pinned hash), hashfun, Caddy (HTTPS from Let's Encrypt) and the firewall (22, 80, 443, 8333, and 20000..32767 for launch nodes), and three services: `bitcoind`, `hashfun-web` (every registered launch's node, then the site) and, when the disk allows, `fulcrum`. Safe to run again.

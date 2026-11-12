@@ -412,6 +412,14 @@ class Session:
         if not self.subscribed or not self.username or self.server.source.tmpl is None:
             return
         job = self.server.source.make_job(self.server.next_job_id(), self.username, clean)
+        # A share must never be harder than the block: on a young launch the block target is far
+        # easier than share difficulty 1, and a miner held to 1 would find blocks and not send them.
+        net = job.ctx.get("target") if isinstance(getattr(job, "ctx", None), dict) else None
+        if net:
+            net_diff = target_for_difficulty(1.0) / net
+            if self.difficulty > net_diff:
+                self.difficulty = max(self.server.min_difficulty, net_diff)
+                self.notify("mining.set_difficulty", [self.difficulty])
         if clean:
             self.jobs.clear()
             self.seen.clear()
@@ -558,6 +566,8 @@ class StratumServer:
                 await writer.drain()
         except (ConnectionError, asyncio.IncompleteReadError):
             pass
+        except Exception:
+            log.exception("stratum session of %s ended on an error", s.username or "?")
         finally:
             self.sessions.remove(s)
             writer.close()

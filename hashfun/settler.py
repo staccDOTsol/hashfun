@@ -286,13 +286,8 @@ class Settler:
                         self._lose(key, "the draw changed after payment")
                     continue
                 p.pop("bad", None)
-                try:
-                    tx = self.btc.gettransaction(p["txid"])
-                except RPCError:
-                    try:  # the wallet does not know it (crash before broadcast): send it now
-                        self.btc.sendrawtransaction(p["hex"])
-                    except RPCError as e:
-                        self._lose(key, f"payment tx not broadcastable: {e}")
+                tx = self._payment_tx(key, p)
+                if tx is None:
                     continue
                 confs = tx.get("confirmations", 0)
                 if confs < 0:
@@ -315,8 +310,170 @@ class Settler:
             self._save()
             return outs
 
+    def _payment_tx(self, key: str, p: dict) -> Optional[dict]:
+        """{confirmations, blockhash, hex} of the payment recorded at key; None: not now."""
+        try:
+            return self.btc.gettransaction(p["txid"])
+        except RPCError:
+            try:  # the wallet does not know it (crash before broadcast): send it now
+                self.btc.sendrawtransaction(p["hex"])
+            except RPCError as e:
+                self._lose(key, f"payment tx not broadcastable: {e}")
+            return None
+
     def coinbase_outputs(self) -> List[TxOut]:
         """Everything the next block's coinbase should carry: headers first, then proofs."""
         with self.lock:
             self.pay_due()
             return self.relay_outputs() + self.proof_outputs()
+
+
+class WatchSettler(Settler):
+    """Settles every block that anyone pays for, and pays nothing itself: no Bitcoin wallet.
+
+    For a site whose users pay their own blocks' sats from their browser wallets. It keeps a list
+    of the obligations that are due (drawn, pay > 0, unsettled, before their deadline), reads each
+    new Bitcoin block for transactions whose first "HF" tag list names one of them with an output
+    that pays the drawn script enough, and once such a payment is buried it publishes the proof,
+    like the paying Settler. A payment made anywhere (this site, another wallet, by hand) counts.
+    """
+
+    LOOKBACK_BTC = 144  # Bitcoin blocks read back at the first start: a day of payments
+
+    def __init__(self, launch: RPC, btc: RPC, state_path: str):
+        super().__init__(launch, btc, state_path, max_pay_sats=None, pay_depth=0)
+        self.st.setdefault("due", {})       # "height:hash" -> obligation (tag, pay, pay_script, deadline_height)
+        self.st.setdefault("next", 0)       # the next launch height whose draw to look at
+        self.st.setdefault("scanned", -1)   # the last Bitcoin height read for payments
+        self.st.setdefault("scanned_hash", "")
+
+    def status(self) -> dict:
+        with self.lock:
+            return {"due": len(self.st["due"]), "paid_awaiting_proof": len(self.st["paid"]),
+                    "bitcoin_scanned_to": self.st["scanned"]}
+
+    def due(self, script_hex: Optional[str] = None) -> List[dict]:
+        """What is owed and unpaid now; with script_hex, only blocks whose coinbase pays it."""
+        with self.lock:
+            out = [dict(ob, key=k, paid=k in self.st["paid"]) for k, ob in self.st["due"].items()]
+        if script_hex is not None:
+            out = [o for o in out if script_hex in o.get("owners", [])]
+        return sorted(out, key=lambda o: o["height"])
+
+    def needs_blocks(self) -> bool:
+        """Is something waiting for blocks: a payment for its proof, or a recent block that owes
+        sats for its draw (DRAW_DELAY blocks on top of it)?"""
+        with self.lock:
+            if self.st["paid"]:
+                return True
+        tip = self.launch.getblockcount()
+        for h in range(max(1, tip - Y.DRAW_DELAY + 1), tip + 1):
+            ob = self._obligation(h)
+            if ob["curve"] and ob["owed"] > 0 and not ob["draw_known"]:
+                return True
+        return False
+
+    def _lose(self, key: str, why: str):
+        # Nothing of ours was spent: the block is simply due again, if it still can be.
+        p = self.st["paid"].pop(key)
+        log.info("block %s: payment %s no longer counts (%s)", key, p["txid"], why)
+
+    def _payment_tx(self, key: str, p: dict) -> Optional[dict]:
+        try:
+            hdr = self.btc.getblockheader(p["blockhash"])
+        except RPCError:
+            hdr = {"confirmations": -1}
+        if hdr["confirmations"] < 0:  # its Bitcoin block left the best chain: read again from there
+            self.st["scanned"] = min(self.st["scanned"], p["btc_height"] - 1)
+            self.st["paid"].pop(key, None)
+            return None
+        return {"confirmations": hdr["confirmations"], "blockhash": p["blockhash"], "hex": p["hex"]}
+
+    def _coinbase_owners(self, height: int) -> List[str]:
+        blk = self.launch.getblock(self.launch.getblockhash(height), 2)
+        return [o["scriptPubKey"]["hex"] for o in blk["tx"][0]["vout"] if o["value"] > 0]
+
+    def _learn_draws(self):
+        tip = self.launch.getblockcount()
+        if self.st["next"] == 0:
+            info = self.launch.getlaunchinfo()
+            dl = (info.get("descriptor") or {}).get("settle_deadline", 17280)
+            self.st["next"] = max(1, tip - dl)
+        last = tip - Y.DRAW_DELAY
+        h = self.st["next"]
+        while h <= last and h < self.st["next"] + 2000:
+            ob = self._obligation(h)
+            if ob["curve"] and ob["draw_known"] and ob["pay"] > 0 and not ob["settled"] and tip < ob["deadline_height"]:
+                self.st["due"][f"{h}:{ob['hash']}"] = {
+                    "height": h, "hash": ob["hash"], "tag": ob["tag"], "pay": ob["pay"], "payee": ob["payee"],
+                    "pay_script": ob["pay_script"], "deadline_height": ob["deadline_height"],
+                    "owners": self._coinbase_owners(h)}
+            h += 1
+        self.st["next"] = h
+        # Drop what is settled, past its deadline, or reorged out (a reorged height is looked at again).
+        for k, ob in list(self.st["due"].items()):
+            if k in self.st["paid"]:
+                continue
+            try:
+                now = self._obligation(ob["height"]) if ob["height"] <= tip else None
+            except RPCError:
+                now = None
+            if now is None or now["hash"] != ob["hash"] or not now["draw_known"]:
+                del self.st["due"][k]
+                self.st["next"] = min(self.st["next"], ob["height"])
+            elif now["settled"] or tip >= now["deadline_height"]:
+                del self.st["due"][k]
+
+    def _scan_bitcoin(self):
+        tip = self.btc.getblockcount()
+        if self.st["scanned"] < 0:
+            self.st["scanned"] = max(0, tip - self.LOOKBACK_BTC)
+        elif self.st["scanned_hash"] and self.st["scanned"] <= tip and \
+                self.btc.getblockhash(self.st["scanned"]) != self.st["scanned_hash"]:
+            self.st["scanned"] = max(0, self.st["scanned"] - 12)  # a Bitcoin reorg: read the last blocks again
+        by_tag = {ob["tag"]: k for k, ob in self.st["due"].items() if k not in self.st["paid"]}
+        h = self.st["scanned"] + 1
+        while h <= tip and h <= self.st["scanned"] + 24:
+            bh = self.btc.getblockhash(h)
+            if by_tag:
+                for tx in self.btc.getblock(bh, 2)["tx"]:
+                    self._match(tx, h, bh, by_tag)
+            self.st["scanned"], self.st["scanned_hash"] = h, bh
+            h += 1
+
+    def _match(self, tx: dict, height: int, bhash: str, by_tag: dict):
+        vouts = tx.get("vout", [])
+        for o in vouts:
+            data = Y.tagged_return(bytes.fromhex(o["scriptPubKey"]["hex"]), b"HF")
+            if data is None:
+                continue
+            if (len(data) - 2) % 20:
+                return  # the first tag list is malformed: the transaction binds nothing
+            for i in range(0, (len(data) - 2) // 20):
+                key = by_tag.get(data[2 + 20 * i:22 + 20 * i].hex())
+                if key is None or i >= len(vouts):
+                    continue
+                ob, out = self.st["due"][key], vouts[i]
+                sats = round(out["value"] * 1e8)
+                if out["scriptPubKey"]["hex"] == ob["pay_script"] and sats >= ob["pay"]:
+                    self.st["paid"][key] = {"txid": tx["txid"], "vout": i, "sats": sats, "payee": ob["payee"],
+                                            "pay_script": ob["pay_script"], "hex": tx["hex"],
+                                            "blockhash": bhash, "btc_height": height}
+                    log.info("block %s: paid on Bitcoin in %s", key, tx["txid"])
+            return  # only the first tag list counts
+
+    def pay_due(self):
+        with self.lock:
+            self._learn_draws()
+            self._scan_bitcoin()
+            for k in list(self.st["paid"]):
+                if k not in self.st["due"]:
+                    ob = None
+                    try:
+                        h = int(k.split(":")[0])
+                        ob = self._obligation(h)
+                    except RPCError:
+                        pass
+                    if ob is None or ob["settled"] or ob["hash"] != k.split(":")[1]:
+                        self.st["paid"].pop(k, None)
+            self._save()

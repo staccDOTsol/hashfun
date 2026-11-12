@@ -71,6 +71,69 @@ async function rightChain(u, ask) {
   return true;
 }
 // Every payment the page asks the wallet for goes through here.
+// ---------------------------------------------------------------- mining from the page
+// The site's pool mines a block that pays the visitor's address; the visitor then pays that
+// block's sats themselves, to the script the draw fixed: one Bitcoin transaction from the page's
+// key, output i bound to block i by the tag list. Nobody holds anything for anybody.
+async function payDues(dues) {
+  const group = dues.slice(0, 3), need = group.reduce((a, x) => a + x.pay, 0);
+  const t = await api('/chain/btc/time');
+  const us = (await api(`/chain/btc/address/${btcAddr()}`)).utxos.filter((u) => u.confirmations > 0).sort((a, b) => b.value - a.value);
+  const sel = []; let total = 0, fee = 0;
+  for (const u of us) {
+    sel.push(u); total += u.value;
+    fee = t.feerate * (11 + 68 * sel.length + 43 * group.length + 12 + 20 * group.length + 31);
+    if (total >= need + fee) break;
+  }
+  if (total < need + fee) {
+    const gap = need + fee - total + 1000;
+    if (confirm(`Paying takes ${fmt(need + fee)} sats at your hashfun key and it holds ${fmt(total)}. Move ${fmt(gap)} sats there from UniSat now? It counts after 1 confirmation.`)) await walletPay(btcAddr(), gap);
+    throw new Error('Top-up on its way. Pay again after 1 confirmation.');
+  }
+  const outs = group.map((x) => ({ value: x.pay, script: B.unhex(x.pay_script) }));
+  outs.push({ value: 0, script: B.cat(Uint8Array.of(0x6a), B.push(B.cat(B.utf8('HF'), ...group.map((x) => B.unhex(x.tag))))) });
+  if (total - need - fee >= 600) outs.push({ value: total - need - fee, script: B.addressToScript(btcAddr(), cfg.btc) });
+  return (await api('/chain/btc/tx', { hex: B.txHex(B.signP2wpkh(W.key, sel, outs)) })).txid;
+}
+
+function minePanel(ticker, d, repaint) {
+  const pool = d.pool, box = h('div', { class: 'col', style: 'gap:10px' });
+  const paidKey = `hf-paid-${ticker}`;
+  const paid = () => { try { return JSON.parse(localStorage.getItem(paidKey) || '{}'); } catch (e) { return {}; } };
+  const load = async () => {
+    if (!W.pub) return box.replaceChildren();
+    try {
+      const sent = paid(), all = await api(`/coin/${ticker}/due?address=${launchAddr(ticker)}`);
+      const dues = all.filter((x) => !x.paid && !sent[x.key]), waiting = all.filter((x) => x.paid || sent[x.key]);
+      const sum = dues.reduce((a, x) => a + x.pay, 0);
+      box.replaceChildren(
+        dues.length ? h('div', { class: 'col', style: 'gap:8px' },
+          h('p', {}, `${dues.length} of your block${dues.length > 1 ? 's' : ''} owe${dues.length > 1 ? '' : 's'} ${fmt(sum)} sats. Pay and the coins unlock; unpaid by block ${dues[0].deadline_height}, they are gone.`),
+          h('button', { class: 'btn wide', id: 'paydue', type: 'button', onclick: async () => {
+            try { const txid = await payDues(dues); const m = paid(); dues.slice(0, 3).forEach((x) => { m[x.key] = txid; }); localStorage.setItem(paidKey, JSON.stringify(m)); toast(`Paid in ${short(txid)}. Unlocks after 1 Bitcoin confirmation.`); load(); } catch (e) { toast(e.message, true); }
+          } }, `Pay ${fmt(dues.slice(0, 3).reduce((a, x) => a + x.pay, 0))} sats`)) : null,
+        waiting.length ? h('p', { class: 'muted', style: 'font-size:13px' }, `${waiting.length} payment${waiting.length > 1 ? 's' : ''} waiting for a Bitcoin confirmation.`) : null);
+    } catch (e) { box.replaceChildren(); }
+  };
+  load();
+  const iv = setInterval(() => { if (!box.isConnected) clearInterval(iv); else load(); }, 8000);
+  const ask = async () => {
+    try {
+      await needWallet();
+      const r = await api(`/coin/${ticker}/queue`, { address: launchAddr(ticker), blocks: 1 });
+      toast(r.position ? `Queued: ${r.position} ahead of you.` : 'Mining your block now.');
+      repaint();
+    } catch (e) { toast(e.message, true); }
+  };
+  return h('div', { class: 'pad col', style: 'gap:14px' },
+    h('p', { class: 'soft' }, 'Coins are mined, not sold. This site mines a block for you; the block pays your address. Then you pay what that block owes in sats, straight to the holder it drew, and the coins unlock.'),
+    h('button', { class: 'btn wide', id: 'mineme', type: 'button', onclick: ask }, pool.queue ? `Mine me a block (${pool.queue} waiting)` : 'Mine me a block'),
+    box,
+    h('p', { class: 'muted', style: 'font-size:13px' }, pool.cut_bps ? `The site keeps ${pool.cut_bps / 100}% of each block it mines for you, in coins.` : 'The site keeps nothing of the block.'),
+    h('p', { class: 'muted', style: 'font-size:13px' }, 'Have hash? Point it here, your address as the username, and every block you find is yours whole:'),
+    h('pre', { class: 'code' }, `stratum+tcp://${location.hostname}:${pool.stratum_port}\nuser: ${W.pub ? launchAddr(ticker) : '[YOUR ' + ticker + ' ADDRESS]'}`));
+}
+
 async function walletPay(address, sats) {
   const u = window.unisat;
   await rightChain(u, true);
@@ -301,7 +364,8 @@ function coin(view, ticker) {
     let body;
     if (side === 'mine') {
       const desc = d ? 'data:application/json,' + encodeURIComponent(JSON.stringify(d.descriptor, null, 2)) : '#';
-      body = h('div', { class: 'pad col', style: 'gap:14px' }, h('p', { class: 'soft' }, 'The cheapest way in: no maker in between. Point SHA-256 hash at this coin and blocks pay you directly.'),
+      if (d && d.pool) body = minePanel(ticker, d, () => { if (side === 'mine') paintTrade(); });
+      else body = h('div', { class: 'pad col', style: 'gap:14px' }, h('p', { class: 'soft' }, 'The cheapest way in: no maker in between. Point SHA-256 hash at this coin and blocks pay you directly.'),
         h('a', { class: 'ghost', href: desc, download: `${ticker.toLowerCase()}.json` }, 'Download the descriptor'),
         h('pre', { class: 'code' }, `npm i -g hashfun\nhashfun node add ${ticker.toLowerCase()}.json --peer ${location.hostname}:${d && d.p2p_port ? d.p2p_port : '[PORT]'}\nhashfun node up ${ticker}\nhashfun mine ${ticker} \\\n  --payout ${W.pub ? launchAddr(ticker) : '[YOUR ' + ticker + ' ADDRESS]'} \\\n  --btc-rpc [YOUR BITCOIN NODE]`),
         h('p', { class: 'muted', style: 'font-size:13px' }, 'Each block you mine owes BTC to the drawn holder. The miner pays it from its own Bitcoin wallet, automatically, before the coins unlock.'));

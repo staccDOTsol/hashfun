@@ -301,6 +301,7 @@ class Site:
                  book_confs=6, book_lock=14400, book_min_lock=600, btc_index: "BtcIndex" = None):
         self.btc, self.reg, self.maker, self.allow_launch = btc, registry, maker, allow_launch
         self.btc_index = btc_index
+        self.pools = None  # sitepool.SitePools when this site mines (hashfun web --pool)
         self.launch_args = list(launch_args)
         # What the page proposes for peer-to-peer swaps: confirmations to wait for on a launch
         # chain (Bitcoin: 1) and the length of the second lock. Each trader's page enforces its own.
@@ -436,6 +437,11 @@ class Site:
                     with self.lock:
                         self.coins[t] = CoinIndex(t, rpc, d, self.btc_hrp, refused=refused)
                         self.coins[t].p2p_port = (self.reg.data.get(t) or {}).get("p2pport")
+                    if self.pools is not None and not refused:
+                        try:
+                            self.pools.ensure(t, rpc, d)
+                        except Exception as e:
+                            log.warning("%s: no pool: %s", t, e)
         for c in list(self.coins.values()):
             c.poll()
 
@@ -617,7 +623,21 @@ def handler(site: Site):
             if parts and parts[0] == "book":
                 return site.book.api(method, parts[1:], q, body)
             if len(parts) >= 2 and parts[0] == "coin" and len(parts) == 2:
-                return site.coin(parts[1]).detail()
+                out = site.coin(parts[1]).detail()
+                if site.pools is not None:
+                    out["pool"] = site.pools.info(parts[1])
+                return out
+            if len(parts) == 3 and parts[0] == "coin" and parts[2] == "queue" and method == "POST":
+                if site.pools is None:
+                    raise KeyError("this site does not mine")
+                site.coin(parts[1])
+                return site.pools.enqueue(parts[1], str(body.get("address", "")), int(body.get("blocks", 1)))
+            if len(parts) == 3 and parts[0] == "coin" and parts[2] == "due":
+                if site.pools is None:
+                    raise KeyError("this site does not mine")
+                c = site.coin(parts[1])
+                script = address_to_script(q.get("address", ""), c.d.hrp).hex()
+                return site.pools.due(parts[1], script)
             if len(parts) == 4 and parts[0] == "coin" and parts[2] == "address":
                 c = site.coin(parts[1])
                 return c.address(address_to_script(parts[3], c.d.hrp).hex())
@@ -695,6 +715,20 @@ def build_maker(cfg_path: str, reg, btc: RPC):
     return Maker(NodeChain("BTC", bw, cfg["btc"].get("hrp", "bc")), forks, ks, cfg, os.path.join(base, cfg.get("state", "maker_orders.json")))
 
 
+class _OperatorMap(dict):
+    """ticker -> the operator's address on that launch, worked out when first asked."""
+
+    def __init__(self, addr_for_hrp, reg):
+        super().__init__()
+        self.addr_for_hrp, self.reg = addr_for_hrp, reg
+
+    def get(self, ticker, default=None):
+        try:
+            return self.addr_for_hrp(self.reg.desc(ticker).hrp)
+        except Exception:
+            return default
+
+
 def serve(site: Site, host: str, port: int) -> ThreadingHTTPServer:
     srv = ThreadingHTTPServer((host, port), handler(site))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -713,6 +747,14 @@ def main(argv=None):
                     help="an Electrum-protocol index of the same Bitcoin chain (electrs, Fulcrum): Bitcoin balances "
                          "in milliseconds instead of a UTXO-set scan of about a minute each; the scan stays the fallback")
     ap.add_argument("--listen", default="127.0.0.1:8080")
+    ap.add_argument("--pool", action="store_true",
+                    help="mine here: a public stratum per launch (P2P port + 2), and the server's CPU mines a block "
+                         "for each visitor who asks; whoever a block pays pays its sats from their own wallet")
+    ap.add_argument("--pool-host", default="0.0.0.0")
+    ap.add_argument("--pool-cpu", type=float, default=1.0, help="share of one core the CPU miner uses (0 = no CPU miner)")
+    ap.add_argument("--operator-pubkey", help="compressed public key (hex) whose address on each launch gets --pool-cut-bps "
+                                              "of the blocks the server mines for visitors")
+    ap.add_argument("--pool-cut-bps", type=int, default=500)
     ap.add_argument("--maker", help="maker config JSON: run a swap maker in this process")
     ap.add_argument("--allow-launch", action="store_true", help="let the launch form create chains on this machine")
     ap.add_argument("--launch-arg", action="append", default=[], help="extra hashfund argument for chains created here")
@@ -729,6 +771,17 @@ def main(argv=None):
     site = Site(btc, reg, maker, a.allow_launch, a.launch_arg, book_path=os.path.join(home(), "book.json"),
                 book_confs=a.book_confs, book_lock=a.book_lock,
                 btc_index=BtcIndex(a.btc_electrum) if a.btc_electrum else None)
+    if a.pool:
+        from .sitepool import SitePools
+        from .ser import p2wpkh_script, script_to_address
+        ops = {}
+        if a.operator_pubkey:
+            pk = bytes.fromhex(a.operator_pubkey)
+            if len(pk) != 33 or pk[0] not in (2, 3):
+                raise SystemExit("--operator-pubkey must be a 33-byte compressed public key in hex")
+            ops = _OperatorMap(lambda hrp: script_to_address(p2wpkh_script(pk), hrp), reg)
+        site.pools = SitePools(site, operator=ops, cut_bps=a.pool_cut_bps if a.operator_pubkey else 0,
+                               cpu=a.pool_cpu > 0, host=a.pool_host, duty=a.pool_cpu or 1.0)
     host, port = a.listen.rsplit(":", 1)
     serve(site, host, int(port))
     print(json.dumps({"site": f"http://{host}:{port}", "bitcoin": site.btc_chain, "launches": sorted(reg.data),

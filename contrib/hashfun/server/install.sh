@@ -14,6 +14,12 @@
 #   INDEX=1|0   a Bitcoin index (Fulcrum) so the site reads any address's sats in milliseconds instead
 #               of a UTXO-set scan of about a minute each. Needs every block kept (PRUNE=0, about
 #               1.1 TB of disk in all). Default: on when the disk has room, else off (the scan stays).
+#   POOL=0      the site does not mine. By default it does: visitors press "Mine me a block", the box's
+#               CPU mines it to their address and they pay that block's sats from their own wallet;
+#               and every launch has a public stratum port for anyone's hash. The box holds no Bitcoin.
+#   OPERATOR_PUBKEY  33-byte compressed public key (hex): its address on each launch gets POOL_CUT_BPS
+#               (default 500 = 5%) of the blocks mined for visitors, in coins. Without it: no cut.
+#   POOL_CPU    share of one core the miner may use (default 1.0)
 #   ALLOW_LAUNCH=0   the launch form is off (by default anyone on the site can launch a coin here)
 #   HASHFUN_TGZ      install hashfun from this tarball (path or URL) instead of npm
 #
@@ -44,6 +50,10 @@ PRUNE="${PRUNE:-}"
 INDEX="${INDEX:-}"
 SNAPSHOT="${SNAPSHOT:-1}"
 ALLOW_LAUNCH="${ALLOW_LAUNCH:-1}"
+POOL="${POOL:-1}"
+OPERATOR_PUBKEY="${OPERATOR_PUBKEY:-}"
+POOL_CUT_BPS="${POOL_CUT_BPS:-500}"
+POOL_CPU="${POOL_CPU:-1.0}"
 HASHFUN_TGZ="${HASHFUN_TGZ:-}"
 ROOT="${ROOT:-}"            # tests: install under this prefix, touch nothing else
 DRY="${DRY:-0}"             # tests: print what would run
@@ -93,6 +103,12 @@ if [ "$INDEX" = 1 ]; then
 fi
 PRUNE="${PRUNE:-20000}"
 case "$PRUNE" in *[!0-9]*) die "PRUNE must be a number of MB" ;; esac
+if [ -n "$OPERATOR_PUBKEY" ]; then
+  case "$OPERATOR_PUBKEY" in 02* | 03*) ;; *) die "OPERATOR_PUBKEY must be a compressed public key (66 hex characters starting 02 or 03)" ;; esac
+  case "$OPERATOR_PUBKEY" in *[!0-9a-fA-F]*) die "OPERATOR_PUBKEY must be hex" ;; esac
+  [ "${#OPERATOR_PUBKEY}" = 66 ] || die "OPERATOR_PUBKEY must be 66 hex characters"
+fi
+case "$POOL_CUT_BPS" in *[!0-9]* | '') die "POOL_CUT_BPS must be a number" ;; esac
 [ "$PRUNE" = 0 ] || [ "$PRUNE" -ge 550 ] || die "PRUNE must be 0 or at least 550"
 
 # ---- 1. packages -----------------------------------------------------------------------------
@@ -294,6 +310,10 @@ fi
 flags="--btc-rpc http://127.0.0.1:8332 --btc-cookie $BTCDIR/.cookie --listen 127.0.0.1:8080"
 [ "$INDEX" = 1 ] && flags="$flags --btc-electrum 127.0.0.1:50001"
 [ "$ALLOW_LAUNCH" = 1 ] && flags="$flags --allow-launch"
+if [ "$POOL" = 1 ]; then
+  flags="$flags --pool --pool-cpu $POOL_CPU"
+  [ -n "$OPERATOR_PUBKEY" ] && flags="$flags --operator-pubkey $OPERATOR_PUBKEY --pool-cut-bps $POOL_CUT_BPS"
+fi
 unit hashfun-web.service "[Unit]
 Description=hashfun: every launch's node and the site
 After=bitcoind.service
