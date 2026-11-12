@@ -44,6 +44,7 @@ class CoinIndex:
     each owed and whom it paid, who holds the coins, the price history."""
 
     def __init__(self, ticker: str, rpc: RPC, d: D.Launch, btc_hrp: str, refused: Optional[str] = None):
+        self.p2p_port = None  # set by the site from its registry
         self.ticker, self.rpc, self.d, self.btc_hrp = ticker, rpc, d, btc_hrp
         self.lock = threading.RLock()
         # refused: why the site does not serve this launch (its Bitcoin anchor is not what the site's
@@ -188,6 +189,9 @@ class CoinIndex:
             s["top_holders"] = [{"address": script_to_address(bytes.fromhex(k), self.d.hrp) or k, "script": k, "value": v}
                                 for k, v in top]
             s["descriptor"] = self.d.to_json()
+            # where this site's node of the launch listens: a miner's node must join it, or it
+            # mines a chain of its own that nobody else follows
+            s["p2p_port"] = self.p2p_port or self.d.p2p
         return s
 
     def address(self, script_hex: str) -> dict:
@@ -431,6 +435,7 @@ class Site:
                         log.warning("%s: not served: %s", t, refused)
                     with self.lock:
                         self.coins[t] = CoinIndex(t, rpc, d, self.btc_hrp, refused=refused)
+                        self.coins[t].p2p_port = (self.reg.data.get(t) or {}).get("p2pport")
         for c in list(self.coins.values()):
             c.poll()
 

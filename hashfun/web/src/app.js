@@ -303,7 +303,7 @@ function coin(view, ticker) {
       const desc = d ? 'data:application/json,' + encodeURIComponent(JSON.stringify(d.descriptor, null, 2)) : '#';
       body = h('div', { class: 'pad col', style: 'gap:14px' }, h('p', { class: 'soft' }, 'The cheapest way in: no maker in between. Point SHA-256 hash at this coin and blocks pay you directly.'),
         h('a', { class: 'ghost', href: desc, download: `${ticker.toLowerCase()}.json` }, 'Download the descriptor'),
-        h('pre', { class: 'code' }, `npm i -g hashfun\nhashfun node add ${ticker.toLowerCase()}.json\nhashfun node up ${ticker}\nhashfun mine ${ticker} \\\n  --payout ${W.pub ? launchAddr(ticker) : '[YOUR ' + ticker + ' ADDRESS]'} \\\n  --btc-rpc [YOUR BITCOIN NODE]`),
+        h('pre', { class: 'code' }, `npm i -g hashfun\nhashfun node add ${ticker.toLowerCase()}.json --peer ${location.hostname}:${d && d.p2p_port ? d.p2p_port : '[PORT]'}\nhashfun node up ${ticker}\nhashfun mine ${ticker} \\\n  --payout ${W.pub ? launchAddr(ticker) : '[YOUR ' + ticker + ' ADDRESS]'} \\\n  --btc-rpc [YOUR BITCOIN NODE]`),
         h('p', { class: 'muted', style: 'font-size:13px' }, 'Each block you mine owes BTC to the drawn holder. The miner pays it from its own Bitcoin wallet, automatically, before the coins unlock.'));
     } else if (!cfg.maker) {
       body = h('div', { class: 'pad col' }, h('p', { class: 'soft' }, 'No instant maker on this site right now. Trade it peer to peer, or mine it.'), h('a', { class: 'btn wide', href: `#/swap/btc/${ticker}` }, 'Open the book'));
