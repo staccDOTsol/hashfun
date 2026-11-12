@@ -225,10 +225,78 @@ class _Asked:
         return call
 
 
+class BtcIndex:
+    """Bitcoin balances from an Electrum-protocol index (electrs, Fulcrum, ElectrumX): every
+    script answered in milliseconds, many in one round trip. Without one the site scans the
+    whole UTXO set per question (about a minute on mainnet, one at a time)."""
+
+    def __init__(self, hostport: str, timeout: float = 20.0):
+        host, port = hostport.rsplit(":", 1)
+        self.host, self.port, self.timeout = host.strip("[]"), int(port), timeout
+        self.lock = threading.Lock()
+        self.sock, self.buf, self.id = None, b"", 0
+
+    def _connect(self):
+        import socket
+        self.sock = socket.create_connection((self.host, self.port), timeout=self.timeout)
+        self.buf = b""
+        self._round([("server.version", ["hashfun", "1.4"])])
+
+    def _round(self, calls):
+        ids = []
+        out = b""
+        for method, params in calls:
+            self.id += 1
+            ids.append(self.id)
+            out += json.dumps({"jsonrpc": "2.0", "id": self.id, "method": method, "params": params}).encode() + b"\n"
+        self.sock.sendall(out)
+        got = {}
+        while len(got) < len(ids):
+            while b"\n" not in self.buf:
+                chunk = self.sock.recv(1 << 16)
+                if not chunk:
+                    raise ConnectionError("the Electrum index closed the connection")
+                self.buf += chunk
+            line, self.buf = self.buf.split(b"\n", 1)
+            msg = json.loads(line)
+            if msg.get("id") in ids:  # notifications (no id) are not asked for and are skipped
+                got[msg["id"]] = msg
+        res = []
+        for i in ids:
+            if got[i].get("error"):
+                raise RuntimeError(f"Electrum index: {got[i]['error']}")
+            res.append(got[i]["result"])
+        return res
+
+    def batch(self, calls):
+        with self.lock:
+            for attempt in (0, 1):  # reads only: safe to ask again once on a fresh connection
+                try:
+                    if self.sock is None:
+                        self._connect()
+                    return self._round(calls)
+                except (OSError, ConnectionError, ValueError):
+                    if self.sock is not None:
+                        self.sock.close()
+                    self.sock = None
+                    if attempt:
+                        raise
+
+    def unspent(self, scripts):
+        """{script hex: (tip height, [utxo...])} with confirmed and mempool outputs (height 0)."""
+        from .electrum import scripthash
+        scripts = list(scripts)
+        res = self.batch([("blockchain.headers.subscribe", [])] +
+                         [("blockchain.scripthash.listunspent", [scripthash(bytes.fromhex(s))]) for s in scripts])
+        tip = res[0]["height"]
+        return tip, {s: r for s, r in zip(scripts, res[1:])}
+
+
 class Site:
     def __init__(self, btc: RPC, registry, maker=None, allow_launch=False, launch_args=(), book_path=None,
-                 book_confs=6, book_lock=14400, book_min_lock=600):
+                 book_confs=6, book_lock=14400, book_min_lock=600, btc_index: "BtcIndex" = None):
         self.btc, self.reg, self.maker, self.allow_launch = btc, registry, maker, allow_launch
+        self.btc_index = btc_index
         self.launch_args = list(launch_args)
         # What the page proposes for peer-to-peer swaps: confirmations to wait for on a launch
         # chain (Bitcoin: 1) and the length of the second lock. Each trader's page enforces its own.
@@ -263,6 +331,15 @@ class Site:
         if not scripts and not new:
             self.bid_sats.clear()
             return
+        if self.btc_index is not None:
+            try:  # an index answers every key at once in milliseconds: no schedule, no pause
+                _tip, res = self.btc_index.unspent(sorted(scripts | new))
+                self.bid_sats = {x: sum(u["value"] for u in us if u["height"] > 0) for x, us in res.items()}
+                self.bid_wanted -= scripts | new
+                self.bid_scanned = time.time()
+                return
+            except Exception as e:
+                log.warning("Bitcoin index not answering (%s): scanning the UTXO set instead", e)
         if now - self.bid_scanned < (self.bid_pause if new else self.bid_every):
             return
         scripts |= new
@@ -415,7 +492,17 @@ class Site:
 
     def btc_address(self, script_hex: str):
         """Unspent Bitcoin outputs paying a script (BTC yield lands at the holder's own script).
-        Uses scantxoutset: instant on regtest, about a minute on mainnet, one scan at a time."""
+        From the Electrum index when there is one (milliseconds; mempool included, as 0
+        confirmations); else scantxoutset: instant on regtest, about a minute on mainnet, one at a time."""
+        if self.btc_index is not None:
+            try:
+                tip, res = self.btc_index.unspent([script_hex])
+                utxos = [{"txid": u["tx_hash"], "vout": u["tx_pos"], "value": u["value"],
+                          "confirmations": tip - u["height"] + 1 if u["height"] > 0 else 0} for u in res[script_hex]]
+                # balance: confirmed, as the scan reports it; the list also has what waits in the mempool
+                return {"balance": sum(u["value"] for u in utxos if u["confirmations"] > 0), "utxos": utxos}
+            except Exception as e:
+                log.warning("Bitcoin index not answering (%s): scanning the UTXO set instead", e)
         with self.scan_lock:
             r = self.btc.scantxoutset("start", [f"raw({script_hex})"])
         tip = r.get("height", 0)
@@ -617,6 +704,9 @@ def main(argv=None):
     ap.add_argument("--btc-rpc", required=True, help="Bitcoin Core RPC URL (reads, broadcasts, header anchor for new launches; "
                                                      "a registered launch is served only if its Bitcoin anchor is on this node's chain)")
     ap.add_argument("--btc-cookie")
+    ap.add_argument("--btc-electrum", metavar="HOST:PORT",
+                    help="an Electrum-protocol index of the same Bitcoin chain (electrs, Fulcrum): Bitcoin balances "
+                         "in milliseconds instead of a UTXO-set scan of about a minute each; the scan stays the fallback")
     ap.add_argument("--listen", default="127.0.0.1:8080")
     ap.add_argument("--maker", help="maker config JSON: run a swap maker in this process")
     ap.add_argument("--allow-launch", action="store_true", help="let the launch form create chains on this machine")
@@ -632,7 +722,8 @@ def main(argv=None):
     maker = build_maker(a.maker, reg, btc) if a.maker else None
     from .cli import home
     site = Site(btc, reg, maker, a.allow_launch, a.launch_arg, book_path=os.path.join(home(), "book.json"),
-                book_confs=a.book_confs, book_lock=a.book_lock)
+                book_confs=a.book_confs, book_lock=a.book_lock,
+                btc_index=BtcIndex(a.btc_electrum) if a.btc_electrum else None)
     host, port = a.listen.rsplit(":", 1)
     serve(site, host, int(port))
     print(json.dumps({"site": f"http://{host}:{port}", "bitcoin": site.btc_chain, "launches": sorted(reg.data),

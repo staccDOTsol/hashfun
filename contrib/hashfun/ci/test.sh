@@ -12,6 +12,7 @@
 #           with `hashfun doctor --replay` and must reach the same conclusions
 #   core    Bitcoin Core's own unit tests, when dist/build.sh built them (TESTS=1)
 #   e2e     one launch end to end on regtest: curve, graduation, merge mining, sats owed, swaps
+#   btcindex the site's Bitcoin balances from an Electrum index agree with the UTXO-set scan
 #   yield   the sats leg, a real node against the Python model of its rules, block by block
 #   fleet   several nodes, miners and a settler talking to each other
 #   book    peer-to-peer swaps on the shipped 4 h and 8 h timelocks (the test moves the clock)
@@ -38,7 +39,7 @@ while [ $# -gt 0 ]; do
     *) SUITES+=("$1"); shift ;;
   esac
 done
-[ ${#SUITES[@]} -gt 0 ] || SUITES=(unit diff web_js doctor core e2e yield fleet book web smoke)
+[ ${#SUITES[@]} -gt 0 ] || SUITES=(unit diff web_js doctor core e2e yield btcindex fleet book web smoke)
 mkdir -p "$LOGS"
 LOGS="$(cd "$LOGS" && pwd)"
 
@@ -131,6 +132,7 @@ for s in "${SUITES[@]}"; do
             else printf 'skip  %-7s not built (TESTS=1 bash contrib/hashfun/dist/build.sh)\n' core; fi ;;
     e2e)    if need_btc; then run e2e "$PY" -m hashfun.tests.e2e_regtest --hashfund "$HF" --bitcoind "$BTC"; else skip e2e "no bitcoind"; fi ;;
     yield)  if need_btc; then run yield "$PY" -m hashfun.tests.yield_regtest --hashfund "$HF" --bitcoind "$BTC"; else skip yield "no bitcoind"; fi ;;
+    btcindex) if need_btc; then run btcindex "$PY" -m hashfun.tests.btcindex_regtest --bitcoind "$BTC"; else skip btcindex "no bitcoind"; fi ;;
     fleet)  if need_btc; then run fleet "$PY" -m hashfun.tests.fleet_regtest --hashfund "$HF" --bitcoind "$BTC"; else skip fleet "no bitcoind"; fi ;;
     book)   if ! need_btc; then skip book "no bitcoind"; elif ! command -v node >/dev/null 2>&1; then skip book "node is not installed"
             else run book suite_book; fi ;;
