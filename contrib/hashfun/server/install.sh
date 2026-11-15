@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# hashfun server: Bitcoin Core (from a UTXO snapshot, usable in hours, not days), every launch's
-# node, and the site behind HTTPS, on a fresh Ubuntu 22.04 or 24.04 box (x86_64 or arm64).
+# hashfun server: Bitcoin Core (from a UTXO snapshot, usable in hours, not days), a Qwencoin node,
+# every launch's node, and the site behind HTTPS, on a fresh Ubuntu 22.04 or 24.04 box (x86_64 or
+# arm64). A launch is quoted in BTC and in QWEN: the site reads both chains.
 #
 #   curl -fsSLO https://raw.githubusercontent.com/staccDOTsol/hashfun/hashfun/contrib/hashfun/server/install.sh
 #   sudo DOMAIN=hash.fun EMAIL=you@example.com bash install.sh
@@ -21,12 +22,15 @@
 #               (default 500 = 5%) of the blocks mined for visitors, in coins. Without it: no cut.
 #   POOL_CPU    share of one core the miner may use (default 1.0)
 #   ALLOW_LAUNCH=0   the launch form is off (by default anyone on the site can launch a coin here)
+#   QWENCOIN=0  no Qwencoin node on this box. The site then cannot mine or settle on a launch's QWEN
+#               curve, nor launch coins (a launch is anchored in both chains). Qwencoin's work table
+#               (528 MB) is fetched all the same: every launch's node checks Qwencoin headers with it.
 #   HASHFUN_TGZ      install hashfun from this tarball (path or URL) instead of npm
 #
 # Safe to run again: it changes only what is not as it should be.
 #
 # Afterwards:
-#   hashfun-status            what the box is doing (Bitcoin sync, snapshot, launches, site)
+#   hashfun-status            what the box is doing (Bitcoin sync, snapshot, Qwencoin, launches, site)
 #   journalctl -u hashfun-web -f
 set -euo pipefail
 
@@ -42,7 +46,18 @@ SNAP_BLOCK=0000000000000000000147034958af1652b2b91bba607beacc5e72a56f0fb5ee
 FULCRUM_VER=2.1.4
 FULCRUM_SHA_x86_64=faf7cb36266c1694c834ad551d9592c0aef357bca66fdb5efdfe0d131c4b38ae
 FULCRUM_SHA_aarch64=bc9cda576bf889222e89c7616012e628597e4921f9116eebc759dfc854785b84
-RELEASE_TGZ=https://github.com/staccDOTsol/hashfun/releases/download/v0.1.0/hashfun-0.1.0.tgz
+# the release of this rule set (two curves): a box must not run an earlier one beside nodes that do
+RELEASE_TGZ=https://github.com/staccDOTsol/hashfun/releases/download/v0.2.0/hashfun-0.2.0.tgz
+# Qwencoin (https://github.com/staccDOTsol/qwencoin): the node as its project's workflow built and
+# released it for each platform, and where the chain's public node is at the moment (it can move:
+# the file is read again at every start and every ten minutes).
+QWEN_TAG=node-13
+QWEN_SHA_x86_64=f2e419c5637472a2fe7c822fae1ddfdc5cc3447a88f0a63e07d568d91e9916dd
+QWEN_SHA_aarch64=ad5a057ada33f0adee9604321daa3a001f6f38ea82d535ead046928424fd2487
+QWEN_SEEDS_URL=https://huggingface.co/staccs/qwencoin/resolve/main/SEEDS
+# the chain's work table (528,482,328 bytes): the same file every Qwencoin node has
+QWORK_SHA=8f53884f7727e80b86f3ddf288d3c3f0f998f1c63b8cd4f0bdad182ddd3f2c03
+QWORK_BYTES=528482328
 
 DOMAIN="${DOMAIN:-}"
 EMAIL="${EMAIL:-}"
@@ -55,6 +70,7 @@ OPERATOR_PUBKEY="${OPERATOR_PUBKEY:-}"
 POOL_CUT_BPS="${POOL_CUT_BPS:-500}"
 POOL_CPU="${POOL_CPU:-1.0}"
 HASHFUN_TGZ="${HASHFUN_TGZ:-}"
+QWENCOIN="${QWENCOIN:-1}"
 ROOT="${ROOT:-}"            # tests: install under this prefix, touch nothing else
 DRY="${DRY:-0}"             # tests: print what would run
 
@@ -63,6 +79,9 @@ HOMEDIR="$ROOT/var/lib/hashfun"
 BTCDIR="$HOMEDIR/bitcoin"
 OPT="$ROOT/opt/bitcoin-$BTC_VER"
 ETC="$ROOT/etc"
+QDIR="$HOMEDIR/qwencoin"
+QOPT="$ROOT/opt/qwencoin-$QWEN_TAG"
+QWORK="$HOMEDIR/.hashfun/qwork.bin"   # where hashfun keeps the table; the Qwencoin node maps the same file
 
 say() { printf '\n== %s\n' "$*"; }
 run() {
@@ -76,8 +95,8 @@ die() {
 [ "$DRY" = 1 ] || [ "$(id -u)" = 0 ] || die "run as root: sudo bash $0"
 ARCH="$(uname -m)"
 case "$ARCH" in
-  x86_64) BTC_SHA=$BTC_SHA_x86_64 FC_ARCH=x86_64 FC_SHA=$FULCRUM_SHA_x86_64 ;;
-  aarch64 | arm64) ARCH=aarch64 BTC_SHA=$BTC_SHA_aarch64 FC_ARCH=arm64 FC_SHA=$FULCRUM_SHA_aarch64 ;;
+  x86_64) BTC_SHA=$BTC_SHA_x86_64 FC_ARCH=x86_64 FC_SHA=$FULCRUM_SHA_x86_64 QWEN_SHA=$QWEN_SHA_x86_64 ;;
+  aarch64 | arm64) ARCH=aarch64 BTC_SHA=$BTC_SHA_aarch64 FC_ARCH=arm64 FC_SHA=$FULCRUM_SHA_aarch64 QWEN_SHA=$QWEN_SHA_aarch64 ;;
   *) die "unsupported CPU $ARCH (x86_64 or arm64)" ;;
 esac
 if [ -r /etc/os-release ]; then
@@ -112,7 +131,7 @@ case "$POOL_CUT_BPS" in *[!0-9]* | '') die "POOL_CUT_BPS must be a number" ;; es
 [ "$PRUNE" = 0 ] || [ "$PRUNE" -ge 550 ] || die "PRUNE must be 0 or at least 550"
 
 # ---- 1. packages -----------------------------------------------------------------------------
-say "1/7 packages"
+say "1/8 packages"
 export DEBIAN_FRONTEND=noninteractive
 run apt-get update -q
 run apt-get install -y -q --no-install-recommends ca-certificates curl python3 nodejs npm caddy ufw jq
@@ -124,7 +143,7 @@ if [ "$DRY" != 1 ]; then
 fi
 
 # ---- 2. the user -----------------------------------------------------------------------------
-say "2/7 user $U, data in $HOMEDIR"
+say "2/8 user $U, data in $HOMEDIR"
 if [ "$DRY" != 1 ] && ! id "$U" > /dev/null 2>&1; then
   useradd --system --home-dir "$HOMEDIR" --create-home --shell /usr/sbin/nologin "$U"
 fi
@@ -132,7 +151,7 @@ run mkdir -p "$BTCDIR"
 run chown -R "$U:$U" "$HOMEDIR"
 
 # ---- 3. Bitcoin Core -------------------------------------------------------------------------
-say "3/7 Bitcoin Core $BTC_VER"
+say "3/8 Bitcoin Core $BTC_VER"
 if [ ! -x "$OPT/bin/bitcoind" ]; then
   tgz="bitcoin-$BTC_VER-$ARCH-linux-gnu.tar.gz"
   tmp="$(mktemp -d)"
@@ -164,7 +183,7 @@ elif [ "$(cat "$conf" 2> /dev/null || true)" != "$want" ]; then
 fi
 
 # ---- 4. hashfun --------------------------------------------------------------------------------
-say "4/7 hashfun"
+say "4/8 hashfun"
 if [ -n "$HASHFUN_TGZ" ]; then
   src="$HASHFUN_TGZ"
 elif [ "$DRY" = 1 ] || npm view hashfun version > /dev/null 2>&1; then
@@ -178,8 +197,97 @@ if [ "$DRY" != 1 ]; then
   sudo -u "$U" -H hashfun doctor --quick || die "hashfun doctor failed (above)"
 fi
 
-# ---- 5. services -------------------------------------------------------------------------------
-say "5/7 services"
+# ---- 5. Qwencoin: the work table, and a node ------------------------------------------------------
+say "5/8 Qwencoin: the work table$([ "$QWENCOIN" = 1 ] && echo " and a node ($QWEN_TAG)")"
+# The table is the MLP weights of Qwen3.5-0.8B at 16-bit fixed point. It is fetched once: hashfun
+# downloads it (resumed if interrupted) only when the file is not whole, and this script compares its
+# SHA-256 with the pinned one once, writing down the size and time of the file it checked.
+if [ "$DRY" = 1 ] || [ "$(stat -L -c %s "$QWORK" 2> /dev/null || echo 0)" != "$QWORK_BYTES" ]; then
+  run sudo -u "$U" -H hashfun qwork fetch
+fi
+if [ "$DRY" = 1 ]; then
+  printf '   + sha256 of %s must be %s\n' "$QWORK" "$QWORK_SHA"
+else
+  [ -f "$QWORK" ] || die "hashfun keeps the work table somewhere else than $QWORK: $(sudo -u "$U" -H hashfun qwork path)"
+  stamp="$QWORK_SHA $(stat -L -c '%s %Y' "$QWORK")"
+  if [ "$(cat "$QWORK.checked" 2> /dev/null || true)" != "$stamp" ]; then
+    echo "$QWORK_SHA  $QWORK" | sha256sum -c - > /dev/null || die "$QWORK is not Qwencoin's work table (its sha256 is not $QWORK_SHA): remove it and run this again"
+    printf '%s\n' "$stamp" > "$QWORK.checked"
+    chown "$U:$U" "$QWORK.checked"
+  fi
+fi
+if [ "$QWENCOIN" = 1 ]; then
+  if [ ! -x "$QOPT/bin/qwencoind" ]; then
+    tgz="qwencoin-node-linux-$ARCH.tar.gz"
+    tmp="$(mktemp -d)"
+    run curl -fSL --retry 3 -o "$tmp/$tgz" "https://github.com/staccDOTsol/qwencoin/releases/download/$QWEN_TAG/$tgz"
+    if [ "$DRY" != 1 ]; then
+      echo "$QWEN_SHA  $tmp/$tgz" | sha256sum -c - > /dev/null || die "$tgz does not match its pinned sha256"
+      mkdir -p "$QOPT"
+      # the package is one folder named after the platform: bin/ (launchers), libexec/ (the programs)
+      # and lib/ (the loader and libraries they were built against, so they run on any distro)
+      tar -xzf "$tmp/$tgz" -C "$QOPT" --strip-components=1
+      chmod 0755 "$QOPT"/bin/* "$QOPT"/libexec/* "$QOPT"/lib/ld-linux-*
+      "$QOPT/bin/qwencoind" -version | head -1 || die "the Qwencoin node does not run on this machine"
+    fi
+    rm -rf "$tmp"
+  fi
+  for b in qwencoind qwencoin-cli; do run ln -sf "$QOPT/bin/$b" "$ROOT/usr/local/bin/$b"; done
+  run mkdir -p "$QDIR"
+  run chown "$U:$U" "$QDIR"
+  qconf="$QDIR/qwencoin.conf"
+  qwant="# written by hashfun install.sh
+server=1
+rpcbind=127.0.0.1
+rpcallowip=127.0.0.1
+rpcport=8732
+listen=1
+port=8733
+# the site looks transactions up by id; the chain is small
+txindex=1
+# the site holds no qwen: whoever a block pays owes that block's qwen and pays it from their own wallet
+disablewallet=1
+dnsseed=0
+natpmp=0
+listenonion=0
+dbcache=300
+qwork=$QWORK
+rpccookieperms=owner
+# where the chain's public node is, as the project says now (hashfun-qwen-seeds rewrites it)
+includeconf=seeds.conf"
+  if [ "$DRY" = 1 ]; then
+    printf '   + write %s\n' "$qconf"
+  else
+    if [ "$(cat "$qconf" 2> /dev/null || true)" != "$qwant" ]; then
+      printf '%s\n' "$qwant" > "$qconf"
+      chown "$U:$U" "$qconf"
+    fi
+    [ -e "$QDIR/seeds.conf" ] || { : > "$QDIR/seeds.conf"; chown "$U:$U" "$QDIR/seeds.conf"; }
+  fi
+  run install -m 0755 /dev/stdin "$ROOT/usr/local/bin/hashfun-qwen-seeds" << SEEDS
+#!/usr/bin/env bash
+# The Qwencoin chain has no DNS seeds: its project publishes where its public node is, in one file,
+# and that node can move. This reads the file and tells the node here: seeds.conf for its next start
+# and, to a node that is running, at once. Lines that are not HOST:PORT are not taken; if the file
+# cannot be read, what was known stays.
+set -uo pipefail
+conf=$QDIR/seeds.conf
+cli() { $QOPT/bin/qwencoin-cli -datadir=$QDIR "\$@"; }
+got="\$(curl -fsSL --max-time 20 $QWEN_SEEDS_URL 2> /dev/null | tr ', ' '\n' | grep -E '^([A-Za-z0-9-]+\.)+[A-Za-z0-9-]+:[0-9]{2,5}\$' | head -8)"
+[ -n "\$got" ] || exit 0
+want="\$(printf '%s\n' "\$got" | sed 's/^/addnode=/')"
+if [ "\$(cat "\$conf" 2> /dev/null)" != "\$want" ]; then
+  printf '%s\n' "\$want" > "\$conf.new" && mv "\$conf.new" "\$conf"
+fi
+if [ "\$(cli getconnectioncount 2> /dev/null || echo x)" = 0 ]; then
+  for s in \$got; do cli addnode "\$s" onetry > /dev/null 2>&1 || true; done
+fi
+exit 0
+SEEDS
+fi
+
+# ---- 6. services -------------------------------------------------------------------------------
+say "6/8 services"
 unit() { # name, contents: written only when different
   local f="$ETC/systemd/system/$1"
   if [ "$DRY" = 1 ]; then
@@ -307,7 +415,46 @@ LimitNOFILE=65536
 WantedBy=multi-user.target"
 fi
 
+if [ "$QWENCOIN" = 1 ]; then
+  unit qwencoind.service "[Unit]
+Description=Qwencoin node (for hashfun)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=$U
+Group=$U
+# where the chain's public node is now, before every start (it is not a reason not to start)
+ExecStartPre=-/usr/local/bin/hashfun-qwen-seeds
+ExecStart=$QOPT/bin/qwencoind -datadir=$QDIR -conf=$qconf -printtoconsole=0
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=300
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target"
+  unit hashfun-qwen-seeds.service "[Unit]
+Description=Tell the Qwencoin node where the chain's public node is
+After=qwencoind.service
+
+[Service]
+Type=oneshot
+User=$U
+ExecStart=/usr/local/bin/hashfun-qwen-seeds"
+  unit hashfun-qwen-seeds.timer "[Unit]
+Description=Every ten minutes: where the Qwencoin chain's public node is
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=10min
+
+[Install]
+WantedBy=timers.target"
+fi
+
 flags="--btc-rpc http://127.0.0.1:8332 --btc-cookie $BTCDIR/.cookie --listen 127.0.0.1:8080"
+[ "$QWENCOIN" = 1 ] && flags="$flags --qwen-rpc http://127.0.0.1:8732 --qwen-cookie $QDIR/.cookie"
 [ "$INDEX" = 1 ] && flags="$flags --btc-electrum 127.0.0.1:50001"
 [ "$ALLOW_LAUNCH" = 1 ] && flags="$flags --allow-launch"
 if [ "$POOL" = 1 ]; then
@@ -316,8 +463,8 @@ if [ "$POOL" = 1 ]; then
 fi
 unit hashfun-web.service "[Unit]
 Description=hashfun: every launch's node and the site
-After=bitcoind.service
-Wants=bitcoind.service
+After=bitcoind.service qwencoind.service
+Wants=bitcoind.service$([ "$QWENCOIN" = 1 ] && echo " qwencoind.service")
 
 [Service]
 User=$U
@@ -342,6 +489,15 @@ echo "== Bitcoin"
 cli getblockchaininfo 2> /dev/null | jq -c '{blocks, headers, progress: .verificationprogress, ibd: .initialblockdownload, pruned}' || echo "not answering yet"
 cli getchainstates 2> /dev/null | jq -c '[.chainstates[] | {blocks, snapshot: (.snapshot_blockhash // null), validated}]' || true
 systemctl --no-pager --lines=3 status hashfun-snapshot 2> /dev/null | sed -n '1,3p;/Main PID/d' || true
+echo "== Qwencoin"
+if [ -x /usr/local/bin/qwencoin-cli ]; then
+  qcli() { sudo -u hashfun qwencoin-cli -datadir=/var/lib/hashfun/qwencoin "$@"; }
+  qcli getblockchaininfo 2> /dev/null | jq -c '{blocks, headers, ibd: .initialblockdownload}' || echo "not answering yet"
+  echo "peers: $(qcli getconnectioncount 2> /dev/null || echo "?")  (the chain's public node: $(tr '\n' ' ' < /var/lib/hashfun/qwencoin/seeds.conf 2> /dev/null | sed 's/addnode=//g'))"
+else
+  echo "no node on this box (QWENCOIN=0)"
+fi
+sudo -u hashfun -H hashfun qwork check 2> /dev/null | tail -1 || echo "the work table is not in place"
 echo "== launches"
 sudo -u hashfun -H hashfun node ls 2> /dev/null || echo "none"
 echo "== site"
@@ -350,7 +506,7 @@ curl -fsS -o /dev/null -w 'http %{http_code} from 127.0.0.1:8080\n' http://127.0
 STATUS
 
 # ---- 6. HTTPS and the firewall ----------------------------------------------------------------
-say "6/7 HTTPS (Caddy) and the firewall"
+say "7/8 HTTPS (Caddy) and the firewall"
 if [ -n "$DOMAIN" ]; then
   site="$DOMAIN"
   [ -n "$EMAIL" ] && site="{
@@ -375,14 +531,19 @@ run ufw allow OpenSSH
 run ufw allow 80/tcp
 run ufw allow 443/tcp
 run ufw allow 8333/tcp
+[ "$QWENCOIN" = 1 ] && run ufw allow 8733/tcp   # Qwencoin's own port: nodes behind routers dial in
 # launch nodes: P2P ports are derived into 20002..31998 (hashfun/descriptor.py)
 run ufw allow 20000:32767/tcp
 run ufw --force enable
 
 # ---- 7. start ------------------------------------------------------------------------------------
-say "7/7 starting"
+say "8/8 starting"
 run systemctl daemon-reload
 run systemctl enable --now bitcoind
+if [ "$QWENCOIN" = 1 ]; then
+  run systemctl enable --now qwencoind
+  run systemctl enable --now hashfun-qwen-seeds.timer
+fi
 [ "$SNAPSHOT" = 1 ] && run systemctl enable --now --no-block hashfun-snapshot
 [ "$INDEX" = 1 ] && run systemctl enable --now --no-block fulcrum
 run systemctl enable --now hashfun-web
@@ -392,5 +553,9 @@ url="http://<this server's IP>/"
 [ -n "$DOMAIN" ] && url="https://$DOMAIN/"
 sync="Bitcoin is syncing from scratch (1 to 2 days)."
 [ "$SNAPSHOT" = 1 ] && sync="Bitcoin is syncing from the $SNAP_HEIGHT snapshot: usable in about 1 to 3 hours."
-printf '\ndone.\n  site:    %s\n  status:  hashfun-status\n  logs:    journalctl -u hashfun-web -f; journalctl -u hashfun-snapshot -f\n\n%s\n%s\n' \
-  "$url" "$sync" "Until then the site runs and launches wait: a launch is served once its Bitcoin anchor is on this node's chain."
+qsync="No Qwencoin node here (QWENCOIN=0): the site shows a launch's QWEN curve and cannot mine, settle or launch on it."
+[ "$QWENCOIN" = 1 ] && qsync="Qwencoin syncs from its public node: every block is checked with a pass through the model's weights, about a minute per thousand blocks."
+qlog=""
+[ "$QWENCOIN" = 1 ] && qlog="; journalctl -u qwencoind -f"
+printf '\ndone.\n  site:    %s\n  status:  hashfun-status\n  logs:    journalctl -u hashfun-web -f; journalctl -u hashfun-snapshot -f%s\n\n%s\n%s\n%s\n' \
+  "$url" "$qlog" "$sync" "$qsync" "Until then the site runs and launches wait: a launch is served once its anchors are on these nodes' chains."

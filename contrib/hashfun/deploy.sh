@@ -64,6 +64,7 @@ esac
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 CMD="${1:-deploy}"
 BRANCH=hashfun
+ABOUT="Memecoins that are each their own Bitcoin fork: mined, priced in BTC and in QWEN, paying their holders. Every coin puts a node and a local model on more machines."
 WORKFLOW=hashfun.yml
 NPM_REGISTRY=https://registry.npmjs.org
 # After a push, GitHub is given LIST_POLLS looks, CANCEL_POLL seconds apart (about 90 s), to list
@@ -487,7 +488,7 @@ confirm() {
 do_repo() {
   [ "$REPO_EXISTS" = 0 ] || return 0
   gh repo create "$REPO" "--$VIS" \
-    --description "hashfun: every launch is its own Bitcoin-fork chain, mined on a bonding curve" > /dev/null 2> "$TMP/repo.err" < /dev/null ||
+    --description "$ABOUT" > /dev/null 2> "$TMP/repo.err" < /dev/null ||
     die "GitHub did not create $REPO ($(first_line "$TMP/repo.err"))" "if the name is taken or belongs to an organization you cannot write to: REPO=owner/name bash deploy.sh"
   say "   created https://github.com/$REPO ($VIS)"
 }
@@ -526,6 +527,7 @@ do_push() {
   git -C "$SRC" config "branch.$BRANCH.remote" "$REMOTE"
   git -C "$SRC" config "branch.$BRANCH.merge" "refs/heads/$BRANCH"
   [ "$BR" = same ] || default_branch
+  do_about
 }
 
 # The Actions tab offers "Run workflow" only for the default branch, and a new clone checks it out.
@@ -538,6 +540,15 @@ default_branch() {
   else
     warn "could not make $BRANCH the default branch of $REPO ($(first_line "$TMP/edit.err")). Nothing depends on it: Settings, Default branch, when convenient"
   fi
+}
+
+# What the repository's page says about it: the same one line the site and the package say
+# (contrib/hashfun/PITCH.md). Nothing depends on it.
+do_about() {
+  local cur
+  cur="$(gh repo view "$REPO" --json description --jq '.description // ""' 2> /dev/null < /dev/null || echo "")"
+  [ "$cur" = "$ABOUT" ] && return 0
+  gh repo edit "$REPO" --description "$ABOUT" > /dev/null 2>&1 < /dev/null || true
 }
 
 do_secret() {

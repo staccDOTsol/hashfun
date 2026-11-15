@@ -100,6 +100,47 @@ jobs:
           CCACHE_MAXSIZE: 1G
         run: bash contrib/hashfun/dist/build.sh ${{ matrix.target }}
 
+      # Qwencoin's work table (528,482,328 bytes), for the checks that run the real pass through the
+      # weights: fetched once, kept in the cache under its sha256, and checked after every download
+      # and every restore. QWORK_TABLE names it for the tests; QWEN_VECTORS names the real Qwencoin
+      # headers the difference test and the self-test replay. (Not HASHFUN_QWORK: that would move
+      # where the CLI itself keeps the table, and every launch a test makes follows a regtest
+      # Qwencoin, which needs none.)
+      - name: Qwencoin's work table, from the cache
+        id: qwork
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ runner.temp }}/qwork/qwork.bin
+          key: qwork-8f53884f7727e80b86f3ddf288d3c3f0f998f1c63b8cd4f0bdad182ddd3f2c03
+
+      - name: Qwencoin's work table, fetched and checked
+        env:
+          QWORK_SHA: 8f53884f7727e80b86f3ddf288d3c3f0f998f1c63b8cd4f0bdad182ddd3f2c03
+          QWORK_HIT: ${{ steps.qwork.outputs.cache-hit }}
+        run: |
+          f="$RUNNER_TEMP/qwork/qwork.bin"
+          if [ "$QWORK_HIT" != true ]; then
+            mkdir -p "$RUNNER_TEMP/qwork"
+            curl -fSL --retry 5 --retry-all-errors -C - -o "$f" https://huggingface.co/staccs/qwencoin/resolve/main/qwork.bin
+          fi
+          got="$({ sha256sum "$f" 2> /dev/null || shasum -a 256 "$f"; } | cut -d ' ' -f 1)"
+          if [ "$got" != "$QWORK_SHA" ]; then
+            echo "::error::qwork.bin has sha256 $got, not $QWORK_SHA"
+            rm -f "$f"
+            exit 1
+          fi
+          {
+            echo "QWORK_TABLE=$f"
+            echo "QWEN_VECTORS=$GITHUB_WORKSPACE/hashfun/tests/data/qwen_headers.json"
+          } >> "$GITHUB_ENV"
+
+      - name: Qwencoin's work table, kept for the next run
+        if: steps.qwork.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ runner.temp }}/qwork/qwork.bin
+          key: qwork-8f53884f7727e80b86f3ddf288d3c3f0f998f1c63b8cd4f0bdad182ddd3f2c03
+
       - name: Test that binary
         run: bash contrib/hashfun/ci/test.sh --logs build/test-logs
 
@@ -261,6 +302,47 @@ jobs:
           npm config set prefix "$RUNNER_TEMP/npm"
           echo "$RUNNER_TEMP/npm/bin" >> "$GITHUB_PATH"
           npm i -g ./pkg/*.tgz
+
+      # Qwencoin's work table (528,482,328 bytes), for the checks that run the real pass through the
+      # weights: fetched once, kept in the cache under its sha256, and checked after every download
+      # and every restore. QWORK_TABLE names it for the tests; QWEN_VECTORS names the real Qwencoin
+      # headers the difference test and the self-test replay. (Not HASHFUN_QWORK: that would move
+      # where the CLI itself keeps the table, and every launch a test makes follows a regtest
+      # Qwencoin, which needs none.)
+      - name: Qwencoin's work table, from the cache
+        id: qwork
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ runner.temp }}/qwork/qwork.bin
+          key: qwork-8f53884f7727e80b86f3ddf288d3c3f0f998f1c63b8cd4f0bdad182ddd3f2c03
+
+      - name: Qwencoin's work table, fetched and checked
+        env:
+          QWORK_SHA: 8f53884f7727e80b86f3ddf288d3c3f0f998f1c63b8cd4f0bdad182ddd3f2c03
+          QWORK_HIT: ${{ steps.qwork.outputs.cache-hit }}
+        run: |
+          f="$RUNNER_TEMP/qwork/qwork.bin"
+          if [ "$QWORK_HIT" != true ]; then
+            mkdir -p "$RUNNER_TEMP/qwork"
+            curl -fSL --retry 5 --retry-all-errors -C - -o "$f" https://huggingface.co/staccs/qwencoin/resolve/main/qwork.bin
+          fi
+          got="$({ sha256sum "$f" 2> /dev/null || shasum -a 256 "$f"; } | cut -d ' ' -f 1)"
+          if [ "$got" != "$QWORK_SHA" ]; then
+            echo "::error::qwork.bin has sha256 $got, not $QWORK_SHA"
+            rm -f "$f"
+            exit 1
+          fi
+          {
+            echo "QWORK_TABLE=$f"
+            echo "QWEN_VECTORS=$GITHUB_WORKSPACE/hashfun/tests/data/qwen_headers.json"
+          } >> "$GITHUB_ENV"
+
+      - name: Qwencoin's work table, kept for the next run
+        if: steps.qwork.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ runner.temp }}/qwork/qwork.bin
+          key: qwork-8f53884f7727e80b86f3ddf288d3c3f0f998f1c63b8cd4f0bdad182ddd3f2c03
 
       # No HASHFUND here: the CLI has to find its own binary. The path proves which one it took.
       # This step runs inside a source checkout on purpose: the installed command has to run the

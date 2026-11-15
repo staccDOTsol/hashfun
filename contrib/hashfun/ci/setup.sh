@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # What a fresh CI machine (GitHub's Ubuntu and macOS runners) needs before dist/build.sh and
-# ci/test.sh: build tools and Boost headers, a virtualenv with zig and playwright, the site's npm
+# ci/test.sh: build tools and Boost headers, a virtualenv with zig, playwright and numpy, the site's npm
 # packages, and a stock bitcoind for the Bitcoin side of the tests (the official release, pinned
 # by the hash bitcoincore.org publishes for it).
 #
@@ -52,11 +52,18 @@ else
   fi
 fi
 
-# Python in a virtualenv: zig (the compiler for the Linux binaries) and playwright (the browser test)
+# Python in a virtualenv: zig (the compiler for the Linux binaries), playwright (the browser test)
+# and numpy (the difference test's own pass through Qwencoin's work table, a third implementation
+# beside the node's and the Qwencoin project's reference values; the tools themselves use the
+# standard library only). numpy is taken as a ready-made package or not at all: on a platform it
+# has none for, those two checks are passed over and the node's self-test still runs the real
+# headers through the node's own pass.
 [ -x "$TOOLS/venv/bin/python" ] || python3 -m venv "$TOOLS/venv"
 if [ "$MINIMAL" = 0 ]; then
   "$TOOLS/venv/bin/python" -m pip install --quiet --upgrade pip
   "$TOOLS/venv/bin/python" -m pip install --quiet "ziglang==$ZIG_VERSION" playwright
+  "$TOOLS/venv/bin/python" -m pip install --quiet --only-binary :all: numpy ||
+    echo "::warning::no ready-made numpy for this Python on this platform: the difference test's Python pass through Qwencoin's work table is passed over here"
   "$TOOLS/venv/bin/python" -m playwright install --with-deps chromium
 fi
 
@@ -81,4 +88,4 @@ if [ -n "${GITHUB_PATH:-}" ]; then
   echo "BITCOIND=$TOOLS/bin/bitcoind" >> "$GITHUB_ENV"
   echo "CCACHE_DIR=$ROOT/build/ccache" >> "$GITHUB_ENV"
 fi
-echo "tools ready: $TOOLS/venv/bin (python with zig and playwright), $TOOLS/bin/bitcoind"
+echo "tools ready: $TOOLS/venv/bin (python with zig, playwright and numpy), $TOOLS/bin/bitcoind"
