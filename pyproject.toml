@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hashfun"
-version = "0.1.0"
+version = "0.2.0"
 description = "PoW launchpad tooling for hashfun launch chains: launch tool, pool, merged mining, strata proxy, swaps, Electrum server, wallet, board"
 requires-python = ">=3.10"
 dependencies = []

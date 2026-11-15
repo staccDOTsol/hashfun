@@ -1,6 +1,8 @@
 # hashfun
 
-PoW launchpad on a Bitcoin Core fork. Every launch is its own chain, defined by a descriptor file; one universal node binary (`hashfund`) runs any of them. Coins are mined, not minted: issuance is a consensus function of cumulative work, shaped like pump.fun's constant-product curve. At graduation the chain opens to Bitcoin merged mining (AuxPoW). Exits are trustless HTLC swaps against BTC.
+Memecoins that are each their own Bitcoin fork: mined, priced in BTC and in QWEN, paying their holders. Every coin puts a node and a local model on more machines. (The words the site and the packages use for this, and where: `contrib/hashfun/PITCH.md`.)
+
+PoW launchpad on a Bitcoin Core fork. Every launch is its own chain, defined by a descriptor file; one universal node binary (`hashfund`) runs any of them. Coins are mined, not minted: issuance is a consensus function of cumulative work, shaped like pump.fun's constant-product curve. Every launch has two such curves over the same coin, one quoted in BTC and one in QWEN ([Qwencoin](https://github.com/staccDOTsol/qwencoin)): a block mined before graduation is on one of them, mints from it and owes that curve's asset. At graduation the chain opens to Bitcoin merged mining (AuxPoW). Exits are trustless HTLC swaps: coin/BTC, coin/QWEN and BTC/QWEN, all with the same contract.
 
 Base: Bitcoin Core master (32.99) + Namecoin's `auxpow` branch (AuxPoW only, no name ops), pinned at `70c6b3698ef8357f6c04004e57c06a85856e3f27`.
 
@@ -8,14 +10,15 @@ Base: Bitcoin Core master (32.99) + Namecoin's `auxpow` branch (AuxPoW only, no 
 
 | Rule | Definition |
 |---|---|
-| Relative work | `W = chainwork(tip) - chainwork(genesis)`, expected hashes |
-| Curve supply | `S(W) = floor(T0 * W / (V0 + W))`, clamped to `G` |
-| Block subsidy (presale) | `S(W_prev + work(nBits)) - S(W_prev)`: path independent, timestamp independent |
-| Price | `(V0+W)^2 / (T0*V0)` hashes per satoshi; ratio end/start = `(T0/(T0-G))^2` (14.7x with pump.fun proportions) |
-| Graduation | `W >= W_g = ceil(G*V0/(T0-G))`; crossing block mints only up to `G` |
+| Curve of a block | bit 9 of the header's nVersion (`0x200`): set = the QWEN curve, clear = the BTC curve. It may be set only while the parent has not graduated (`bad-curve-version`); it is clear in the genesis block, after graduation and so in every merge-mined block |
+| Work per curve | `Wq` = work of the blocks on the QWEN curve, `Wb = chainwork(tip) - chainwork(genesis) - Wq`, expected hashes |
+| Curve supply | each curve: `S(W) = floor(T0 * W / (V0 + W))`, clamped to `G`; both curves have the same `V0`, `T0`, `G` |
+| Block subsidy (presale) | `S(Wx_prev + work(nBits)) - S(Wx_prev)` on the block's own curve x: path independent, timestamp independent, and not moved by what the other curve has sold |
+| Price | per curve, `(V0+Wx)^2 / (T0*V0)` hashes per satoshi; ratio end/start = `(T0/(T0-G))^2` (14.7x with pump.fun proportions) |
+| Graduation | the first curve with `Wx >= W_g = ceil(G*V0/(T0-G))`; the crossing block mints only up to `G`, and what the other curve has not sold is never minted. Presale supply is between `G` and `2G` |
 | Tail | after graduation: `tail_reward >> (height / tail_halving_interval)` per block |
 | Creator fee | coinbase must pay `floor(subsidy * creator_fee_bps / 10000)` to `creator_script` (`bad-cb-creator-fee`) |
-| AuxPoW | valid only if the parent block's `W >= W_g` (`auxpow-before-graduation`); chain ID from the launch id, kept in `[1, 0x1FFE]` so a BIP9/version-rolled BTC parent never collides |
+| AuxPoW | valid only on a graduated parent (`auxpow-before-graduation`); chain ID from the launch id, kept in `[1, 0x1FFE]` so a BIP9/version-rolled BTC parent never collides |
 | Difficulty | LWMA-1 every block, window N, solvetimes capped at 6T, monotonic-forced timestamps, overflow-guarded. Block times are whole seconds and every solvetime counts as at least 1 s, so `target_spacing >= 2` (with T = 1 difficulty could never rise). A hash surge raises difficulty a few percent per block; until it catches up blocks arrive as fast as timestamps allow (about 6 per second, pinned at the future limit), each minting only what its work is worth |
 | Stall relief | the target doubles for every full 6T a block's own timestamp sits past its parent's, up to the pow limit, so an abandoned chain decays to CPU-minable in minutes. Safe because issuance is priced by work. nBits is a function of (ancestors, own nTime): no nTime rolling. `getblocktemplate` and `createauxblock` rebuild their cached template when the clock enters the next relief step (a cached one would be invalid, or would keep a stalled chain stalled) |
 | BTC anchor | mandatory `btc_anchor_height` / `btc_anchor_header` / `btc_anchor_period_time`, hashed into the launch id: no block of the launch can predate that Bitcoin block, and the in-chain Bitcoin header relay starts from it. The parser refuses what it can refute without a chain: the header's hash must meet its own bits, the bits may be no easier than Bitcoin's minimum, the period start must be set, not later than the anchor allows, and the anchor's own time when `height % 2016 == 0` (`btc_regtest` launches skip this). Whether the header really is the block at that height is a question for a Bitcoin node: see "Checking a launch file" below |
@@ -25,25 +28,42 @@ Base: Bitcoin Core master (32.99) + Namecoin's `auxpow` branch (AuxPoW only, no 
 
 Sniping does nothing: a low-difficulty block pays exactly its work at the curve price. Merge-mining pools cannot touch presale issuance because auxpow is invalid until graduation; after it, exahash secures the tail.
 
-All arithmetic is 256-bit integer. Validation bounds (`V0 <= 2^160`, `G <= 99.9% T0`, `T0 <= MAX_MONEY`) keep every product below 2^256.
+All arithmetic is 256-bit integer. Validation bounds (`V0 <= 2^160`, `G <= 99.9% T0`, `T0 <= MAX_MONEY`, `2G` plus the whole tail `<= MAX_MONEY`) keep every product below 2^256.
+
+## Two curves, two prices
+
+Each coin has a BTC curve and a QWEN curve. Nothing in consensus ties them together: whoever mints picks a curve, each price is moved only by what is bought through it, and whoever sees one cheaper than the other takes it. With the peer-to-peer book trading all three pairs, that is the whole mechanism: a coin has two price points, and the QWEN price is what they imply.
+
+| | |
+|---|---|
+| Price point of a curve | what a block on it owes per coin it mints, at the margin: `hashes_per_coin_x * num_x / 2^shift_x` base units of x per coin (the hash itself costs the same on either curve and is left out) |
+| Implied QWEN price | `price_btc / price_qwen` BTC per QWEN. It is a two-sided price only while both curves are being mined; with one curve idle it is a bound (only the BTC curve mined: QWEN is worth at least that; only the QWEN curve: at most), and the site says which |
+| Who mines which | whoever holds the asset. A Qwencoin node holds qwen it mined and takes the QWEN curve (`hashfun mine --curve qwen`); a visitor of the site pays sats and takes the BTC curve |
+| What the node keeps | the QWEN curve's work is not in the block index: `src/launchcurve.cpp` remembers one sum every 64 blocks by block hash and the first graduated block of each chain |
+| RPC | `getlaunchinfo.curves.{btc,qwen}` (work, supply, progress, price, what the next block mints and owes, blocks mined on it and the latest), `graduated_by`; `getmintobligation.quote`; `getblocktemplate.launchcurves` (version, coinbase value and creator fee for either curve; the top level is the node's own mining curve: `-minecurve`, `setminecurve`) |
+
+What the QWEN side rests on: a payment in qwen is proven the way a payment in sats is, by a merkle proof under a relayed header with enough work on top, and Qwencoin's work is small where Bitcoin's is not. A proof of a qwen payment is as hard to fake as `qwen_confs` Qwencoin blocks are to mine (a private branch that carries a payment nobody received), and one such branch can carry the payments of every block still inside its settlement window. So `hashfun launch new` sizes the confirmations to the leg: `qwen_confs = clamp(ceil(1.25 * total qwen / 50), 6, 1008)`, which makes faking the whole leg cost more Qwencoin blocks than mining that much qwen honestly would (50 a block). It bounds one launch; someone working several launches at once shares one branch among them. A miner who fakes pays nothing to holders and still gets coins, at the price of the hash alone: the QWEN curve is only as dear as Qwencoin is hard to mine, which is also what its price point says.
 
 ## One command
 
 ```
 npm i -g hashfun                                # the CLI and the hashfund for this machine (macOS or Linux, Intel/AMD or ARM)
 hashfun doctor                                  # which hashfund this machine runs, proven by running it
+hashfun qwork fetch                             # Qwencoin's work table (528 MB, once): every node of a launch needs it
 hashfun launch new --name "My Coin" --ticker MYC --creator-address myc1... -o myc.json \
-        --btc-rpc URL --sats-total 0.7 --creator-btc-address bc1...        # Bitcoin anchor + sats leg (required)
+        --btc-rpc URL --sats-total 0.7 --creator-btc-address bc1... \       # Bitcoin anchor + sats leg (required)
+        --qwen-rpc URL --qwen-total 300 --creator-qwen-address bc1...      # Qwencoin anchor + QWEN leg (required)
 hashfun node add myc.json && hashfun node up    # one hashfund per registered launch, state in ~/.hashfun
 hashfun node ls                                 # height, curve %, graduated, peers
-hashfun mine MYC --payout myc1... --btc-rpc URL --btc-wallet NAME     # pool + CPU miner (or --no-cpu for ASICs)
-hashfun wallet yield | claim-yield              # BTC earned by holding, paid at your launch keys on Bitcoin
+hashfun mine MYC --payout myc1... --curve btc --btc-rpc URL --btc-wallet NAME     # pool + CPU miner (or --no-cpu for ASICs)
+hashfun mine MYC --payout myc1... --curve qwen --qwen-rpc URL --qwen-wallet NAME  # the same on the QWEN curve
+hashfun wallet yield | claim-yield [--chain]    # BTC and QWEN earned by holding, paid at your launch keys on each chain
 hashfun wallet buy|sell ..., hashfun swap ..., hashfun electrum ..., hashfun board ...
 hashfun web --btc-rpc URL                       # the site
 hashfun book ...                                # peer-to-peer offers and swaps without a browser tab
 ```
 
-`hashfun mine` merge-mines every other registered launch that has graduated and runs the settler (relay Bitcoin headers, pay the drawn payee, publish the proof). `contrib/hashfun/cli_smoke.sh` drives all of this against real binaries.
+`hashfun mine` merge-mines every other registered launch that has graduated and runs the settler: it relays the headers of every chain it was given a node for, pays each block's drawn payee from the wallet of that block's curve, and publishes the proof. A chain with a node and no wallet is relayed and never paid on; `--curve` defaults to the curve a wallet was given for. Miners at the pool choose per connection: stratum username `ADDRESS`, `ADDRESS/btc` or `ADDRESS/qwen`. Wherever a command takes `--btc-rpc URL`, `electrums://HOST:PORT,HOST:PORT` reaches Bitcoin through Electrum servers instead of a node (see Bitcoin without a node). `contrib/hashfun/cli_smoke.sh` drives all of this against real binaries.
 
 In a source checkout the same CLI is `python3 -m hashfun.cli` (or `pip install -e .`). Which `hashfund` it runs: see Platforms and the node binary.
 
@@ -63,9 +83,21 @@ Launch chains are production chains: `test: false` descriptors cannot mock the c
 
 The settler (`hashfun mine`) pays a block only once it is `--pay-depth` deep (default 12, so its draw block is 6 deep), writes the signed payment to disk before broadcasting it, republishes a proof whose block was reorged out, and reports a payment as lost only if a reorg changed the draw after it was made. `python -m hashfun.tests.fleet_regtest` runs all of this with four nodes, two pools and two Bitcoin wallets.
 
-## Sats leg
+## The two legs: sats and qwen
 
-Every launch has one; there is a single kind of coin. A curve block owes real BTC on top of its hash: `owed = (work * sats_num) >> sats_shift` (`hashfun launch new --sats-total` sizes it as total BTC over the curve). No bridge and no reserve: the miner pays a drawn payee directly on Bitcoin and proves it on the launch chain.
+Every launch has both; there is a single kind of coin. A block on the BTC curve owes real BTC on top of its hash, a block on the QWEN curve owes qwen: `owed = (work * num) >> shift` with the curve's own numbers (`sats_num` / `sats_shift`, `qwen_num` / `qwen_shift`; `hashfun launch new --sats-total` and `--qwen-total` size them as the total over each curve). No bridge and no reserve: the miner pays a drawn payee directly on the block's own chain and proves it on the launch chain. The table below is written for sats; for a block on the QWEN curve read Qwencoin for Bitcoin, with these differences:
+
+| | BTC curve | QWEN curve |
+|---|---|---|
+| Minimum payment | `sats_min_payment` | `qwen_min_payment` |
+| Creator's script | `creator_btc_script` | `creator_qwen_script` |
+| Dev's and a holder's script | the script | the same script (a Qwencoin main-network address is the same string as the Bitcoin address of the same key) |
+| Headers | `OP_RETURN "HFH1"`, in any transaction | `OP_RETURN "HFH2"`, in a block's coinbase only: checking one costs every node a pass through the weights, a header that fails costs its relayer nothing, and in any transaction eight a block could be bought for a fee and put ahead of a miner's own. At most 8 are checked per launch block |
+| Proof | `OP_RETURN "HFP1"` | `OP_RETURN "HFP2"`, same format. A proof never settles a block of the other curve |
+| Confirmations | `btc_confs` | `qwen_confs` |
+| The other chain's rules, in the node | Bitcoin's: work is the header hash, limit 0x1d00ffff, retarget every 2016 blocks | Qwencoin's: work is a pass through its 528 MB table of model weights (`src/crypto/qwork.cpp`, Qwencoin's own kernel), limit 0x2000ffff, the same retarget (computed without the product that would overflow near that limit), and its two timestamp rules at the edges of a period (the first block not more than 600 s before its parent, the last not before the period's first) |
+
+The node maps Qwencoin's table at start (`-qwork=<file>`; `hashfun qwork fetch` gets it, sha256 `8f53884f7727e80b86f3ddf288d3c3f0f998f1c63b8cd4f0bdad182ddd3f2c03`, and `hashfun node up` passes it) and does not start without it unless the launch follows a regtest Qwencoin; the Qwencoin anchor's work is checked there, since no parser can. Work values are kept in `qwork_values.dat` beside the chain, so a restart costs no pass for a header seen before.
 
 | Step | Rule |
 |---|---|
@@ -95,16 +127,21 @@ JSON. The launch id is `SHA256d` of a canonical binary serialization of every co
 || i64 tail_reward || u32 tail_halving_interval || bytes creator_script || u16 creator_fee_bps || u8 test
 || u32 btc_anchor_height || 80B btc_anchor_header || u32 btc_anchor_period_time
 || i64 sats_num || u32 sats_shift || i64 sats_min_payment || u32 settle_deadline || u32 btc_confs
-|| bytes creator_btc_script || u8 btc_regtest || [32B meta, only when set]
+|| bytes creator_btc_script || u8 btc_regtest
+|| u32 qwen_anchor_height || 80B qwen_anchor_header || u32 qwen_anchor_period_time
+|| i64 qwen_num || u32 qwen_shift || i64 qwen_min_payment || u32 qwen_confs
+|| bytes creator_qwen_script || u8 qwen_regtest || [32B meta, only when set]
 ```
 
 (`str`/`bytes` = CompactSize length + data; integers little-endian.) Derived from the id: P2P magic (`SHA256("hashfun-magic"||id)[:4] | 0x80` per byte), auxpow chain ID, default ports, datadir `launch_<ticker>_<id8>`.
 
-Ports: three in a row per launch, as Bitcoin has them (8332, 8333, 8334). P2P is `20002 + (id-derived mod 3000) * 4`, RPC is one under it, and one above it is where the node itself listens for incoming Tor connections (a node told to serve RPC there cannot start). All of them sit under the range systems hand out to outgoing connections (Linux from 32768, macOS from 49152): a port in that range can be held by a connection made a moment ago, and a node cannot listen on it then. The CLI registers a launch on its own RPC port unless another registered launch has it, and the tools pick any other listening port from 20000..32767. Not consensus: `p2p_port` and `rpc_port` in the launch file override them.
+Ports: three in a row per launch, as Bitcoin has them (8332, 8333, 8334). P2P is `20002 + (id-derived mod 3000) * 4`, RPC is one under it, and one above it is where the node itself listens for incoming Tor connections (a node told to serve RPC there cannot start). All of them sit under the range systems hand out to outgoing connections (Linux from 32768, macOS from 49152): a port in that range can be held by a connection made a moment ago, and a node cannot listen on it then. The CLI registers a launch on its own ports unless another registered launch has one of them or something on the machine is listening there (another program, or a node of the same launch started from another folder): then that node gets a free port instead, kept in the registry. The tools pick any other listening port from 20000..32767. Not consensus: `p2p_port` and `rpc_port` in the launch file override them.
 
 `test: true` launches allow `setmocktime` and nonstandard txs.
 
-`version` is 2. It is hashed into the id and names the rule set, so a file made for one rule set is never read under another. Version 1 was the pre-release set (the first sats leg, and a parser that took anchors, payout scripts and time limits it should have refused): both parsers refuse it and say to create the launch again.
+`version` is 3. It is hashed into the id and names the rule set, so a file made for one rule set is never read under another. Version 1 was the pre-release set and version 2 the set with one curve, quoted in BTC only: both parsers refuse them and say to create the launch again.
+
+The QWEN leg's keys mirror the sats leg's (`qwen_anchor_*`, `qwen_num`, `qwen_shift`, `qwen_min_payment`, `qwen_confs` 1..1008, `creator_qwen_script`, `qwen_regtest`), and all are mandatory. Unless `qwen_regtest`, the Qwencoin anchor's bits may be no easier than Qwencoin's limit and its period start follows the Bitcoin anchor's rules. Both parsers also refuse a launch whose deadline cannot cover its confirmations: on a leg that is not on regtest, `settle_deadline * target_spacing` must be at least `1200 s * confs` (twice the ten minutes a confirmation takes), or every block that owes a payment would lose its coins whatever its miner did.
 
 Two parsers read launch files: the node's (C++, `src/kernel/launch.cpp`) and the tools' (Python, `hashfun/descriptor.py`). A file that meant one launch to the node and another to the pool, the wallet or the site would be a split, so both refuse whatever JSON readers disagree about, with the same message: bytes that are not strict UTF-8, a key twice in one object (one reader takes the first, the other the last), a number of more than 40 characters, nesting deeper than 64, `NaN` and `Infinity`. Keys left out get the same default in both (`target_spacing` 5, `lwma_window` 90, `ftl` from the formula above). `tail_halving_interval` and `btc_anchor_height` are below 2^31. `creator_btc_script` must be P2PKH, P2SH or a witness program: every miner whose block draws the creator has to get a Bitcoin payment to it relayed. `test_diff_cpp` holds the two parsers together on random, mutated and byte-damaged files.
 
@@ -329,16 +366,38 @@ Amounts are sats for Bitcoin and whole coins (decimals allowed) for launch coins
 
 Coins only come from blocks, and nobody installs a CLI to get one. `hashfun web --pool` makes the site the way in (`hashfun/sitepool.py`):
 
-- **Mine me a block.** The page puts the visitor's launch address in a queue; the server's CPU mines (only while someone waits) and the next block it finds pays the address at the head of the queue, output 0. With `--operator-pubkey` the operator's address on that launch takes `--pool-cut-bps` (default 5%) of those blocks, as output 1, in coins.
-- **The visitor pays the block's sats.** Once the block's draw is made the page lists what each of the visitor's blocks owes and to which Bitcoin script (`GET /api/coin/T/due?address=`), and pays up to three in one transaction from the page's own key: output i pays block i's drawn script, then the `HF` tag list. If the key is short, it asks UniSat for a top-up first. The site never receives the money: it goes to the holder, creator or dev the draw named.
-- **The site proves it.** `settler.WatchSettler` has no wallet. It keeps the obligations that are due, reads every new Bitcoin block for a transaction whose first tag list names one of them with an output paying the drawn script enough, and publishes the proof in a later block. A payment made from anywhere counts. While a block that owes waits for its draw, or a payment for its proof, the server mines the blocks that carry them (to the operator's address), so a quiet launch does not stall.
+- **Mine me a block.** The visitor picks a curve. The page puts the visitor's launch address in that curve's queue (`POST /api/coin/T/queue {address, blocks, curve}`); the server's CPU mines (only while someone waits) and the next block it finds, on that curve, pays the address at the head of the queue, output 0. With `--operator-pubkey` the operator's address on that launch takes `--pool-cut-bps` (default 5%) of those blocks, as output 1, in coins.
+- **The visitor pays what the block owes.** Once the block's draw is made the page lists what each of the visitor's blocks owes, in which asset (`quote`) and to which script (`GET /api/coin/T/due?address=`), and pays up to three of one chain in one transaction from the page's own key: output i pays block i's drawn script, then the `HF` tag list. Sats: if the key is short, it asks UniSat for a top-up first. Qwen: from the page key's balance on Qwencoin (no wallet extension signs Qwencoin; the page shows the key's balance on each chain, named, and where to send qwen). The site never receives the money: it goes to the holder, creator or dev the draw named.
+- **The site proves it.** `settler.WatchSettler` has no wallet. It keeps the obligations that are due, reads every new block of Bitcoin and of Qwencoin for a transaction whose first tag list names one of them with an output paying the drawn script enough, and publishes the proof in a later block. A payment made from anywhere counts. While a block that owes waits for its draw, or a payment for its proof, the server mines the blocks that carry them (to the operator's address), so a quiet launch does not stall.
 - **A public stratum per launch** on P2P port + 2: `stratum+tcp://site:port`, username = a launch address. Whoever finds the block gets the whole coinbase at that address and unlocks it the same way on the page. A share is never harder than the block itself, so a miner on a young launch sends the blocks it finds.
 
 The server holds no Bitcoin and nobody's coins. What it spends is CPU; on ASIC presets its CPU finds nothing and the hash has to come through the stratum. `sitepool_regtest` runs the whole path, including a real browser: ask, mine, draw, pay from the page, proof, unlock.
 
+## Bitcoin without a node
+
+`hashfun/btclight.py`: wherever a command takes `--btc-rpc`, a URL `electrums://HOST:PORT,HOST:PORT` (TLS; `electrum://` plain) gives the site and the settlers Bitcoin through Electrum servers, with no bitcoind on the machine. It answers the calls they make on a Bitcoin node (anchors, headers, proofs, payments to a script, balances, broadcast). It is what lets the public site run on a small machine.
+
+| | |
+|---|---|
+| What it checks itself | its own chain of headers from a block hash written in the file (each header meets its bits and links to the one below, retargets, median time, most work wins): confirmations are counted on that chain only. A merkle branch is checked against its header before it is a proof; a transaction fetched by id must hash to that id |
+| What it asks two servers | whether an output is unspent, a script's history, "not found": both must say the same, and a disagreement is an error the caller sees, never an empty answer |
+| What a server can do | hide a payment or a spend (two servers that agree on the lie): a balance shown wrong, a bid that looks backed or not, a payment the watching settler does not see until its deadline, after which that block's coins stay locked. Drop a transaction it said it took (it is sent again). Quote a fee up to the cap. See which scripts the operator asks about |
+| What it cannot do | make up a block, a confirmation or a proof, or make the launch accept a payment that was not made: the launch's own nodes check every relayed header and every proof again |
+| Without a key file | `hashfun mine --btc-rpc electrums://...` relays headers and pays nothing; with `--btc-wallet KEYFILE` it pays from that key |
+
+Checked against real servers (read only): three answered over TLS on port 443, each gave 12,197 headers that passed every rule and proofs of two well-known transactions. `test_btclight` runs it against servers that lie, disagree, hang and cut the line; `btclight_regtest` runs every call, a reorganisation, a settler and the site against a real server over a regtest node. An operator with a Bitcoin node of their own gives its RPC URL instead and trusts nobody.
+
+## The Qwencoin nodes run it
+
+Who runs a launch's nodes and mines it: the Qwencoin nodes do. `contrib/hashfun/qwencoin/` is a patch series for [Qwencoin](https://github.com/staccDOTsol/qwencoin) (with `apply.sh`, and `CODEX.md` for whoever applies it): a node follows the launches of the site named in a one-line file, runs a `hashfund` per launch beside its qwencoind (the same work table, mapped once), mines the QWEN curve at a small share of a core, pays each block's qwen from a wallet of its own within the spending limit its owner set, relays Qwencoin headers and proves its payments. Its model is offered five functions for it (`fun_coins`, `fun_quote`, `fun_mine`, `fun_send`, `fun_launch`), behind the same approval and limits as everything else that moves its coins. The public node serves the site under its own domain at `/fun`, and carries a line at `/fun/p2p/TICKER` to its launch nodes for followers behind routers. A node whose owner names no site is exactly as before.
+
+The QWEN leg has run against a real Qwencoin: the project's own qwencoind on a private network with main-network rules and the real table, a launch anchored on that chain, blocks mined on the QWEN curve, 17 payments in real qwen, headers relayed (each a real pass through the weights) and proofs taken; a proof one confirmation short, a header with a changed nonce and a header outside the coinbase were each refused, and a restart cost no pass.
+
 ## Running the public site
 
-`contrib/hashfun/server/install.sh` turns a fresh Ubuntu 22.04/24.04 box (x86_64 or arm64) into the site: `sudo DOMAIN=example.com EMAIL=you@example.com bash install.sh`. It installs Bitcoin Core 32.1 (pinned hash), hashfun, Caddy (HTTPS from Let's Encrypt) and the firewall (22, 80, 443, 8333, and 20000..32767 for launch nodes), and three services: `bitcoind`, `hashfun-web` (every registered launch's node, then the site) and, when the disk allows, `fulcrum`. Safe to run again.
+Two ways. On the Qwencoin public node, under its domain: the Qwencoin project starts `hashfun web --base-path /fun --qwen-rpc <its own node> --qwen-pages <its pages> --btc-rpc electrums://... --pool` itself once the patch series above is in (nothing to install by hand; the machine needs no Bitcoin node). Or on a box of its own:
+
+`contrib/hashfun/server/install.sh` turns a fresh Ubuntu 22.04/24.04 box (x86_64 or arm64) into the site: `sudo DOMAIN=example.com EMAIL=you@example.com bash install.sh`. It installs Bitcoin Core 32.1 (pinned hash), hashfun, Caddy (HTTPS from Let's Encrypt) and the firewall (22, 80, 443, 8333, and 20000..32767 for launch nodes), a Qwencoin node (the project's own binaries, the work table fetched once and checked against its sha256, port 8733 open; `QWENCOIN=0` leaves it out), and the services: `bitcoind`, the Qwencoin node, `hashfun-web` (every registered launch's node, then the site with `--qwen-rpc`) and, when the disk allows, `fulcrum`. Safe to run again.
 
 - **Bitcoin in hours, not days.** Bitcoin Core 32.1 carries assumeutxo hashes up to height 935,000. `hashfun-snapshot` downloads that UTXO snapshot (about 9 GB), waits for headers past it, checks the block hash and loads it: the node is usable after catching up from 935,000 to the tip, and checks the history before it in the background. The node rejects a file whose contents do not hash to the value compiled into it, so the download's source does not matter for safety. `SNAPSHOT=0` syncs from scratch.
 - **Bitcoin balances in milliseconds.** `hashfun web --btc-electrum HOST:PORT` reads addresses from an Electrum-protocol index (Fulcrum, electrs) instead of a UTXO-set scan of about a minute each, one at a time; bids' sats for every key in one round trip. When the index does not answer the site falls back to the scan. The installer adds Fulcrum 2.1.4 (pinned hash) when the disk has about 1.1 TB free, which needs every block (`PRUNE=0`); Fulcrum starts once the snapshot's background check is done. `btcindex_regtest` holds the two paths to the same answers.
@@ -361,7 +420,7 @@ One command ships it: `bash contrib/hashfun/deploy.sh` (in a delivery: `bash dep
 
 Run by hand with `core_tests` on, the build jobs also build and run Bitcoin Core's own unit tests with the shipping toolchain. On a private repository the macOS jobs are most of the bill (a macOS minute counts as about ten Linux minutes); on a public one the runners are free.
 
-What has never run: this workflow (it needs a repository), anything on macOS (the native build, the macOS binaries, the suites on a Mac), and Bitcoin Core's own unit tests on this fork.
+The workflow has run on GitHub for version 0.1.0 (all four platforms: build, the whole regression, pack, install from the tarball, the release page). The test jobs fetch Qwencoin's work table once (cached by its sha256, checked after the download) and set `QWORK_TABLE`, so the node's self-test checks Qwencoin's work function on real headers of its chain on every platform; where a skip is a failure, a missing table is one. What has not run there: Bitcoin Core's own unit tests on this fork.
 
 ## Swaps
 
@@ -379,22 +438,26 @@ The regression is one command:
 bash contrib/hashfun/ci/test.sh [--hashfund PATH] [--bitcoind PATH] [--logs DIR] [suite ...]
 ```
 
-One line per suite on the terminal (PASS or FAIL, seconds, the suite's own last line), one log per suite (`build/test-logs/` unless `--logs`), exit status nonzero if any suite failed. `hashfund` is `--hashfund`, else `$HASHFUND`, else the one the CLI itself picks on this machine; `bitcoind` (a stock Bitcoin Core, for the Bitcoin side) is `--bitcoind`, else `$BITCOIND`, else the one on `PATH`. A suite whose tools are missing is skipped and says why; with `CI` set a skip counts as a failure.
+One line per suite on the terminal (PASS or FAIL, seconds, the suite's own last line), one log per suite (`build/test-logs/` unless `--logs`), exit status nonzero if any suite failed. `hashfund` is `--hashfund`, else `$HASHFUND`, else the one the CLI itself picks on this machine; `bitcoind` (a stock Bitcoin Core, for the Bitcoin side) is `--bitcoind`, else `$BITCOIND`, else the one on `PATH`. A suite whose tools are missing is skipped and says why; with `CI` set a skip counts as a failure. With `CI` set (or `RETRY=1`) a suite that fails is run once more, its first log kept as `<suite>.first.log` and the fact said on its line: a shared runner can make a check that waits on a clock miss it once, and a suite that fails twice has failed.
 
 | Suite | What it runs | Needs |
 |---|---|---|
-| `unit` | `test_core`, `test_yieldstate`, `test_stack`, `test_book`, `test_cli` | Python |
-| `diff` | builds the differential driver and runs `test_diff_cpp`. When `dist/build.sh` has left its compiler in `build/dist/tc`, the driver is compiled with that one, so the arithmetic under test is the shipped binary's (`CXX` overrides) | a C++ compiler |
+| `unit` | `test_core`, `test_yieldstate`, `test_stack`, `test_book`, `test_cli`, `test_btclight` | Python (the page tests in `test_book` want playwright and are passed over without it) |
+| `diff` | builds the differential driver, runs the node's self-test (`hfdiff --selftest`: the two curves, both relays, Qwencoin's work function and its retargets on real headers of its chain) and then `test_diff_cpp`. When `dist/build.sh` has left its compiler in `build/dist/tc`, the driver is compiled with that one, so the arithmetic under test is the shipped binary's (`CXX` overrides) | a C++ compiler; for the checks on real Qwencoin headers, the work table (`QWORK_TABLE`, or where `hashfun qwork fetch` put it); two of them also run a Python pass through it, which wants numpy. Without the table those checks are passed over, and with `CI` set that is a failure; without numpy only the Python pass is |
 | `web_js` | `test_web_js` | node, npm |
 | `doctor` | `hashfun doctor` on the binary under test; it also mines the short chain for the cross-machine check into the log directory (`chain-<target>.json`) | the binary |
 | `core` | Bitcoin Core's own unit tests, one process per test suite, in parallel | a `TESTS=1` build; passed over, not failed, without one |
-| `e2e`, `fleet` | `e2e_regtest`, `fleet_regtest` | bitcoind |
-| `yield` | `yield_regtest`: the sats leg on a real node against the Python model of its rules, at every height after every block, restart and reorg | bitcoind |
+| `twin` | `twin_regtest`: the two curves of a launch on one node by raw RPC (what each block mints, templates for either curve, graduation by the QWEN curve, undo, restart) | the binary |
+| `e2e`, `fleet` | `e2e_regtest`, `fleet_regtest` | bitcoind (a second one plays the regtest Qwencoin, here and below) |
+| `yield` | `yield_regtest`: the sats leg and the QWEN leg on a real node against the Python model of their rules, at every height after every block, restart and reorg | bitcoind |
+| `btcindex` | `btcindex_regtest`: the site's Bitcoin and Qwencoin balances from an index agree with the UTXO-set scan | bitcoind |
+| `btclight` | `btclight_regtest`: Bitcoin through Electrum servers instead of a node, every call the site and the settlers make, against a real server over a regtest node | bitcoind |
+| `sitepool` | `sitepool_regtest`: the site mines a block for a visitor on either curve, the page pays what it owes from its own key, it unlocks | bitcoind, playwright |
 | `book` | `book_regtest` | bitcoind, node |
 | `web` | `web_regtest`, screenshots into the log directory | bitcoind, Python's playwright with its chromium |
 | `smoke` | `contrib/hashfun/cli_smoke.sh` | bitcoind |
 
-`contrib/hashfun/ci/setup.sh` prepares a CI or throwaway machine for all of it (it installs system packages): build tools and Boost headers, a virtualenv with zig and playwright, the site's npm packages, and the official `bitcoind` of Bitcoin Core 32.1, pinned by the hash bitcoincore.org publishes for it.
+`contrib/hashfun/ci/setup.sh` prepares a CI or throwaway machine for all of it (it installs system packages): build tools and Boost headers, a virtualenv with zig, playwright and numpy, the site's npm packages, and the official `bitcoind` of Bitcoin Core 32.1, pinned by the hash bitcoincore.org publishes for it.
 
 The suites one by one:
 
@@ -406,7 +469,8 @@ python -m unittest hashfun.tests.test_book      # launch metadata; the peer-to-p
 python -m unittest hashfun.tests.test_cli       # which node binary the CLI runs on which machine (the npm layout with stand-in binaries, $HASHFUND, the translated-Python case)
 bash contrib/hashfun/difftest/build.sh build/hfdiff && HFDIFF=build/hfdiff python -m unittest hashfun.tests.test_diff_cpp
 python -m hashfun.tests.e2e_regtest --hashfund build/bin/hashfund --bitcoind /path/to/stock/bitcoind
-python -m hashfun.tests.yield_regtest --hashfund build/bin/hashfund --bitcoind /path/to/stock/bitcoind   # ~30 s: node vs model, 270 blocks, every obligation at every height
+python -m hashfun.tests.twin_regtest --hashfund build/bin/hashfund                                        # a few seconds: both curves on one node
+python -m hashfun.tests.yield_regtest --hashfund build/bin/hashfund --bitcoind /path/to/stock/bitcoind   # ~1 min: node vs model, 442 blocks, every obligation at every height, both legs
 python -m hashfun.tests.fleet_regtest --hashfund build/bin/hashfund --bitcoind /path/to/stock/bitcoind   # ~4.5 min, real time
 python -m unittest hashfun.tests.test_web_js    # browser code vs Python, the site bundle and the swap engine bundle are current, lint (needs node; cd hashfun/web && npm install)
 python -m hashfun.tests.web_regtest --hashfund build/bin/hashfund --bitcoind /path/to/stock/bitcoind     # ~9 min, two browsers, needs playwright

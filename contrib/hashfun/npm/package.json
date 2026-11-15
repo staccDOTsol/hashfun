@@ -1,7 +1,7 @@
 {
   "name": "hashfun",
-  "version": "0.1.0",
-  "description": "hashfun CLI: launch a proof-of-work coin on its own Bitcoin-fork chain, run its node, mine it, settle the BTC it owes, swap it, and serve the site",
+  "version": "0.2.0",
+  "description": "Memecoins that are each their own Bitcoin fork: mined, priced in BTC and in QWEN, paying their holders. Every coin puts a node and a local model on more machines. The hashfun CLI launches a coin, runs its node, mines it, settles what its blocks owe, swaps it and serves the site.",
   "license": "MIT",
   "bin": { "hashfun": "bin/hashfun.js" },
   "files": ["bin", "py", "prebuilt/*/hashfund", "README.md"],
