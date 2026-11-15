@@ -1,12 +1,12 @@
 /* Anton, Inter and JetBrains Mono are served from here (SIL Open Font License). */
-@font-face { font-family: Anton; font-weight: 400; font-display: swap; src: url(/anton-400.woff2) format('woff2'); }
-@font-face { font-family: Inter; font-weight: 400; font-display: swap; src: url(/inter-400.woff2) format('woff2'); }
-@font-face { font-family: Inter; font-weight: 500; font-display: swap; src: url(/inter-500.woff2) format('woff2'); }
-@font-face { font-family: Inter; font-weight: 600; font-display: swap; src: url(/inter-600.woff2) format('woff2'); }
-@font-face { font-family: Inter; font-weight: 700; font-display: swap; src: url(/inter-700.woff2) format('woff2'); }
-@font-face { font-family: 'JetBrains Mono'; font-weight: 400; font-display: swap; src: url(/mono-400.woff2) format('woff2'); }
-@font-face { font-family: 'JetBrains Mono'; font-weight: 500; font-display: swap; src: url(/mono-500.woff2) format('woff2'); }
-@font-face { font-family: 'JetBrains Mono'; font-weight: 700; font-display: swap; src: url(/mono-700.woff2) format('woff2'); }
+@font-face { font-family: Anton; font-weight: 400; font-display: swap; src: url(anton-400.woff2) format('woff2'); }
+@font-face { font-family: Inter; font-weight: 400; font-display: swap; src: url(inter-400.woff2) format('woff2'); }
+@font-face { font-family: Inter; font-weight: 500; font-display: swap; src: url(inter-500.woff2) format('woff2'); }
+@font-face { font-family: Inter; font-weight: 600; font-display: swap; src: url(inter-600.woff2) format('woff2'); }
+@font-face { font-family: Inter; font-weight: 700; font-display: swap; src: url(inter-700.woff2) format('woff2'); }
+@font-face { font-family: 'JetBrains Mono'; font-weight: 400; font-display: swap; src: url(mono-400.woff2) format('woff2'); }
+@font-face { font-family: 'JetBrains Mono'; font-weight: 500; font-display: swap; src: url(mono-500.woff2) format('woff2'); }
+@font-face { font-family: 'JetBrains Mono'; font-weight: 700; font-display: swap; src: url(mono-700.woff2) format('woff2'); }
 :root { --bg: #0A0A0B; --panel: #131315; --panel2: #1F1F23; --line: #2C2C31; --text: #F2F0EC; --soft: #D4D1CA; --muted: #A6A39C; --o: #FF9A1F; --l: #C7F23E; }
 * { box-sizing: border-box; }
 body { margin: 0; background-color: var(--bg); background-image: radial-gradient(#1D1D21 1px, transparent 1px); background-size: 22px 22px; color: var(--text); font: 15px/1.45 Inter, system-ui, -apple-system, 'Segoe UI', sans-serif; }
@@ -21,6 +21,7 @@ a:focus-visible, button:focus-visible, input:focus-visible { outline: 2px solid 
 .top { border-bottom: 1px solid var(--line); background: var(--bg); position: sticky; top: 0; z-index: 5; }
 .bar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 28px; padding-top: 10px; padding-bottom: 10px; }
 .logo { display: flex; align-items: center; gap: 10px; min-height: 44px; color: var(--text); text-decoration: none; font-size: 28px; line-height: 1; }
+.brand { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 14px; min-width: 0; } .tagline { font-size: 12px; font-weight: 500; color: var(--l); letter-spacing: .2px; }
 .logo .mark { display: flex; align-items: center; justify-content: center; width: 34px; height: 34px; background: var(--o); color: var(--bg); font-size: 24px; }
 nav { display: flex; flex-wrap: wrap; gap: 4px; }
 nav a { display: flex; align-items: center; min-height: 44px; padding: 0 14px; color: var(--muted); text-decoration: none; font-weight: 600; }
@@ -53,7 +54,7 @@ h1, h2, p { margin: 0; }
 .offer { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; width: 100%; padding: 14px 16px; background: transparent; color: var(--text); border: 0; border-bottom: 1px solid var(--panel2); border-left: 4px solid transparent; text-align: left; }
 .offer:hover { background: var(--panel2); } .offer.on { border-left-color: var(--o); background: #1D1710; }
 a.tr { color: var(--text); text-decoration: none; } a.tr:hover { background: var(--panel2); color: var(--text); }
-.meter { position: relative; height: 12px; background: var(--panel2); } .meter > i { display: block; height: 100%; background: var(--o); } .meter.l > i { background: var(--l); }
+.meter { position: relative; height: 12px; background: var(--panel2); } .meter > i { display: block; height: 100%; background: var(--o); } .meter.l > i { background: var(--l); } .meter.w > i { background: var(--text); }
 .meter::after { content: ''; position: absolute; inset: 0; background-image: repeating-linear-gradient(90deg, transparent 0 10px, var(--panel) 10px 12px); }
 .meter.tall { height: 24px; } .meter.tall::after { background-image: repeating-linear-gradient(90deg, transparent 0 14px, var(--panel) 14px 17px); }
 .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(300px, 100%), 1fr)); gap: 16px; }

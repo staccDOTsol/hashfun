@@ -1,0 +1,14 @@
+{
+ "tagline": "The memes pay for the nodes.",
+ "what": "Memes quoted in BTC. Mined, not minted.",
+ "oneliner": "Memecoins that are each their own Bitcoin fork: mined, priced in BTC and in QWEN, paying their holders. Every coin puts a node and a local model on more machines.",
+ "fact_chain": "Every coin here is its own Bitcoin fork. Nobody mints it: machines mine it.",
+ "fact_prices": "Two prices per coin, one in BTC and one in QWEN. Two curves; take the cheaper one.",
+ "fact_holders": "80% of what a block owes is paid to a holder of that coin, in BTC or in QWEN. Hold and you earn.",
+ "why": "Why: mining these puts a Bitcoin-style node and a local model on one more machine, and then another. Pockets of people who have both keep the record and the knowledge when the lights, GPS and internet go out. Life will find a way.",
+ "pockets": "{n} machines run a node and a model right now. Add yours.",
+ "coin": "{TICKER} is its own chain with two curves. Whoever mines a block pays what it owes: 80% to a holder of {TICKER}, 10% to its creator, 10% to hashfun. No floor: the curves are the only seller.",
+ "mine": "This block is mined for you. You get its coins and you pay what it owes, 80% of it to a holder.",
+ "launch": "A coin is a chain. Name it, and the network's machines run it and mine it. Launching costs nothing.",
+ "honest": "No presale, no team allocation, no floor. A coin nobody mines stops."
+}

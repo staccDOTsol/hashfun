@@ -1,0 +1,47 @@
+<!doctype html>
+<!-- The site's share picture (static/share.png, 1200 x 630): what a link to the site shows where it is
+     pasted. Drawn with the page's own stylesheet, fonts and words (static/pitch.json);
+     `npm run share` renders it (src/share.py). -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="../static/style.css">
+<style>
+html, body { width: 1200px; height: 630px; margin: 0; overflow: hidden; }
+.card { box-sizing: border-box; width: 1200px; height: 630px; padding: 52px 64px 56px; display: flex; flex-direction: column; justify-content: space-between; border: 6px solid #FF9A1F; }
+.brandline { display: flex; align-items: center; gap: 16px; font-size: 44px; line-height: 1; }
+.brandline .mark { display: flex; align-items: center; justify-content: center; width: 54px; height: 54px; background: #FF9A1F; color: #0A0A0B; font-size: 38px; }
+h1 { font-size: 118px; line-height: .94; margin: 0; }
+.foot2 { display: flex; align-items: flex-end; justify-content: space-between; gap: 48px; }
+.tag { font-size: 30px; font-weight: 700; color: #C7F23E; }
+.curves { display: flex; flex-direction: column; gap: 12px; width: 430px; }
+.curves .lab { font-size: 15px; display: flex; justify-content: space-between; }
+.curves .meter { height: 20px; }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="brandline"><span class="d mark">#</span><span class="d">hashfun</span></div>
+  <h1 class="d"><span id="w1"></span><br><span id="w2" class="o"></span></h1>
+  <div class="foot2">
+    <span class="m tag" id="tagline"></span>
+    <div class="curves">
+      <div class="lab"><span class="o">BTC curve</span><span>sats per coin</span></div>
+      <div class="meter tall"><i style="width:62%"></i></div>
+      <div class="lab"><span style="color:#F2F0EC">QWEN curve</span><span>QWEN sats per coin</span></div>
+      <div class="meter tall w"><i style="width:38%"></i></div>
+    </div>
+  </div>
+</div>
+<script>
+fetch('../static/pitch.json').then((r) => r.json()).then(async (p) => {
+  const cut = p.what.indexOf('.') + 1;
+  document.getElementById('w1').textContent = p.what.slice(0, cut);
+  document.getElementById('w2').textContent = p.what.slice(cut).trim();
+  document.getElementById('tagline').textContent = p.tagline;
+  await document.fonts.ready;
+  document.body.dataset.ready = '1';
+});
+</script>
+</body>
+</html>

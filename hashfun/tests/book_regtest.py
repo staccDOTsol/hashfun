@@ -18,6 +18,13 @@ the nodes: a refund the test tries before its timelock is refused by consensus, 
      script. The maker's engine locks for none of them
   S8 a dishonest maker: a contract that refunds early, an underfunded lock. The taker's engine
      claims neither and takes its own lock back
+  Q1 coin for QWEN (rule set 3: QWEN is a chain of the book): the taker locks QWEN on Qwencoin, the
+     maker waits for 6 Qwencoin confirmations, then both claim
+  Q2 BTC for QWEN, no launch involved: sats locked on Bitcoin against QWEN locked on Qwencoin
+  Q3 the maker vanishes after the taker locked QWEN: Qwencoin refuses the refund before 8 h 10 min,
+     the taker's engine takes its QWEN back after
+
+A second stock bitcoind plays the regtest Qwencoin (tests/qwenreg.py), on the same mock clock.
 
 Needs node (18+), hashfund and a stock bitcoind:
   python3 -m hashfun.tests.book_regtest --hashfund build/bin/hashfund --bitcoind /path/to/bitcoind
@@ -41,6 +48,7 @@ from hashfun.ser import address_to_script, script_to_address, segwit_encode
 from hashfun.settler import Settler
 from hashfun.tests.e2e_regtest import COIN, RESULTS, block_from_gbt, check, free_port, mk_launch, open_wallet, ser_block
 from hashfun.tests.fleet_regtest import FNode, wait
+from hashfun.tests.qwenreg import QwenNode
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WEB = os.path.join(os.path.dirname(HERE), "web")
@@ -95,6 +103,7 @@ class Rig:
         self.T = int(t if t is not None else self.T + dt)
         self.btc.rpc.setmocktime(self.T)
         self.rpc.setmocktime(self.T)
+        self.qn.rpc.setmocktime(self.T)
         self.host("clock", t=self.T)
 
     def mine_tt(self, n=1):
@@ -112,6 +121,11 @@ class Rig:
             self.clock(dt=30)
             self.wb.generatetoaddress(1, self.btc_addr)
 
+    def mine_qwen(self, n=1):
+        for _ in range(n):
+            self.clock(dt=30)
+            self.wq.generatetoaddress(1, self.qwen_addr)
+
     def sync(self):
         """The site reads the launch chain through an index that polls: wait for it."""
         tip = self.rpc.getblockcount()
@@ -124,7 +138,7 @@ class Rig:
     def past(self, chain, when):
         """Move the clocks to `when` and mine until that chain's median time has passed it."""
         self.clock(t=when)
-        (self.mine_btc if chain == "btc" else self.mine_tt)(7)
+        {"btc": self.mine_btc, "qwen": self.mine_qwen}.get(chain, self.mine_tt)(7)
         mtp = self.get(f"/chain/{chain}/time")["mediantime"]
         assert mtp > when - 1, (mtp, when)
 
@@ -142,13 +156,16 @@ def main():
     from hashfun.cli import Registry
     from hashfun.web import Site, serve
     reg, rig, t0 = Registry(), Rig(a, work), time.time()
-    rig.btc = rig.host = None
+    rig.btc = rig.host = rig.qn = None
     try:
         # ---------------------------------------------------------------- chains
         rig.btc = FNode(a.bitcoind, os.path.join(work, "btc"), ["-regtest", "-listen=0"], free_port(), "btc")
         rig.wb = wb = open_wallet(rig.btc.rpc)
         rig.btc_addr = wb.getnewaddress("", "bech32")
         wb.generatetoaddress(110, rig.btc_addr)
+        rig.qn = QwenNode(a.bitcoind, os.path.join(work, "qwencoin"))
+        rig.wq = wq = rig.qn.funded_wallet()
+        rig.qwen_addr = wq.getnewaddress("", "bech32")
         g = int(time.time()) - DAY
         d = mk_launch("TT", b"\x00\x14" + hash160(pubkey_from_priv(random_priv())), 10**7, g)
         path = os.path.join(work, "tt.json")
@@ -185,7 +202,7 @@ def main():
         print(f"   TT at {rpc.getblockcount()}, rig wallet holds {have} spendable TT", flush=True)
 
         # ---------------------------------------------------------------- site, on the shipped defaults
-        site = Site(rig.btc.rpc, reg, None, book_path=os.path.join(work, "book.json"))
+        site = Site(rig.btc.rpc, reg, None, book_path=os.path.join(work, "book.json"), qwen=rig.qn.rpc)
         site.book.now = rig.now
         port = free_port()
         serve(site, "127.0.0.1", port)
@@ -201,11 +218,14 @@ def main():
         rig.mine_tt(12)
         rig.mine_btc(1)
 
-        def fund(addr_tt=None, coins=0, addr_btc=None, sats=0):
+        def fund(addr_tt=None, coins=0, addr_btc=None, sats=0, addr_q=None, qwen=0):
             if coins:
                 w.sendtoaddress(addr_tt, coins)
             if sats:
                 wb.sendtoaddress(addr_btc, f"{sats / COIN:.8f}")
+            if qwen:
+                wq.sendtoaddress(addr_q, f"{qwen / COIN:.8f}")
+                rig.mine_qwen(1)
             rig.mine_tt(1)
             rig.mine_btc(1)
 
@@ -565,12 +585,103 @@ def main():
             host("tick", name="M")
         check("S8 the taker's engine claims neither a lock that refunds early nor a short one, and takes its own sats back",
               all(u and st == "refunded" and 0 < lost <= 20_000 for _, u, st, lost, _ in results), str(results))
+
+        # ================================================================= Q1
+        print("-- Q1 coin for QWEN", flush=True)
+        check("Q the site's config names Qwencoin as a chain of the book", rig.get("/config")["qwen_id"] == "qwen:regtest"
+              and A["T"]["qwen"] == A["T"]["btc"], f"{rig.get('/config')['qwen_id']} {A['T']}")
+        fund(addr_q=A["T"]["qwen"], qwen=5 * COIN)
+        fund(addr_q=A["M"]["qwen"], qwen=5 * COIN)
+        rig.mine_qwen(1)
+        o = offer(get="qwen", give_amount=10 * COIN, get_amount=COIN // 2)
+        check("Q1 the offer asks 6 Qwencoin confirmations on the taker's QWEN", (o["lock"], o["confs"]) == (LOCK, 6), f"{o['lock']} {o['confs']}")
+        m_coins, t_q, m_q, t_coins, t_sats, at = bal("M", "TT"), bal("T", "qwen"), bal("M", "qwen"), bal("T", "TT"), bal("T", "btc"), rig.T
+        r = take(o)
+        ct = contract(r)
+        qlock = rig.qn.rpc.getrawtransaction(r["my"]["txid"], True)
+        check("Q1 the taker's lock is on Qwencoin: P2WSH of the contract, refundable 8 h 10 min from now",
+              r["state"] == "locked" and ct.locktime == at + T_INIT and ct.recipient_pub.hex() == P["M"]
+              and qlock["vout"][r["my"]["vout"]]["scriptPubKey"]["hex"] == "0020" + sha256(ct.script()).hex()
+              and round(qlock["vout"][r["my"]["vout"]]["value"] * COIN) == COIN // 2, f"{ct.locktime - at}")
+        rig.mine_qwen(5)
+        host("tick", name="M")
+        five = rec("M", r["id"])["state"]
+        rig.mine_qwen(1)
+        host("tick", name="M")
+        check("Q1 the maker locks its coins only at 6 Qwencoin confirmations", five == "accepted" and rec("M", r["id"])["state"] == "locked",
+              f"{five} {rec('M', r['id'])['state']} {rec('M', r['id']).get('note', '')}")
+        rig.mine_tt(6)
+        host("tick", name="T")
+        rig.mine_tt(1)
+        host("tick", name="M")
+        rig.mine_qwen(1)
+        rig.sync()
+        check("Q1 both claim: coins at the taker's key, QWEN at the maker's key on Qwencoin, no sats moved",
+              rec("T", r["id"])["state"] == "done" and rec("M", r["id"])["state"] == "done"
+              and 0 < t_coins + 10 * COIN - bal("T", "TT") <= 2000 and 0 < m_q + COIN // 2 - bal("M", "qwen") <= 12_000
+              and bal("T", "qwen") <= t_q - COIN // 2 and bal("M", "TT") <= m_coins - 10 * COIN and bal("T", "btc") == t_sats,
+              f"{rec('T', r['id'])['state']} {rec('M', r['id'])['state']} {rec('T', r['id']).get('note', '')} {rec('M', r['id']).get('note', '')}")
+
+        # ================================================================= Q2
+        print("-- Q2 BTC for QWEN", flush=True)
+        o = offer(give="qwen", get="btc", give_amount=COIN, get_amount=200_000)
+        t_q, t_sats, m_q, m_sats, at = bal("T", "qwen"), bal("T", "btc"), bal("M", "qwen"), bal("M", "btc"), rig.T
+        r = take(o)
+        rig.mine_btc(1)
+        host("tick", name="M")
+        rm = rec("M", r["id"])
+        mlock = rig.qn.rpc.getrawtransaction(rm["my"]["txid"], True) if rm["state"] == "locked" else None
+        check("Q2 the taker locks sats on Bitcoin, the maker then locks QWEN on Qwencoin, refundable 4 h 10 min from the take",
+              mlock is not None and contract(rm).locktime == at + T_INIT - LOCK
+              and wb.gettxout(r["my"]["txid"], r["my"]["vout"]) is not None, rm["state"] + " " + rm.get("note", ""))
+        rig.mine_qwen(5)
+        host("tick", name="T")
+        five = rec("T", r["id"])["state"]
+        rig.mine_qwen(1)
+        host("tick", name="T")
+        rig.mine_qwen(1)
+        host("tick", name="M")
+        rig.mine_btc(1)
+        check("Q2 the taker claims QWEN at 6 Qwencoin confirmations, the maker claims the sats with the secret",
+              five == "locked" and rec("T", r["id"])["state"] == "done" and rec("M", r["id"])["state"] == "done"
+              and 0 < t_q + COIN - bal("T", "qwen") <= 12_000 and 0 < m_sats + 200_000 - bal("M", "btc") <= 12_000
+              and bal("T", "btc") <= t_sats - 200_000 and bal("M", "qwen") <= m_q - COIN,
+              f"{five} {rec('T', r['id'])['state']} {rec('M', r['id'])['state']} {rec('T', r['id']).get('note', '')}")
+
+        # ================================================================= Q3
+        print("-- Q3 a refund on the Qwencoin side", flush=True)
+        o = offer(get="qwen", give_amount=10 * COIN, get_amount=COIN // 2)
+        t_q, at = bal("T", "qwen"), rig.T
+        r = take(o)
+        host("drop", name="M")
+        rig.mine_qwen(1)
+        rig.past("qwen", at + T_INIT - 900)
+        host("tick", name="T")
+        early = refund_tx(contract(r), bytes.fromhex(r["my"]["txid"])[::-1], r["my"]["vout"], COIN // 2,
+                          address_to_script(A["T"]["qwen"], "bcrt"), 400, keys["T"])
+        try:
+            rig.qn.rpc.sendrawtransaction(early.serialize().hex())
+            refused = ""
+        except RPCError as e:
+            refused = str(e)
+        check("Q3 8 hours in, the taker's QWEN is still locked: the page waits and Qwencoin itself refuses the refund",
+              rec("T", r["id"])["state"] == "locked" and "non-final" in refused
+              and rig.qn.rpc.gettxout(r["my"]["txid"], r["my"]["vout"]) is not None, refused[:80])
+        rig.past("qwen", at + T_INIT + 1)
+        host("tick", name="T")
+        rig.mine_qwen(1)
+        back = bal("T", "qwen")
+        check("Q3 past 8 h 10 min the taker's engine takes its QWEN back on Qwencoin by itself: only fees are gone",
+              rec("T", r["id"])["state"] == "refunded" and 0 < t_q - back <= 20_000, f"{t_q - back} {rec('T', r['id']).get('note', '')}")
+        host("back", name="M")
+        host("tick", name="M")
     except Exception as e:  # noqa: BLE001
         import traceback
         traceback.print_exc()
         check("book run completed", False, str(e))
     finally:
-        for fn in ((lambda: rig.host.stop()) if rig.host else None, lambda: reg.down("TT"), (lambda: rig.btc.stop()) if rig.btc else None):
+        for fn in ((lambda: rig.host.stop()) if rig.host else None, lambda: reg.down("TT"), (lambda: rig.btc.stop()) if rig.btc else None,
+                   (lambda: rig.qn.stop()) if rig.qn else None):
             if fn:
                 try:
                     fn()

@@ -1,8 +1,11 @@
-"""The no-install path, end to end on regtest: a visitor asks the site to mine a block for them, the
-server's CPU mines it to their address, they pay that block's sats from their own Bitcoin wallet
-(as their browser wallet would: one tagged transaction), the site's settler sees the payment and
-proves it, and their coins unlock. Plus the public stratum: an outside miner with only a launch
-address as username gets the coinbase.
+"""The no-install path, end to end on regtest (rule set 3: two curves): a visitor asks the site to
+mine a block for them, the server's CPU mines it to their address, they pay that block's sats from
+their own Bitcoin wallet (as their browser wallet would: one tagged transaction), the site's settler
+sees the payment and proves it, and their coins unlock. Plus the public stratum: an outside miner
+with only a launch address as username gets the coinbase, on the curve its username names. Then the
+same from a real browser on both curves: a BTC-curve block paid in sats and a QWEN-curve block paid
+in QWEN on Qwencoin (a second stock bitcoind plays the regtest Qwencoin: tests/qwenreg.py), each
+from the page's own key.
 
 python -m hashfun.tests.sitepool_regtest --hashfund build/bin/hashfund --bitcoind PATH
 """
@@ -21,6 +24,7 @@ from hashfun.crypto import hash160, pubkey_from_priv, random_priv
 from hashfun.rpc import RPC
 from hashfun.ser import Tx, TxOut, segwit_encode
 from hashfun.tests.e2e_regtest import free_port
+from hashfun.tests.qwenreg import QwenNode
 
 RESULTS = []
 
@@ -51,7 +55,7 @@ def main():
     w = tempfile.mkdtemp(prefix="hashfun-sitepool-")
     env = dict(os.environ, HASHFUN_HOME=os.path.join(w, "home"), HASHFUND=os.path.abspath(a.hashfund))
     hf = [sys.executable, "-m", "hashfun.cli"]
-    procs = []
+    procs, qn = [], None
     try:
         bp = free_port()
         procs.append(subprocess.Popen([a.bitcoind, "-regtest", f"-datadir={w}", "-server=1", "-listen=0", f"-rpcport={bp}",
@@ -64,14 +68,22 @@ def main():
         wb = btc.wallet("w")
         ba = wb.getnewaddress("", "bech32")
         wb.generatetoaddress(110, ba)
+        qn = QwenNode(a.bitcoind, os.path.join(w, "qwencoin"))
+        wq = qn.funded_wallet()
 
         def addr(hrp):
             return segwit_encode(hrp, 0, hash160(pubkey_from_priv(random_priv())))
 
+        # What a block owes is its work times the curve's rate, and under the launch's least payment it is
+        # paid by lot. The site's own miner is a slow one (Python, one thread beside everything else the site
+        # does), and how slow is a matter of the machine: the rate here (4 sats a hash) puts the least payment
+        # at 2,500 hashes a block, which the slowest machine this runs on keeps up at this spacing.
         subprocess.run(hf + ["launch", "new", "--name", "Site pool", "--ticker", "SPL", "--creator-address", addr("spl"),
                              "--graduation-hashes", "1e9", "--pow-limit", "207fffff", "--spacing", "5", "--window", "10",
-                             "--test", "--btc-rpc", btc_url, "--btc-cookie", cookie, "--sats-total", "0.5",
+                             "--test", "--btc-rpc", btc_url, "--btc-cookie", cookie, "--sats-total", "40",
                              "--creator-btc-address", wb.getnewaddress("", "bech32"), "--btc-hrp", "bcrt",
+                             "--qwen-rpc", qn.url, "--qwen-cookie", qn.cookie, "--qwen-regtest", "--qwen-total", "50",
+                             "--creator-qwen-address", wq.getnewaddress("", "bech32"),
                              "-o", os.path.join(w, "spl.json")], env=env, check=True, capture_output=True)
         d = json.load(open(os.path.join(w, "spl.json")))
         hrp = d["hrp"]
@@ -82,6 +94,7 @@ def main():
         op_pub = pubkey_from_priv(op_priv)
         log = open(os.path.join(w, "web.log"), "w")
         procs.append(subprocess.Popen(hf + ["web", "--btc-rpc", btc_url, "--btc-cookie", cookie, "--listen", f"127.0.0.1:{site_port}",
+                                            "--qwen-rpc", qn.url, "--qwen-cookie", qn.cookie,
                                             "--pool", "--pool-host", "127.0.0.1", "--operator-pubkey", op_pub.hex(),
                                             "--pool-cut-bps", "500"], env=env, stdout=log, stderr=subprocess.STDOUT))
         base = f"http://127.0.0.1:{site_port}/api"
@@ -95,6 +108,8 @@ def main():
 
         coin = wait(lambda: (get("/coin/SPL").get("pool") or None) and get("/coin/SPL"), 120, "the site serving SPL with a pool")
         check("the site runs a pool for the launch, with a public stratum port", coin["pool"]["stratum_port"] == coin["p2p_port"] + 2,
+              coin["pool"])
+        check("the pool mines both curves: the site has a node of each quote chain", coin["pool"]["curves"] == ["btc", "qwen"],
               coin["pool"])
         reg = json.load(open(os.path.join(w, "home", "launches.json")))
         e = reg["SPL"]
@@ -113,7 +128,7 @@ def main():
         except urllib.error.HTTPError as err:
             check("an address of another chain is refused", err.code == 400)
         try:
-            wait(lambda: launch.getblockcount() >= h0 + 2 and get("/coin/SPL")["pool"]["queue"] == 0, 90, "two blocks for the visitor")
+            wait(lambda: launch.getblockcount() >= h0 + 2 and get("/coin/SPL")["pool"]["queue"] == 0, 240, "two blocks for the visitor")
         except TimeoutError:
             print("state:", h0, launch.getblockcount(), get("/coin/SPL")["pool"], launch.getblockchaininfo())
             raise
@@ -132,32 +147,67 @@ def main():
         check("the operator's share is 5% of the block's reward, output 1", cb1["vout"][1]["scriptPubKey"]["hex"] == op_script
               and abs(cut - total * 500 // 10000) <= 1, (cut, total))
 
-        # 2. the draws come: the site lists what the visitor owes
+        # 2. an outside miner on the public stratum, with only an address as its username. It comes for a
+        #    couple of blocks at a time and stays until the launch says its next block owes four times the
+        #    least payment: how fast a test chain's difficulty rises is a matter of the machine, and a span of
+        #    time that is enough on one is not on another (a block that owes less than the least payment is
+        #    paid by lot, and then what the visitor owes below would be luck).
         ext = addr(hrp)
+        ext_script = launch.validateaddress(ext)["scriptPubKey"]
         port = coin["pool"]["stratum_port"]
         from hashfun.miner import StratumMiner
         import asyncio
-        res = asyncio.run(StratumMiner("127.0.0.1", port, ext).run(25))
-        hs = [h for h in range(h0 + 1, launch.getblockcount() + 1)
-              if launch.getblock(launch.getblockhash(h), 2)["tx"][0]["vout"][0]["scriptPubKey"]["hex"] ==
-              launch.validateaddress(ext)["scriptPubKey"]]
+        paid = {}  # height -> the script its coinbase pays first
+
+        def blocks_of(script, above):
+            tip = launch.getblockcount()
+            for h in range(max([x for x in paid if x < tip - 2], default=h0) + 1, tip + 1):  # the last few again
+                paid[h] = launch.getblock(launch.getblockhash(h), 2)["tx"][0]["vout"][0]["scriptPubKey"]["hex"]
+            return [h for h in sorted(paid) if above < h <= tip and paid[h] == script]
+
+        def outside(username):
+            return asyncio.run(StratumMiner("127.0.0.1", port, username, batch=512, max_shares=2).run(10))
+
+        res, t0 = None, time.time()
+        while True:
+            c = launch.getlaunchinfo()["curves"]["btc"]
+            hs = blocks_of(ext_script, h0)
+            if len(hs) >= 6 and c["next_owed"] >= 4 * c["min_payment"]:
+                break
+            if time.time() - t0 > 300:
+                raise TimeoutError(f"the outside miner raising what a block owes: {len(hs)} blocks, {c}, {res}")
+            res = outside(ext)
         check("an outside miner on the public stratum gets the coinbase at its username's address, no cut", len(hs) >= 6 and all(
             not any(o["scriptPubKey"]["hex"] == op_script for o in launch.getblock(launch.getblockhash(h), 2)["tx"][0]["vout"]) for h in hs),
             (len(hs), res))
-        # By now coins are held and the difficulty has risen, so blocks owe real sats. The visitor
-        # asks again; the outside miner then leaves, and the server alone mines the blocks that
-        # carry the draws (it mines while a block that owes waits for its draw).
+        check("a bare address mines the pool's default curve, the BTC curve: no block of it has the QWEN bit",
+              all(not launch.getblock(launch.getblockhash(h), 1)["version"] & 0x200 for h in hs), hs)
+        hq0, t0 = launch.getblockcount(), time.time()
+        while not blocks_of(ext_script, hq0) and time.time() - t0 < 120:
+            outside(ext + "/qwen")
+        qhs = blocks_of(ext_script, hq0)
+        check("ADDRESS/qwen on the stratum mines the QWEN curve: its blocks carry header bit 0x200 and owe QWEN",
+              qhs and all(launch.getblock(launch.getblockhash(h), 1)["version"] & 0x200 for h in qhs)
+              and all(launch.getmintobligation(h).get("quote") == "qwen" for h in qhs), qhs)
+        # By now coins are held and a block owes real sats. The visitor asks again; the outside miner has
+        # left, and the server alone mines the blocks that carry the draws (it mines while a block that
+        # owes waits for its draw). A draw comes DRAW_DELAY blocks after its block: the wait is for that,
+        # not for a span of time.
         due = None
         for _ in range(4):
+            hv = launch.getblockcount()
             post("/coin/SPL/queue", {"address": me, "blocks": 3})
             wait(lambda: get("/coin/SPL")["pool"]["queue"] == 0, 300, "three more blocks for the visitor")
-            try:
-                due = wait(lambda: [x for x in get(f"/coin/SPL/due?address={me}") if x["pay"] > 0] or None, 90, "dues")
+            mine = blocks_of(mine_script, hv)
+            drawn = wait(lambda: mine and [launch.getmintobligation(h) for h in mine]
+                         if all(launch.getmintobligation(h)["draw_known"] for h in mine) else None, 300,
+                         "the draws of the visitor's blocks")
+            if any(ob["pay"] for ob in drawn):
+                due = wait(lambda: [x for x in get(f"/coin/SPL/due?address={me}") if x["pay"] > 0] or None, 120, "dues")
                 break
-            except TimeoutError:
-                continue  # every draw said nothing is due (the lottery under the minimum payment): ask again
+            # every draw said nothing is due (the lot of a block under the least payment): ask again
         if not due:
-            raise TimeoutError("the visitor's dues")
+            raise TimeoutError(f"the visitor's dues: {launch.getlaunchinfo()['curves']['btc']}")
         cb_heights = set(h for h in range(1, launch.getblockcount() + 1)
                          if launch.getblock(launch.getblockhash(h), 2)["tx"][0]["vout"][0]["scriptPubKey"]["hex"] == mine_script)
         check("the site lists the visitor's drawn blocks with what each owes and to which script",
@@ -173,12 +223,12 @@ def main():
         txid = wb.sendrawtransaction(wb.signrawtransactionwithwallet(funded["hex"])["hex"])
         wb.generatetoaddress(2, ba)
         # nobody mines now: the server's CPU mines the blocks that carry the proof, to the operator
-        settled = wait(lambda: all(launch.getmintobligation(x["height"])["settled"] for x in due) or None, 180,
+        settled = wait(lambda: all(launch.getmintobligation(x["height"])["settled"] for x in due) or None, 300,
                        "the site's settler proving the visitor's payment")
         check("the site's settler found the payment on Bitcoin and proved it: the blocks are settled", settled, txid)
         check("the visitor's coinbases are spendable now", all(launch.getmintobligation(x["height"])["spendable"] for x in due))
         check("settled blocks leave the visitor's list", wait(lambda: not [x for x in get(f"/coin/SPL/due?address={me}")
-                                                                           if x["height"] in [y["height"] for y in due]] or None, 60, "list"))
+                                                                           if x["height"] in [y["height"] for y in due]] or None, 120, "list"))
 
         # 4. the same from a real browser: the page asks for a block, shows what it owes, and pays
         #    from the page's own key after one top-up from the (stand-in) wallet
@@ -187,7 +237,7 @@ def main():
         btc.createwallet("u")
         wu = btc.wallet("u")
         uaddr = wu.getnewaddress("", "bech32")
-        wb.sendtoaddress(uaddr, 1)
+        wb.sendtoaddress(uaddr, 100)
         wb.generatetoaddress(1, ba)
         pw = sync_playwright().start()
         browser = pw.chromium.launch()
@@ -211,7 +261,7 @@ def main():
             page.click("#mineme")
             wait(lambda: get("/coin/SPL")["pool"]["queue"] == 0, 300, "the page's block")
             try:
-                got = wait(lambda: page.locator("#paydue").count() > 0, 90, "the pay button")
+                got = wait(lambda: page.locator("#paydue").count() > 0, 240, "the pay button")
                 break
             except TimeoutError:
                 continue
@@ -228,31 +278,76 @@ def main():
                 page.wait_for_timeout(500)
             raise TimeoutError(what)
         page.click("#paydue")   # the page's key is empty: it asks to top up from the wallet (accepted), then says to pay again
-        pwait(lambda: wu.listtransactions("*", 5) and any(t["category"] == "send" for t in wu.listtransactions("*", 5)), 60, "the top-up")
+        pwait(lambda: wu.listtransactions("*", 5) and any(t["category"] == "send" for t in wu.listtransactions("*", 5)), 120, "the top-up")
         wb.generatetoaddress(1, ba)
         page_due = [x for x in get(f"/coin/SPL/due?address={page_launch}") if x["pay"] > 0]
-        pwait(lambda: page.locator("#paydue").count() > 0, 60, "pay button again")
+        pwait(lambda: page.locator("#paydue").count() > 0, 120, "pay button again")
         page.click("#paydue")
-        pwait(lambda: len(btc.getrawmempool()) > 0, 60, "the page's payment in the mempool")
+        pwait(lambda: len(btc.getrawmempool()) > 0, 120, "the page's payment in the mempool")
         wb.generatetoaddress(2, ba)
-        ok = pwait(lambda: all(launch.getmintobligation(x["height"])["settled"] for x in page_due[:3]) or None, 240, "the page's blocks settled")
+        ok = pwait(lambda: all(launch.getmintobligation(x["height"])["settled"] for x in page_due[:3]) or None, 300, "the page's blocks settled")
         check("the page paid its blocks' sats from its own key and they are settled", ok and page_due, page_due)
         check("the page's coins are in its address, spendable", any(
             launch.getblock(launch.getblockhash(x["height"]), 2)["tx"][0]["vout"][0]["scriptPubKey"]["hex"] == page_script
             and launch.getmintobligation(x["height"])["spendable"] for x in page_due))
+
+        # 5. the QWEN curve from the same page: the block owes QWEN, paid on Qwencoin from the page's
+        #    key (the same address string as on Bitcoin, funded on Qwencoin as the page asks)
+        key_script = "0014" + hash160(pub).hex()
+        key_q = segwit_encode("bcrt", 0, hash160(pub))
+        wq.sendtoaddress(key_q, 20)
+        qn.mine(1)
+        page.click("#curve-qwen")
+        page.wait_for_selector("#curve-qwen[aria-pressed='true']")
+        check("picking the QWEN curve puts /qwen in the stratum line", "/qwen" in page.locator("pre.code").inner_text())
+        gotq = None
+        for _ in range(5):
+            page.click("#mineme")
+            pwait(lambda: get("/coin/SPL")["pool"]["queue"] == 0, 300, "the page's QWEN-curve block")
+            try:
+                gotq = pwait(lambda: page.locator("#paydue-qwen").count() > 0, 240, "the QWEN pay button")
+                break
+            except TimeoutError:
+                continue
+        check("after its QWEN-curve block is drawn the page shows what it owes on Qwencoin", bool(gotq) and
+              "on Qwencoin" in page.locator("[data-dues='qwen']").inner_text(), page.locator(".pad").first.inner_text()[:300])
+        qdue = [x for x in get(f"/coin/SPL/due?address={page_launch}") if x["pay"] > 0 and x["quote"] == "qwen"]
+        check("those blocks are on the QWEN curve (header bit 0x200) and paid the page's address", qdue and all(
+            launch.getblock(launch.getblockhash(x["height"]), 1)["version"] & 0x200 and
+            launch.getblock(launch.getblockhash(x["height"]), 2)["tx"][0]["vout"][0]["scriptPubKey"]["hex"] == page_script
+            for x in qdue), qdue)
+        btc_pool = set(btc.getrawmempool())
+        page.click("#paydue-qwen")
+        pwait(lambda: len(qn.rpc.getrawmempool()) > 0, 120, "the page's QWEN payment in the Qwencoin mempool")
+        qtx = qn.rpc.getrawtransaction(qn.rpc.getrawmempool()[0], True)
+        check("paid on Qwencoin from the page's key, and nothing sent on Bitcoin", set(btc.getrawmempool()) == btc_pool and all(
+            qn.rpc.getrawtransaction(i["txid"], True)["vout"][i["vout"]]["scriptPubKey"]["hex"] == key_script for i in qtx["vin"]), qtx["vin"])
+        qn.mine(2)
+        okq = pwait(lambda: all(launch.getmintobligation(x["height"])["settled"] for x in qdue[:3]) or None, 300,
+                    "the page's QWEN-curve blocks settled")
+        check("the site's settler relayed Qwencoin's headers, proved the QWEN payment, and the blocks are settled", okq, qdue)
+        check("the page's QWEN-curve coins are spendable",
+              all(launch.getmintobligation(x["height"])["spendable"] for x in qdue[:3]))
+        check("settled QWEN dues leave the page", pwait(lambda: page.locator("#paydue-qwen").count() == 0, 180, "dues gone"))
         check("no page errors", not errors, errors[:3])
         browser.close()
         pw.stop()
     except BaseException:
+        # the error itself is printed last, where the end of a log is read first
         try:
-            print('--- the site log, last lines'); print(''.join(open(os.path.join(w, 'web.log')).readlines()[-40:]))
-        except OSError:
+            print("--- the site log, last lines\n" + "".join(open(os.path.join(w, "web.log")).readlines()[-12:]), flush=True)
+            info = launch.getlaunchinfo()
+            print("--- the launch: height", info["height"], {c: {k: v[k] for k in ("blocks", "next_owed", "min_payment")}
+                                                            for c, v in info["curves"].items()}, flush=True)
+        except Exception:
             pass
         raise
     finally:
         for p in procs:
             p.terminate()
         subprocess.run(hf + ["node", "down"], env=env, capture_output=True)
+        if qn is not None:
+            qn.stop()
         for p in procs:
             try:
                 p.wait(20)

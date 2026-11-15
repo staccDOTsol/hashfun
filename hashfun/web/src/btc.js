@@ -131,9 +131,9 @@ export const scriptToAddress = (spk, hrp) => {
 };
 
 // ---------------------------------------------------------------- transactions
-// tx: { version, locktime, vin: [{ txid (hex, display order), vout, sequence, witness: [bytes] }], vout: [{ value, script }] }
+// tx: { version, locktime, vin: [{ txid (hex, display order), vout, sequence, witness: [bytes], scriptSig? }], vout: [{ value, script }] }
 const ser = (tx, withWitness) => {
-  const ins = tx.vin.map((i) => cat(rev(unhex(i.txid)), u32(i.vout), varbytes(new Uint8Array(0)), u32(i.sequence)));
+  const ins = tx.vin.map((i) => cat(rev(unhex(i.txid)), u32(i.vout), varbytes(i.scriptSig || new Uint8Array(0)), u32(i.sequence)));
   const outs = tx.vout.map((o) => cat(u64(o.value), varbytes(o.script)));
   const wit = withWitness && tx.vin.some((i) => i.witness && i.witness.length);
   return cat(u32(tx.version), wit ? Uint8Array.of(0, 1) : new Uint8Array(0), varint(ins.length), ...ins, varint(outs.length), ...outs,
@@ -164,6 +164,67 @@ export const signP2wpkh = (priv, utxos, outputs) => {
   tx.vin.forEach((i, n) => { i.witness = [sign(priv, sighash(tx, n, p2pkhCode(pub), utxos[n].value)), pub]; });
   return tx;
 };
+
+// ---------------------------------------------------------------- PSBT (BIP 174)
+// The page signs with its own key everywhere but one place: coins that sit at the wallet's own
+// address on Qwencoin (QWEN it was paid there, or moved there) can only be moved by the wallet's
+// key. A Qwencoin transaction is a Bitcoin-format transaction, so the wallet signs it as a PSBT
+// and the site hands the result to its Qwencoin node. Nothing here signs; it writes the request
+// and reads the answer.
+const kv = (type, value, keydata = new Uint8Array(0)) => cat(varint(1 + keydata.length), Uint8Array.of(type), keydata, varbytes(value));
+// Which kind of output a wallet address is: p2wpkh, p2sh (taken to wrap p2wpkh), p2tr or legacy.
+export const scriptKind = (spk) => (spk.length === 22 && spk[0] === 0 && spk[1] === 20 ? 'p2wpkh' : spk.length === 34 && spk[0] === 0x51 && spk[1] === 32 ? 'p2tr'
+  : spk.length === 23 && spk[0] === 0xa9 && spk[22] === 0x87 ? 'p2sh' : spk.length === 25 && spk[0] === 0x76 ? 'p2pkh' : 'other');
+// inputs: [{ txid, vout, value }], all paying `script` (the wallet address); pub: the wallet's
+// compressed public key (needed for p2sh-wrapped and taproot addresses). outputs: [{ value, script }].
+export const psbtHex = (inputs, script, outputs, pub) => {
+  const kind = scriptKind(script);
+  if (kind === 'p2pkh' || kind === 'other') throw new Error('an address of this kind (legacy) cannot be spent from this page: it would need the whole earlier transaction, which the site may not have');
+  let extra = new Uint8Array(0);
+  if (kind === 'p2sh') {
+    const redeem = p2wpkh(pub);
+    if (!eq(hash160(redeem), script.slice(2, 22))) throw new Error('this address is not a wrapped segwit address of the wallet key');
+    extra = kv(0x04, redeem);
+  } else if (kind === 'p2tr') extra = kv(0x17, pub.slice(1));
+  const tx = { version: 2, locktime: 0, vin: inputs.map((u) => ({ txid: u.txid, vout: u.vout, sequence: 0xfffffffd, witness: [] })), vout: outputs };
+  return hex(cat(unhex('70736274ff'), kv(0x00, ser(tx, false)), Uint8Array.of(0),
+    ...inputs.map((u) => cat(kv(0x01, cat(u64(u.value), varbytes(script))), extra, Uint8Array.of(0))), ...outputs.map(() => Uint8Array.of(0))));
+};
+const reader = (b) => {
+  let o = 0;
+  const take = (n) => { if (o + n > b.length) throw new Error('truncated'); const x = b.slice(o, o + n); o += n; return x; };
+  const vi = () => { const f = take(1)[0]; if (f < 0xfd) return f; const n = f === 0xfd ? 2 : f === 0xfe ? 4 : 8; return take(n).reduce((a, x, i) => a + x * 256 ** i, 0); };
+  return { take, vi, bytes: () => take(vi()), end: () => o >= b.length, u32: () => new DataView(take(4).buffer).getUint32(0, true), u64: () => Number(new DataView(take(8).buffer).getBigUint64(0, true)) };
+};
+const psbtMap = (r) => { // one key-value map: [{ type, key, value }]
+  const out = [];
+  for (;;) { const klen = r.vi(); if (klen === 0) return out; const k = r.take(klen); out.push({ type: k[0], key: k.slice(1), value: r.bytes() }); }
+};
+const stack = (b) => { const r = reader(b), out = []; for (let n = r.vi(); n > 0; n--) out.push(r.bytes()); return out; };
+// The network transaction a signed PSBT holds, and the transaction it was asked for: the page
+// broadcasts only if the wallet signed exactly what it was given (same inputs, same outputs).
+export const txFromPsbt = (psbt) => {
+  try {
+    const r = reader(unhex(psbt));
+    if (hex(r.take(5)) !== '70736274ff') throw 0;
+    const g = psbtMap(r).find((e) => e.type === 0 && e.key.length === 0);
+    const t = reader(g.value), tx = { version: t.u32(), vin: [], vout: [], locktime: 0 };
+    for (let n = t.vi(); n > 0; n--) { const prev = t.take(32); tx.vin.push({ txid: hex(rev(prev)), vout: t.u32(), scriptSig: t.bytes(), sequence: t.u32(), witness: [] }); }
+    for (let n = t.vi(); n > 0; n--) tx.vout.push({ value: t.u64(), script: t.bytes() });
+    tx.locktime = t.u32();
+    for (const i of tx.vin) {
+      const m = psbtMap(r), get = (type) => m.find((e) => e.type === type);
+      const fw = get(0x08), fs = get(0x07), part = get(0x02), key = get(0x13), redeem = get(0x04);
+      if (fw || fs) { i.witness = fw ? stack(fw.value) : []; i.scriptSig = fs ? fs.value : new Uint8Array(0); } // finalized by the wallet
+      else if (key) i.witness = [key.value]; // taproot key path, not finalized
+      else if (part) { i.witness = [part.value, part.key]; i.scriptSig = redeem ? push(redeem.value) : new Uint8Array(0); } // one signature and its key
+      else throw 0;
+    }
+    return { hex: txHex(tx), txid: txid(tx), tx };
+  } catch (e) { throw new Error('the wallet did not return a signed transaction'); }
+};
+export const sameSpend = (tx, inputs, outputs) => tx.vin.length === inputs.length && tx.vin.every((i, n) => i.txid === inputs[n].txid && i.vout === inputs[n].vout)
+  && tx.vout.length === outputs.length && tx.vout.every((o, n) => o.value === outputs[n].value && eq(o.script, outputs[n].script));
 
 // ---------------------------------------------------------------- HTLC (hashfun/htlc.py)
 export const contractScript = (c) => cat(Uint8Array.of(0x63, 0x82), pushInt(32), Uint8Array.of(0x88, 0xa8), push(c.secretHash),

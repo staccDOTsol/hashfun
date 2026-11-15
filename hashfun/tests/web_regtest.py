@@ -18,6 +18,14 @@ wallet and whose signMessage returns a fixed signature (the UniSat extension can
   P2 coin for coin: a holder of a second chain's coin swaps it for the first, no Bitcoin involved
   P3 a bid in sats paid from the hashfun key, taken with coins
   P4 the maker's browser goes away after the taker locked: the taker's coins come back by themselves
+  R1 the site is served under --base-path /fun: everything the page asks for is under the prefix
+  R2 a crawler (no script) gets the pitch and the link-preview tags in the HTML, for the site and for a
+     coin at /fun/c/TICKER, with absolute addresses that carry the base path
+  R3 the board with storage blocked: the pitch block whole, the coins, no error
+  R4 both curves of a coin: two price points on the board and the coin page
+
+Rule set 3: every launch has a QWEN curve; a second stock bitcoind plays the regtest Qwencoin
+(tests/qwenreg.py) and the site follows it (--qwen-rpc), so the launch form can create launches.
 
 Pictures: the first launch commits to a picture and a blurb (the site serves and shows them); the
 launch form uploads one, the page shrinks it, and the new chain's launch id commits to the result.
@@ -44,7 +52,8 @@ from hashfun.ser import address_to_script, segwit_encode
 from hashfun.settler import Settler
 from hashfun.tests.e2e_regtest import RESULTS, check, free_port, open_wallet, COIN, DAY
 from hashfun.tests.fleet_regtest import FNode, BtcTicker, Rig, wait, mine_gbt, FLOOR_BITS
-from hashfun.tests.test_book import png
+from hashfun.tests.test_book import BLOCKED_STORAGE, png
+from hashfun.tests.qwenreg import QwenNode
 
 N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
 SIG = "H" + base64.b64encode(hashlib.sha256(b"hashfun web test wallet").digest() * 2).decode()
@@ -111,11 +120,11 @@ def main():
     t0 = time.time()
     loop = asyncio.new_event_loop()
     threading.Thread(target=loop.run_forever, daemon=True).start()
-    reg, btc, rig, rig2, ticker, browser, pw = Registry(), None, None, None, None, None, None
+    reg, btc, rig, rig2, ticker, browser, pw, qn = Registry(), None, None, None, None, None, None, None
     errors = []
 
     def get(path):
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api{path}", timeout=60) as r:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/fun/api{path}", timeout=60) as r:
             return json.loads(r.read())
 
     def shot(page, name):
@@ -135,6 +144,9 @@ def main():
         wb.sendtoaddress(user2_addr, 2)
         wb.sendtoaddress(ws2.getnewaddress("", "bech32"), 5)
         wb.generatetoaddress(1, btc_addr)
+        qn = QwenNode(a.bitcoind, os.path.join(work, "qwencoin"))
+        wq = qn.funded_wallet()
+        qspk = lambda x: bytes.fromhex(wq.getaddressinfo(x)["scriptPubKey"])  # noqa: E731
         ticker = BtcTicker(wb, btc_addr, 2.0)
         ticker.start()
         bspk = lambda x: bytes.fromhex(wb.getaddressinfo(x)["scriptPubKey"])  # noqa: E731
@@ -144,8 +156,10 @@ def main():
         d = D.make("Rig Cat", "RIGCAT", creator_spk, 10**10, test=False, btc_regtest=True, pow_limit_bits=FLOOR_BITS,
                    target_spacing=2, lwma_window=15, genesis_time=int(time.time()) - 2 * DAY,
                    creator_btc_script=bspk(wb.getnewaddress("", "bech32")), _validate=False,
+                   creator_qwen_script=qspk(wq.getnewaddress("", "bech32")),
                    metadata=M.from_image(PICTURE, description="The cat that mines.\nSecond line.", x="https://x.com/rigcat"))
         d.sats_num, d.sats_shift = 1, 2
+        d.qwen_num, d.qwen_shift = 3, 3
         D.validate(d)
         d.grind_genesis()
         path = os.path.join(work, "rigcat.json")
@@ -165,8 +179,10 @@ def main():
         # ---- a second launch, mined from the start, so that two different coins exist to swap
         d2 = D.make("Moon Dog", "MOON", b"\x00\x14" + hash160(pubkey_from_priv(random_priv())), 10**10, test=False,
                     btc_regtest=True, pow_limit_bits=FLOOR_BITS, target_spacing=2, lwma_window=15,
-                    genesis_time=int(time.time()) - 2 * DAY, creator_btc_script=bspk(wb.getnewaddress("", "bech32")), _validate=False)
+                    genesis_time=int(time.time()) - 2 * DAY, creator_btc_script=bspk(wb.getnewaddress("", "bech32")), _validate=False,
+                    creator_qwen_script=qspk(wq.getnewaddress("", "bech32")))
         d2.sats_num, d2.sats_shift = 1, 2
+        d2.qwen_num, d2.qwen_shift = 3, 3
         D.validate(d2)
         d2.grind_genesis()
         path2 = os.path.join(work, "moon.json")
@@ -190,10 +206,10 @@ def main():
         maker = build_maker(os.path.join(work, "maker.json"), reg, btc.rpc)
         maker.forks.pop("MOON", None)  # the house maker trades the first coin only; MOON moves peer to peer
         site = Site(btc.rpc, reg, maker, allow_launch=True, launch_args=local, book_path=os.path.join(work, "book.json"),
-                    book_confs=2, book_lock=240, book_min_lock=20)
+                    book_confs=2, book_lock=240, book_min_lock=20, qwen=qn.rpc, base_path="/fun")
         port = free_port()
         serve(site, "127.0.0.1", port)
-        url = f"http://127.0.0.1:{port}/"
+        url = f"http://127.0.0.1:{port}/fun/"
 
         # ---- browser with a mock UniSat backed by the "user" regtest wallet
         from playwright.sync_api import sync_playwright
@@ -227,9 +243,11 @@ def main():
         check("W1 the board lists the launch", ok)
         h1 = board_of("RIGCAT")["height"]
         ok = wait(lambda: board_of("RIGCAT")["height"] > h1 and page.locator("a.card.hot").count() >= 0, 30, "board height moves")
-        check("W1 the board follows the chain", ok and "gets its own" in page.locator("h1").inner_text().lower())
+        from hashfun.web import PITCH
+        check("W1 the board follows the chain, under the pitch's heading", ok and
+              page.locator("#pitch-what").inner_text().replace("\n", " ").lower() == PITCH["what"].lower())
         ok = wait(lambda: page.evaluate(loaded, "a.card img.tile.pic"), 30, "the launch's picture on its card")
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}{board_of('RIGCAT')['image']}", timeout=30) as r:
+        with urllib.request.urlopen(url + board_of("RIGCAT")["image"], timeout=30) as r:
             served, ctype, cache = r.read(), r.headers["Content-Type"], r.headers["Cache-Control"]
         check("W1 the board shows the launch's picture: the committed bytes, typed and cacheable forever",
               ok and served == PICTURE and ctype == "image/png" and "immutable" in cache
@@ -510,8 +528,11 @@ def main():
         ok = wait(lambda: len(sent2) == n2 + 1 and sent2[-1][0] == my2_btc
                   and any(u["confirmations"] > 0 for u in get(f"/chain/btc/address/{my2_btc}")["utxos"]), 60, "the deposit confirms at the hashfun key")
         ok = ok and post(page2, "100000", "4", lambda: any(x["give_ticker"] == "BTC" for x in get("/book")["orders"]), "the bid is listed")
-        # the same sats cannot be promised twice: 150,000 at the key, 100,000 already offered
-        page2.fill("#po-give", "100000")
+        # the same sats cannot be promised twice: 100,000 of what the key holds are already offered. The
+        # key holds the deposit and whatever it has earned as a holder of RIGCAT while this ran (each
+        # block's draw may pay it), so the second bid is for everything it holds now, not for a fixed sum.
+        held = get(f"/chain/btc/address/{my2_btc}")["balance"]
+        page2.fill("#po-give", str(max(held, 100000)))
         page2.fill("#po-want", "4")
         page2.click("#po-go")
         twice = wait(lambda: page2.locator("#po-err").count() == 1 and "other open offers" in page2.locator("#po-err").inner_text(), 15, "second bid refused")
@@ -597,6 +618,107 @@ def main():
         refused = wait(lambda: "Switch UniSat" in page3.locator("#toast").inner_text(), 15, "the payment is refused")
         check("U1 no payment is requested from a wallet that moved to another chain", refused and "send" not in calls, str(calls))
         ctx3.close()
+
+        # ================================================================= R1..R4
+        print("-- R1 under --base-path /fun", flush=True)
+        import re
+        from hashfun.web import PITCH
+        root = f"http://127.0.0.1:{port}"
+
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *a_, **k_):
+                return None
+        try:
+            urllib.request.build_opener(NoRedirect).open(root + "/fun", timeout=20)
+            moved = None
+        except urllib.error.HTTPError as e:
+            moved = (e.code, e.headers.get("Location"))
+        asked = []
+        page.on("request", lambda r: asked.append(r.url))
+        page.goto(url + "#/c/RIGCAT", wait_until="domcontentloaded")
+        page.wait_for_selector("#price-qwen")
+        page.wait_for_timeout(2500)
+        api_calls = [u for u in asked if "/api/" in u]
+        check("R1 /fun redirects to /fun/ and everything the page asks for is under /fun",
+              moved == (301, "/fun/") and api_calls and all(u.startswith(root + "/fun/") for u in asked),
+              f"{moved} {[u for u in asked if not u.startswith(root + '/fun/')][:3]}")
+
+        print("-- R2 what a crawler gets", flush=True)
+
+        def html_of(path, headers=None):
+            req = urllib.request.Request(root + path, headers=headers or {})
+            try:
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    return r.status, r.read().decode()
+            except urllib.error.HTTPError as e:
+                return e.code, e.read().decode()
+
+        def tags(doc):
+            out = {m.group(1): m.group(2) for m in re.finditer(r'<meta (?:property|name)="([^"]+)" content="([^"]*)">', doc)}
+            t = re.search(r"<title>([^<]*)</title>", doc)
+            out["title"] = t.group(1) if t else None
+            return out
+        import html as H
+        st, doc = html_of("/fun/")
+        tg = tags(doc)
+        with urllib.request.urlopen(tg.get("og:image", root), timeout=30) as r:
+            share_ok = r.status == 200 and r.headers["Content-Type"] == "image/png" and r.read()[:8] == b"\x89PNG\r\n\x1a\n"
+        check("R2 the site's HTML has the pitch and its preview tags: what, oneliner, the share picture at an absolute /fun address",
+              st == 200 and H.unescape(tg["title"]) == f"hashfun: {PITCH['what']}" and H.unescape(tg["og:title"]) == PITCH["what"]
+              and H.unescape(tg["og:description"]) == PITCH["oneliner"] == H.unescape(tg["twitter:description"])
+              and tg["og:url"] == root + "/fun/" and tg["og:image"] == root + "/fun/share.png" == tg["twitter:image"]
+              and tg["twitter:card"] == "summary_large_image" and H.escape(PITCH["tagline"]) in doc and share_ok, json.dumps(tg)[:400])
+        st, doc = html_of("/fun/c/RIGCAT")
+        tg = tags(doc)
+        desc = H.unescape(tg.get("og:description", ""))
+        with urllib.request.urlopen(tg.get("og:image", root), timeout=30) as r:
+            pic_ok = r.read() == PICTURE
+        check("R2 a coin's address /fun/c/RIGCAT has its name and ticker, both price points, how far each curve is, its own picture",
+              st == 200 and H.unescape(tg["og:title"]) == "Rig Cat ($RIGCAT)" and tg["og:url"] == root + "/fun/c/RIGCAT"
+              and re.search(r"BTC curve: [0-9.,]+ sats per coin, [0-9.]+% mined\. QWEN curve: [0-9.,]+ QWEN sats per coin, [0-9.]+% mined", desc)
+              and desc.startswith("$RIGCAT is its own chain with two curves.")
+              and tg["og:image"].startswith(root + "/fun/api/coin/RIGCAT/image") and pic_ok, desc + " | " + tg.get("og:image", ""))
+        st404, doc404 = html_of("/fun/c/NOPE")
+        _, fwd = html_of("/fun/", {"Host": "example.org", "X-Forwarded-Proto": "https"})
+        check("R2 an unknown coin is a 404 with the site's tags; behind a proxy the addresses follow its host and scheme",
+              st404 == 404 and tags(doc404)["og:url"] == root + "/fun/" and tags(fwd)["og:url"] == "https://example.org/fun/"
+              and tags(fwd)["og:image"] == "https://example.org/fun/share.png", f"{st404} {tags(fwd).get('og:url')}")
+        page.goto(root + "/fun/c/RIGCAT", wait_until="domcontentloaded")
+        ok = wait(lambda: page.locator("#coin-pitch").count() == 1, 30, "the coin opened from its preview address")
+        check("R2 a person following the coin's address lands on its page, under /fun",
+              ok and page.evaluate("location.pathname + location.hash") == "/fun/#/c/RIGCAT"
+              and page.locator("#coin-pitch").inner_text() == PITCH["coin"].replace("{TICKER}", "$RIGCAT"), page.evaluate("location.href"))
+
+        print("-- R3 the board with storage blocked", flush=True)
+        ctx4 = browser.new_context(viewport={"width": 1200, "height": 900})
+        page4 = ctx4.new_page()
+        errs4 = []
+        page4.on("pageerror", lambda e: errs4.append(f"pageerror: {e}"))
+        page4.on("console", lambda m: errs4.append(f"console: {m.text}") if m.type == "error" and "Failed to load resource" not in m.text else None)
+        page4.add_init_script(BLOCKED_STORAGE)
+        page4.goto(url, wait_until="domcontentloaded")
+        ok = wait(lambda: page4.locator("#pitch[data-open='1'] #pitch-facts").count() == 1
+                  and page4.locator("a.card[href='#/c/RIGCAT']").count() >= 1, 30, "pitch and board without storage")
+        block = page4.locator("#pitch").inner_text() if ok else ""
+        page4.reload(wait_until="domcontentloaded")
+        again = wait(lambda: page4.locator("#pitch[data-open='1'] #pitch-facts").count() == 1, 30, "whole again")
+        check("R3 with storage blocked the board shows the whole pitch and the coins, again on reload, with no error",
+              ok and again and all(PITCH[k] in block for k in ("fact_chain", "fact_prices", "fact_holders", "why"))
+              and page4.locator("header .tagline").inner_text() == PITCH["tagline"] and not errs4, "; ".join(errs4)[:300])
+        ctx4.close()
+
+        print("-- R4 two curves", flush=True)
+        page.goto(url, wait_until="domcontentloaded")
+        ok = wait(lambda: page.locator("a.card[href='#/c/RIGCAT'] [data-point='qwen']").count() == 1, 30, "two price points on the card")
+        card = page.locator("a.card[href='#/c/RIGCAT']")
+        cv = get("/coin/RIGCAT")["curves"]
+        check("R4 the board's card has both price points, each in its own unit",
+              ok and card.locator("[data-point='btc']").inner_text().endswith(" sats per coin")
+              and card.locator("[data-point='qwen']").inner_text().endswith(" QWEN sats per coin")
+              and cv["btc"]["blocks"] > 0 and cv["qwen"]["blocks"] == 0, json.dumps(cv)[:300])
+        page.goto(url + "#/c/RIGCAT", wait_until="domcontentloaded")
+        ok = wait(lambda: page.locator("#price-qwen").count() == 1 and page.locator("[data-progress]").count() == 2, 30, "both curves")
+        check("R4 the coin page shows both curves: two price points and how far each is mined", ok)
         page.goto(url, wait_until="domcontentloaded")
         wait(lambda: page.locator(".feed b.l").count() >= 1, 30, "payout feed")
         shot(page, "board")
@@ -631,6 +753,8 @@ def main():
                 pass
         if btc:
             btc.stop()
+        if qn:
+            qn.stop()
         failed = [n for n, ok in RESULTS.items() if not ok]
         print(f"\nweb: {len(RESULTS) - len(failed)}/{len(RESULTS)} passed in {time.time() - t0:.0f}s"
               + (f"; failed: {failed}" if failed else ""), flush=True)

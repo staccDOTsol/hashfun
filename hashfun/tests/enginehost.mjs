@@ -35,7 +35,7 @@ async function make({ name, priv, site }) {
   const book = createBook({ api, W, cfg: () => cfg, store, unisat: () => null, now: () => clock });
   W.addr = book.addrOn('btc');
   traders[name] = { book, W, mem, api, refresh: async () => { cfg = await api('/config'); } };
-  return { pub: B.hex(W.pub), btc: book.addrOn('btc'), coins: Object.fromEntries(Object.keys(cfg.launches).map((t) => [t, book.addrOn(t)])) };
+  return { pub: B.hex(W.pub), btc: book.addrOn('btc'), qwen: cfg.qwen ? book.addrOn('qwen') : null, coins: Object.fromEntries(Object.keys(cfg.launches).map((t) => [t, book.addrOn(t)])) };
 }
 
 const ops = {

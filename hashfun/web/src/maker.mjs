@@ -15,9 +15,10 @@ import { createBook, FINAL } from './book.js';
 
 const HELP = `hashfun book: peer-to-peer offers and swaps without a browser tab
 
-  hashfun book key                         create the key (first run); show where to send coins and sats
+  hashfun book key                         create the key (first run); show where to send coins, sats and QWEN
   hashfun book balances
   hashfun book post --give CAT --get btc --give-amount 1000 --get-amount 50000 [--hours 24]
+  hashfun book post --give btc --get qwen --give-amount 250000 --get-amount 0.5      (any pair of chains)
   hashfun book offers | cancel ID | swaps
   hashfun book take ID [--pay AMOUNT]      take someone's offer, paying from the key
   hashfun book run                         keep offers live: answer takes, lock, claim, refund
@@ -25,8 +26,12 @@ const HELP = `hashfun book: peer-to-peer offers and swaps without a browser tab
   --site URL             the hashfun site (default http://127.0.0.1:8080, or $HASHFUN_SITE)
   --dir DIR              where the key and swap records live (default ~/.hashfun/book, or $HASHFUN_BOOK_DIR)
   --btc-payout ADDRESS   send the sats you earn there instead of keeping them at the key
+  --qwen-payout ADDRESS  the same for QWEN, on Qwencoin
 
-Amounts: sats for Bitcoin, whole coins (decimals allowed) for launch coins.
+Chains: btc (Bitcoin), qwen (Qwencoin, when the site follows it) and every launch by its ticker.
+Amounts: sats for Bitcoin, whole coins (decimals allowed) for QWEN and for launch coins.
+The key's address on Bitcoin and on Qwencoin is the same string (Qwencoin kept Bitcoin's address
+form): what is sent to it on one chain is at the key on that chain, not on the other.
 The key file is encrypted with a password ($HASHFUN_BOOK_PASSWORD, or asked for); --no-encrypt on
 first use stores it in the clear. Everything the key holds is in play: fund it with what you mean
 to trade. An offer is listed only while "run" is running, and "run" finishes or refunds its swaps.
@@ -159,13 +164,13 @@ const engine = (what) => {
   process.on('exit', () => { try { if (fs.readFileSync(lock, 'utf8').startsWith(`${process.pid} `)) fs.rmSync(lock, { force: true }); } catch (e) { /* already gone */ } });
 };
 
-const W = { key: null, pub: null, addr: null };
+const W = { key: null, pub: null, addr: null, qwenAddr: null };
 let cfg = null;
-const names = () => ['btc', ...Object.keys(cfg.launches)];
-const norm = (x) => (String(x || '').toLowerCase() === 'btc' ? 'btc' : String(x || '').toUpperCase());
+const names = () => ['btc', ...(cfg.qwen ? ['qwen'] : []), ...Object.keys(cfg.launches)];
+const norm = (x) => (['btc', 'qwen'].includes(String(x || '').toLowerCase()) ? String(x).toLowerCase() : String(x || '').toUpperCase());
 const chain = (x, what) => { const n = norm(x); if (!names().includes(n)) die(`${what}: ${x || '(missing)'} is not on this site (${names().join(', ')})`); return n; };
 const toUnits = (n, x) => { const v = Number(x); if (!(v > 0)) die(`amount ${x}: a positive number`); return Math.round(n === 'btc' ? v : v * COIN); };
-const show = (n, v) => (n === 'btc' ? `${v} sats` : `${v / COIN} $${n}`);
+const show = (n, v) => (n === 'btc' ? `${v} sats` : n === 'qwen' ? `${v / COIN} QWEN` : `${v / COIN} $${n}`);
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
 const told = {};
 const book = createBook({ api, W, cfg: () => cfg, store, unisat: () => null, onChange: (r) => {
@@ -180,12 +185,19 @@ const describe = (o) => `${o.id}  give ${show(book.nameOf(o.give), o.remaining)}
   cfg = await api('/config');
   W.addr = opts['btc-payout'] || book.addrOn('btc');
   try { B.addressToScript(W.addr, cfg.btc); } catch (e) { die(`--btc-payout ${W.addr}: not an address on this site's Bitcoin network`); }
+  if (opts['qwen-payout']) {
+    if (!cfg.qwen) die('--qwen-payout: this site has no Qwencoin node');
+    try { B.addressToScript(opts['qwen-payout'], cfg.qwen); } catch (e) { die(`--qwen-payout ${opts['qwen-payout']}: not an address on this site's Qwencoin network`); }
+    W.qwenAddr = opts['qwen-payout'];
+  }
 
   if (cmd === 'key') {
-    console.log(JSON.stringify({ pubkey: B.hex(W.pub), site, send_sats_to: book.addrOn('btc'), send_coins_to: Object.fromEntries(Object.keys(cfg.launches).map((t) => [t, book.addrOn(t)])) }, null, 2));
+    console.log(JSON.stringify({ pubkey: B.hex(W.pub), site, send_sats_to: book.addrOn('btc'),
+      ...(cfg.qwen ? { send_qwen_to: book.addrOn('qwen'), note: 'send_sats_to is this key on Bitcoin and send_qwen_to the same key on Qwencoin. The two are one string when both networks use the same address form: what you send on one chain is at the key on that chain, not on the other.' } : {}),
+      send_coins_to: Object.fromEntries(Object.keys(cfg.launches).map((t) => [t, book.addrOn(t)])) }, null, 2));
   } else if (cmd === 'balances') {
     const out = {};
-    for (const n of names()) out[n === 'btc' ? 'sats' : n] = n === 'btc' ? await book.balance(n) : (await book.balance(n)) / COIN;
+    for (const n of names()) out[n === 'btc' ? 'sats' : n === 'qwen' ? 'QWEN' : n] = n === 'btc' ? await book.balance(n) : (await book.balance(n)) / COIN;
     console.log(JSON.stringify(out, null, 2));
   } else if (cmd === 'post') {
     const give = chain(opts.give, '--give'), get = chain(opts.get, '--get');

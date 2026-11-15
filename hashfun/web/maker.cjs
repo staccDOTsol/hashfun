@@ -1207,7 +1207,7 @@ var addressToScript = (addr, net) => {
   throw new Error("address is for another network");
 };
 var ser = (tx, withWitness) => {
-  const ins = tx.vin.map((i) => cat(rev(unhex(i.txid)), u32(i.vout), varbytes(new Uint8Array(0)), u32(i.sequence)));
+  const ins = tx.vin.map((i) => cat(rev(unhex(i.txid)), u32(i.vout), varbytes(i.scriptSig || new Uint8Array(0)), u32(i.sequence)));
   const outs = tx.vout.map((o) => cat(u64(o.value), varbytes(o.script)));
   const wit = withWitness && tx.vin.some((i) => i.witness && i.witness.length);
   return cat(
@@ -1370,21 +1370,28 @@ function createBook(env) {
   };
   const pubHex = () => hex(W3.pub);
   const sign3 = (text) => signText(W3.key, text);
-  const nameOf = (id) => id === cfg2().btc_id ? "btc" : Object.keys(cfg2().launches).find((t) => cfg2().launches[t].id === id);
-  const idOf = (name) => name === "btc" ? cfg2().btc_id : cfg2().launches[name].id;
-  const label = (name) => name === "btc" ? "sats" : "$" + name;
+  const outside = (name) => name === "btc" || name === "qwen";
+  const nameOf = (id) => id === cfg2().btc_id ? "btc" : cfg2().qwen_id && id === cfg2().qwen_id ? "qwen" : Object.keys(cfg2().launches).find((t) => cfg2().launches[t].id === id);
+  const idOf = (name) => name === "btc" ? cfg2().btc_id : name === "qwen" ? cfg2().qwen_id : (cfg2().launches[name] || {}).id;
+  const label = (name) => name === "btc" ? "sats" : name === "qwen" ? "QWEN" : "$" + name;
   const myScript = () => p2wpkh(W3.pub);
-  const addrOn = (name) => segwitEncode(name === "btc" ? cfg2().btc.hrp : cfg2().launches[name].hrp, 0, hash160(W3.pub));
-  const destOn = (name) => name === "btc" ? addressToScript(W3.addr, cfg2().btc) : myScript();
-  const spacing = (name) => name === "btc" ? 600 : cfg2().launches[name].target_spacing || 60;
-  const confsFor = (name) => name === "btc" ? 1 : cfg2().book.confs;
+  const netOf = (name) => {
+    const n = outside(name) ? cfg2()[name] : cfg2().launches[name];
+    if (!n) throw new Error(name === "qwen" ? "this site has no Qwencoin node" : `this site does not follow ${name}`);
+    return n;
+  };
+  const addrOn = (name) => segwitEncode(netOf(name).hrp, 0, hash160(W3.pub));
+  const destOn = (name) => name === "btc" ? addressToScript(W3.addr, cfg2().btc) : name === "qwen" && W3.qwenAddr ? addressToScript(W3.qwenAddr, cfg2().qwen) : myScript();
+  const spacing = (name) => outside(name) ? 600 : cfg2().launches[name].target_spacing || 60;
+  const confsFor = (name) => name === "btc" ? 1 : name === "qwen" ? 6 : cfg2().book.confs;
   const margin = (name, lock) => Math.min(Math.max(600, 6 * spacing(name)), Math.floor(lock / 4));
-  let btcCache = null;
+  const scanned = {};
   const utxos = async (name) => {
     let list;
-    if (name === "btc") {
-      if (!btcCache || ms() - btcCache.t > (cfg2().btc.chain === "main" ? 12e4 : 3e3)) btcCache = { t: ms(), list: (await api2(`/chain/btc/address/${addrOn("btc")}`)).utxos.filter((u) => u.confirmations > 0) };
-      list = btcCache.list;
+    if (outside(name)) {
+      const keep = netOf(name).chain !== "main" ? 3e3 : name === "btc" ? 12e4 : 15e3;
+      if (!scanned[name] || ms() - scanned[name].t > keep) scanned[name] = { t: ms(), list: (await api2(`/chain/${name}/address/${addrOn(name)}`)).utxos.filter((u) => u.confirmations > 0) };
+      list = scanned[name].list;
     } else list = (await api2(`/coin/${name}/address/${addrOn(name)}`)).utxos.filter((u) => u.spendable);
     const spent = load("hf_spent");
     return list.filter((u) => !spent[`${name}:${u.txid}:${u.vout}`]);
@@ -1437,13 +1444,14 @@ function createBook(env) {
     });
   };
   async function post({ give, get, give_amount, get_amount, min_get, ttl }) {
+    if (!idOf(give) || !idOf(get)) throw new Error([give, get].includes("qwen") && !cfg2().qwen_id ? "this site has no Qwencoin node" : "this site does not follow one of those chains");
     if (!(give_amount >= MIN_OUTPUT) || !(get_amount >= MIN_OUTPUT)) throw new Error("too small: both sides need at least " + MIN_OUTPUT + " base units");
     const needLock = 12 * spacing(give) + 6 * spacing(get);
     if (cfg2().btc.chain !== "regtest" && cfg2().book.lock < needLock) throw new Error(`this site's swap lock (${cfg2().book.lock} s) is too short for this pair: it needs ${needLock} s`);
     const promised = (await mine().catch(() => [])).filter((x) => x.give === idOf(give)).reduce((a, x) => a + x.remaining, 0);
     let have = await balance(give);
-    if (have < give_amount + promised && give === "btc") {
-      btcCache = null;
+    if (have < give_amount + promised && outside(give)) {
+      delete scanned[give];
       have = await balance(give);
     }
     if (have < give_amount + promised) throw new Error(`your hashfun key holds ${have} in spendable ${label(give)}: less than this offer${promised ? " plus your other open offers" : ""}`);
@@ -1614,7 +1622,7 @@ function createBook(env) {
         rec.state = "locking";
         put(rec);
         markSpent(tx.spends);
-        if (name === "btc") btcCache = null;
+        if (outside(name)) delete scanned[name];
       }
     }
     if (rec.my.hex) await broadcast(name, rec.my.hex, rec.my);
@@ -1837,15 +1845,16 @@ function createBook(env) {
     else hold();
   }
   const pending = () => Object.values(recs()).some((r) => r.taker && ["locking", "locked"].includes(r.state));
-  return { pending, post, cancel, mine, take: takeGuarded, tick, start, recs, balance, nameOf, idOf, addrOn, confsFor, list: (q = "") => api2("/book" + q).then((r) => r.orders) };
+  return { pending, post, cancel, mine, take: takeGuarded, tick, start, recs, balance, nameOf, idOf, addrOn, confsFor, label, outside, list: (q = "") => api2("/book" + q).then((r) => r.orders) };
 }
 
 // src/maker.mjs
 var HELP = `hashfun book: peer-to-peer offers and swaps without a browser tab
 
-  hashfun book key                         create the key (first run); show where to send coins and sats
+  hashfun book key                         create the key (first run); show where to send coins, sats and QWEN
   hashfun book balances
   hashfun book post --give CAT --get btc --give-amount 1000 --get-amount 50000 [--hours 24]
+  hashfun book post --give btc --get qwen --give-amount 250000 --get-amount 0.5      (any pair of chains)
   hashfun book offers | cancel ID | swaps
   hashfun book take ID [--pay AMOUNT]      take someone's offer, paying from the key
   hashfun book run                         keep offers live: answer takes, lock, claim, refund
@@ -1853,8 +1862,12 @@ var HELP = `hashfun book: peer-to-peer offers and swaps without a browser tab
   --site URL             the hashfun site (default http://127.0.0.1:8080, or $HASHFUN_SITE)
   --dir DIR              where the key and swap records live (default ~/.hashfun/book, or $HASHFUN_BOOK_DIR)
   --btc-payout ADDRESS   send the sats you earn there instead of keeping them at the key
+  --qwen-payout ADDRESS  the same for QWEN, on Qwencoin
 
-Amounts: sats for Bitcoin, whole coins (decimals allowed) for launch coins.
+Chains: btc (Bitcoin), qwen (Qwencoin, when the site follows it) and every launch by its ticker.
+Amounts: sats for Bitcoin, whole coins (decimals allowed) for QWEN and for launch coins.
+The key's address on Bitcoin and on Qwencoin is the same string (Qwencoin kept Bitcoin's address
+form): what is sent to it on one chain is at the key on that chain, not on the other.
 The key file is encrypted with a password ($HASHFUN_BOOK_PASSWORD, or asked for); --no-encrypt on
 first use stores it in the clear. Everything the key holds is in play: fund it with what you mean
 to trade. An offer is listed only while "run" is running, and "run" finishes or refunds its swaps.
@@ -2042,10 +2055,10 @@ var engine = (what) => {
     }
   });
 };
-var W2 = { key: null, pub: null, addr: null };
+var W2 = { key: null, pub: null, addr: null, qwenAddr: null };
 var cfg = null;
-var names = () => ["btc", ...Object.keys(cfg.launches)];
-var norm = (x) => String(x || "").toLowerCase() === "btc" ? "btc" : String(x || "").toUpperCase();
+var names = () => ["btc", ...cfg.qwen ? ["qwen"] : [], ...Object.keys(cfg.launches)];
+var norm = (x) => ["btc", "qwen"].includes(String(x || "").toLowerCase()) ? String(x).toLowerCase() : String(x || "").toUpperCase();
 var chain = (x, what) => {
   const n = norm(x);
   if (!names().includes(n)) die(`${what}: ${x || "(missing)"} is not on this site (${names().join(", ")})`);
@@ -2056,7 +2069,7 @@ var toUnits = (n, x) => {
   if (!(v > 0)) die(`amount ${x}: a positive number`);
   return Math.round(n === "btc" ? v : v * COIN);
 };
-var show = (n, v) => n === "btc" ? `${v} sats` : `${v / COIN} $${n}`;
+var show = (n, v) => n === "btc" ? `${v} sats` : n === "qwen" ? `${v / COIN} QWEN` : `${v / COIN} $${n}`;
 var log = (...a) => console.log((/* @__PURE__ */ new Date()).toISOString().slice(11, 19), ...a);
 var told = {};
 var book = createBook({ api, W: W2, cfg: () => cfg, store, unisat: () => null, onChange: (r) => {
@@ -2077,11 +2090,26 @@ var describe = (o) => `${o.id}  give ${show(book.nameOf(o.give), o.remaining)} f
   } catch (e) {
     die(`--btc-payout ${W2.addr}: not an address on this site's Bitcoin network`);
   }
+  if (opts["qwen-payout"]) {
+    if (!cfg.qwen) die("--qwen-payout: this site has no Qwencoin node");
+    try {
+      addressToScript(opts["qwen-payout"], cfg.qwen);
+    } catch (e) {
+      die(`--qwen-payout ${opts["qwen-payout"]}: not an address on this site's Qwencoin network`);
+    }
+    W2.qwenAddr = opts["qwen-payout"];
+  }
   if (cmd === "key") {
-    console.log(JSON.stringify({ pubkey: hex(W2.pub), site, send_sats_to: book.addrOn("btc"), send_coins_to: Object.fromEntries(Object.keys(cfg.launches).map((t) => [t, book.addrOn(t)])) }, null, 2));
+    console.log(JSON.stringify({
+      pubkey: hex(W2.pub),
+      site,
+      send_sats_to: book.addrOn("btc"),
+      ...cfg.qwen ? { send_qwen_to: book.addrOn("qwen"), note: "send_sats_to is this key on Bitcoin and send_qwen_to the same key on Qwencoin. The two are one string when both networks use the same address form: what you send on one chain is at the key on that chain, not on the other." } : {},
+      send_coins_to: Object.fromEntries(Object.keys(cfg.launches).map((t) => [t, book.addrOn(t)]))
+    }, null, 2));
   } else if (cmd === "balances") {
     const out = {};
-    for (const n of names()) out[n === "btc" ? "sats" : n] = n === "btc" ? await book.balance(n) : await book.balance(n) / COIN;
+    for (const n of names()) out[n === "btc" ? "sats" : n === "qwen" ? "QWEN" : n] = n === "btc" ? await book.balance(n) : await book.balance(n) / COIN;
     console.log(JSON.stringify(out, null, 2));
   } else if (cmd === "post") {
     const give = chain(opts.give, "--give"), get = chain(opts.get, "--get");

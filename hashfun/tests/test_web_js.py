@@ -235,6 +235,143 @@ class WebJsTest(unittest.TestCase):
                          "give": K.give_for(o, t["get_amount"])})
         self.assertEqual(run_js(cases), want)
 
+    # ---------------------------------------------------------------- Qwencoin in the page
+    def test_engine_names_three_kinds_of_chain(self):
+        """Bitcoin, Qwencoin and the launches, as the swap engine names them: in the API, in what it
+        signs, and as addresses. A key has one address string on Bitcoin and on Qwencoin."""
+        priv = self.priv()
+        cat = {"id": "ab" * 32, "hrp": "cat", "target_spacing": 5}
+        cfg = {"btc_id": "btc:main", "qwen_id": "qwen:main", "btc": {"chain": "main", "hrp": "bc"}, "qwen": {"chain": "main", "hrp": "bc"},
+               "launches": {"CAT": cat}, "book": {"confs": 6, "lock": 14400}}
+        key = hash160(pubkey_from_priv(priv))
+        both, only_btc = run_js([{"op": "engine", "priv": f"{priv:064x}", "cfg": c, "names": ["btc", "qwen", "CAT"]}
+                                 for c in (cfg, {**cfg, "qwen": None, "qwen_id": None})])
+        self.assertEqual(both["btc"], {"id": "btc:main", "back": "btc", "addr": segwit_encode("bc", 0, key), "confs": 1, "label": "sats", "outside": True})
+        self.assertEqual(both["qwen"], {"id": "qwen:main", "back": "qwen", "addr": segwit_encode("bc", 0, key), "confs": 6, "label": "QWEN", "outside": True})
+        self.assertEqual(both["CAT"], {"id": "ab" * 32, "back": "CAT", "addr": segwit_encode("cat", 0, key), "confs": 6, "label": "$CAT", "outside": False})
+        self.assertEqual(both["btc"]["addr"], both["qwen"]["addr"])   # which is why the chain is named beside every address
+        self.assertEqual((only_btc["qwen"]["id"], only_btc["qwen"]["addr"]), (None, "error: this site has no Qwencoin node"))
+        self.assertEqual(only_btc["btc"], both["btc"])
+
+    @staticmethod
+    def _kv(type_: int, value: bytes, keydata: bytes = b"") -> bytes:
+        from hashfun.ser import varint
+        return varint(1 + len(keydata)) + bytes([type_]) + keydata + varint(len(value)) + value
+
+    def test_psbt_request_is_bip174(self):
+        """What the page hands a wallet to sign (QWEN at the wallet's own address): the unsigned
+        transaction and, per input, the output it spends, plus what each address kind needs."""
+        from hashfun.ser import varint
+        pub = pubkey_from_priv(self.priv())
+        dest = p2wpkh_script(pubkey_from_priv(self.priv()))
+        scripts = {"p2wpkh": p2wpkh_script(pub), "p2sh": b"\xa9\x14" + hash160(p2wpkh_script(pub)) + b"\x87", "p2tr": b"\x51\x20" + self.rb(32)}
+        cases, want = [], []
+        for kind, script in scripts.items():
+            ins = [{"txid": self.rb(32).hex(), "vout": self.rng.randint(0, 5), "value": self.rng.randint(10_000, 10**9)} for _ in range(self.rng.randint(1, 4))]
+            outs = [{"value": sum(i["value"] for i in ins) - 500, "script": dest.hex()}]
+            tx = Tx(version=2, vin=[TxIn(bytes.fromhex(i["txid"])[::-1], i["vout"], b"", 0xfffffffd) for i in ins],
+                    vout=[TxOut(o["value"], bytes.fromhex(o["script"])) for o in outs])
+            extra = {"p2wpkh": b"", "p2sh": self._kv(4, p2wpkh_script(pub)), "p2tr": self._kv(0x17, pub[1:])}[kind]
+            utxo = lambda i: i["value"].to_bytes(8, "little") + varint(len(script)) + script  # noqa: E731
+            psbt = b"psbt\xff" + self._kv(0, tx.serialize(witness=False)) + b"\x00" + \
+                b"".join(self._kv(1, utxo(i)) + extra + b"\x00" for i in ins) + b"\x00" * len(outs)
+            cases.append({"op": "psbt", "inputs": ins, "script": script.hex(), "outputs": outs, "pub": pub.hex()})
+            want.append({"psbt": psbt.hex(), "kind": kind})
+        self.assertEqual(run_js(cases), want)
+        legacy = b"\x76\xa9\x14" + self.rb(20) + b"\x88\xac"
+        other = b"\xa9\x14" + self.rb(20) + b"\x87"   # a script hash that is not this key's wrapped segwit
+        bad = run_js([{"op": "psbt", "inputs": [{"txid": "00" * 32, "vout": 0, "value": 9000}], "script": x.hex(),
+                       "outputs": [{"value": 8000, "script": dest.hex()}], "pub": pub.hex()} for x in (legacy, other)])
+        self.assertIn("legacy", bad[0]["error"])
+        self.assertIn("not a wrapped segwit address", bad[1]["error"])
+
+    def test_psbt_answer_is_read_back_and_checked(self):
+        """What comes back from the wallet: finalized (as wallets return it), or a bare signature.
+        The page broadcasts only a transaction that spends and pays exactly what it asked for."""
+        from hashfun.ser import varint
+        priv = self.priv()
+        pub = pubkey_from_priv(priv)
+        script, dest = p2wpkh_script(pub), p2wpkh_script(pubkey_from_priv(self.priv()))
+        ins = [{"txid": self.rb(32).hex(), "vout": 1, "value": 70_000}, {"txid": self.rb(32).hex(), "vout": 0, "value": 30_000}]
+        outs = [{"value": 99_000, "script": dest.hex()}]
+        tx = Tx(version=2, vin=[TxIn(bytes.fromhex(i["txid"])[::-1], i["vout"], b"", 0xfffffffd) for i in ins],
+                vout=[TxOut(99_000, dest)])
+        sigs = []
+        for n, i in enumerate(ins):
+            r, s_ = ecdsa_sign(priv, bip143_sighash(tx, n, p2wpkh_script_code(pub), i["value"]))
+            sigs.append(der_sig(r, s_) + b"\x01")
+        head = b"psbt\xff" + self._kv(0, tx.serialize(witness=False)) + b"\x00"
+        utxo = lambda i: self._kv(1, i["value"].to_bytes(8, "little") + varint(len(script)) + script)  # noqa: E731
+        wit = lambda sig: b"\x02" + varint(len(sig)) + sig + varint(len(pub)) + pub  # noqa: E731
+        final = head + b"".join(utxo(i) + self._kv(8, wit(s_)) + b"\x00" for i, s_ in zip(ins, sigs)) + b"\x00"
+        partial = head + b"".join(utxo(i) + self._kv(2, s_, pub) + b"\x00" for i, s_ in zip(ins, sigs)) + b"\x00"
+        signed = Tx(version=2, vin=[TxIn(bytes.fromhex(i["txid"])[::-1], i["vout"], b"", 0xfffffffd, [s_, pub]) for i, s_ in zip(ins, sigs)],
+                    vout=[TxOut(99_000, dest)])
+        want = {"hex": signed.serialize().hex(), "txid": signed.txid_hex(), "same": True}
+        wrapped = b"\x16" + p2wpkh_script(pub)   # a wrapped-segwit input also has a scriptSig: the push of its redeem script
+        nested = head + b"".join(utxo(i) + self._kv(7, wrapped) + self._kv(8, wit(s_)) + b"\x00" for i, s_ in zip(ins, sigs)) + b"\x00"
+        nested_tx = Tx(version=2, vin=[TxIn(bytes.fromhex(i["txid"])[::-1], i["vout"], wrapped, 0xfffffffd, [s_, pub]) for i, s_ in zip(ins, sigs)],
+                       vout=[TxOut(99_000, dest)])
+        unsigned = head + b"".join(utxo(i) + b"\x00" for i in ins) + b"\x00"
+        elsewhere = [{"value": 99_000, "script": p2wpkh_script(pubkey_from_priv(self.priv())).hex()}]
+        got = run_js([{"op": "unpsbt", "psbt": final.hex(), "inputs": ins, "outputs": outs},
+                      {"op": "unpsbt", "psbt": partial.hex(), "inputs": ins, "outputs": outs},
+                      {"op": "unpsbt", "psbt": nested.hex(), "inputs": ins, "outputs": outs},
+                      {"op": "unpsbt", "psbt": final.hex(), "inputs": ins, "outputs": elsewhere},        # pays somebody else
+                      {"op": "unpsbt", "psbt": final.hex(), "inputs": ins[::-1], "outputs": outs},       # spends something else
+                      {"op": "unpsbt", "psbt": final.hex(), "inputs": ins, "outputs": [{"value": 98_000, "script": dest.hex()}]},
+                      {"op": "unpsbt", "psbt": unsigned.hex(), "inputs": ins, "outputs": outs},
+                      {"op": "unpsbt", "psbt": "00" * 40, "inputs": ins, "outputs": outs}])
+        self.assertEqual(got[0], want)
+        self.assertEqual(got[1], want)
+        self.assertEqual(got[2], {"hex": nested_tx.serialize().hex(), "txid": nested_tx.txid_hex(), "same": True})
+        self.assertEqual([g.get("same") for g in got[3:6]], [False, False, False])
+        self.assertEqual([g.get("error") for g in got[6:]], ["the wallet did not return a signed transaction"] * 2)
+
+    # ---------------------------------------------------------------- the pitch
+    def test_the_pitch_is_said_in_the_source_s_words(self):
+        """contrib/hashfun/PITCH.md is the one source. The page is built with static/pitch.json,
+        which must be that table word for word; the page takes each place's text from it; and the
+        built page carries the words (a bundle that lost them would say nothing to anyone)."""
+        import re
+        root = os.path.dirname(os.path.dirname(WEB))
+        with open(os.path.join(root, "contrib", "hashfun", "PITCH.md"), encoding="utf-8") as f:
+            table = dict(re.findall(r"^\| `(\w+)` \| (.+?) \|$", f.read(), re.M))
+        with open(os.path.join(WEB, "static", "pitch.json"), encoding="utf-8") as f:
+            words = json.load(f)
+        self.assertEqual(words, table)
+        self.assertEqual(sorted(words), sorted(["tagline", "what", "oneliner", "fact_chain", "fact_prices", "fact_holders", "why",
+                                                "pockets", "coin", "mine", "launch", "honest"]))
+        with open(os.path.join(WEB, "src", "app.js"), encoding="utf-8") as f:
+            src = f.read()
+        for place, uses in {"the board's block": ["PITCH.what", "'fact_chain'", "'fact_prices'", "'fact_holders'", "PITCH.why", "PITCH.pockets",
+                                                    "PITCH.tagline", "id: 'way-mine'", "id: 'way-make'"],
+                            "a coin's page": ["PITCH.coin"], "the mine panel": ["PITCH.mine"],
+                            "the launch form": ["PITCH.launch", "PITCH.honest"]}.items():
+            for u in uses:
+                self.assertIn(u, src, f"{place}: {u}")
+        with open(os.path.join(WEB, "static", "app.js"), encoding="utf-8") as f:
+            bundle = f.read()
+        for k, text in words.items():
+            if k == "oneliner":   # said by the server, in the link-preview tags
+                continue
+            for piece in re.split(r"\{\w+\}", text):
+                self.assertIn(json.dumps(piece, ensure_ascii=False)[1:-1], bundle, k)
+        with open(os.path.join(WEB, "static", "index.html"), encoding="utf-8") as f:
+            page = f.read()
+        self.assertIn('<span class="m tagline">{{tagline}}</span>', page)   # beside the name, on every page; web.py fills it in
+        self.assertIn("<title>{{title}}</title>", page)
+        self.assertIn("{{tags}}", page)
+
+    def test_nothing_the_site_says_has_an_em_dash(self):
+        root = os.path.dirname(WEB)
+        files = [os.path.join(WEB, "src", n) for n in ("app.js", "book.js", "btc.js", "maker.mjs", "share.html", "share.py")] + \
+            [os.path.join(WEB, "static", n) for n in ("index.html", "style.css", "pitch.json", "app.js")] + \
+            [os.path.join(WEB, "maker.cjs"), os.path.join(root, "web.py"), os.path.join(root, "book.py")]
+        for path in files:
+            with open(path, encoding="utf-8") as f:
+                self.assertNotIn("—", f.read(), path)
+
 
 if __name__ == "__main__":
     unittest.main()

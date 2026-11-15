@@ -1,5 +1,6 @@
 """hashfun book: a peer-to-peer order book for atomic swaps between any two chains a site follows
-(Bitcoin and every launch; they all run the same script engine, so one HTLC works on all of them).
+(Bitcoin, Qwencoin and every launch; they all run the same script engine, so one HTLC works on all
+of them, and a coin, sats and QWEN swap for each other in any pair).
 
 The server side is a bulletin board and a mailbox, nothing more. Orders, takes and every later
 message are signed by the page keys of the two traders; the swap contracts are built, checked
@@ -32,8 +33,10 @@ agree on it without a serializer:
 
 one field per line; the signature is ECDSA (r || s, 64 bytes hex) over SHA256d of the text, by
 the maker's or taker's key. Ids are the first 16 bytes of that hash. Chains are named "btc:<net>"
-(btc:main, btc:regtest, ...) or by launch id, so an order cannot be replayed on another network
-or against a different coin with the same ticker."""
+(btc:main, btc:regtest, ...), "qwen:<net>" or by launch id, so an order cannot be replayed on
+another network, on the other outside chain (a Qwencoin address is the same string as the Bitcoin
+address of the same key, so only the name tells them apart) or against a different coin with the
+same ticker."""
 import json
 import os
 import re
@@ -134,8 +137,8 @@ def give_for(o: dict, get_amount: int) -> int:
 class Book:
     """chains(): {chain id: display ticker} of the chains this site follows.
     backing(chain id, maker pub hex): spendable balance of the maker's key on that chain, or None
-    while the site does not know yet (sats on Bitcoin take a UTXO-set scan, which the site runs in
-    the background: an offer waits, unlisted, until its backing has been seen)."""
+    while the site does not know yet (sats on Bitcoin and QWEN on Qwencoin take a UTXO-set scan,
+    which the site runs in the background: an offer waits, unlisted, until its backing has been seen)."""
 
     def __init__(self, chains: Callable[[], Dict[str, str]], backing: Callable[[str, str], Optional[int]],
                  path: Optional[str] = None, now: Callable[[], float] = time.time, min_lock: int = 600):

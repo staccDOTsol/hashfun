@@ -3,14 +3,15 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>hashfun</title>
+<title>{{title}}</title>
+{{tags}}
 <link rel="icon" href="data:,">
-<link rel="stylesheet" href="/style.css">
+<link rel="stylesheet" href="style.css">
 </head>
 <body>
 <header class="top">
   <div class="wrap bar">
-    <a class="logo" href="#/"><span class="d mark" aria-hidden="true">#</span><span class="d">hashfun</span></a>
+    <div class="brand"><a class="logo" href="#/"><span class="d mark" aria-hidden="true">#</span><span class="d">hashfun</span></a><span class="m tagline">{{tagline}}</span></div>
     <nav aria-label="Main">
       <a href="#/" data-nav="board">Board</a>
       <a href="#/swap" data-nav="swap">Swap</a>
@@ -24,6 +25,6 @@
 <div id="modal" hidden></div>
 <div id="toast" role="status" aria-live="polite"></div>
 <footer class="foot"><div class="wrap">Every launch is a public chain. Run a node and check everything yourself. <span class="m">npm i -g hashfun</span></div></footer>
-<script src="/app.js"></script>
+<script src="app.js"></script>
 </body>
 </html>

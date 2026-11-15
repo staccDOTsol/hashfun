@@ -35,6 +35,14 @@ process.stdin.on('end', () => {
       if (c.op === 'meta') return { hash: B.hex(B.metaHash({ ...c.meta, image: B.unhex(c.meta.image) })), type: B.imageType(B.unhex(c.meta.image)), b64: B.b64(B.unhex(c.meta.image)) };
       if (c.op === 'sign') { const sig = B.signText(B.unhex(c.priv), c.text); return { sig, ok: B.verifyText(B.hex(B.pubkey(B.unhex(c.priv))), c.text, sig) }; }
       if (c.op === 'verify') return { ok: B.verifyText(c.pub, c.text, c.sig) };
+      if (c.op === 'psbt') return { psbt: B.psbtHex(c.inputs, B.unhex(c.script), c.outputs.map((o) => ({ value: o.value, script: B.unhex(o.script) })), c.pub ? B.unhex(c.pub) : null), kind: B.scriptKind(B.unhex(c.script)) };
+      if (c.op === 'unpsbt') { const r = B.txFromPsbt(c.psbt); return { hex: r.hex, txid: r.txid, same: B.sameSpend(r.tx, c.inputs, c.outputs.map((o) => ({ value: o.value, script: B.unhex(o.script) }))) }; }
+      if (c.op === 'engine') {
+        const W = { key: B.unhex(c.priv), pub: B.pubkey(B.unhex(c.priv)), addr: null, qwenAddr: c.qwenAddr || null };
+        const book = K.createBook({ api: async () => ({}), W, cfg: () => c.cfg, store: { getItem: () => null, setItem: () => {} }, unisat: () => null });
+        const safe = (f) => { try { return f(); } catch (e) { return 'error: ' + e.message; } };
+        return Object.fromEntries(c.names.map((n) => [n, { id: safe(() => book.idOf(n) || null), back: safe(() => (book.idOf(n) ? book.nameOf(book.idOf(n)) : null)), addr: safe(() => book.addrOn(n)), confs: safe(() => book.confsFor(n)), label: book.label(n), outside: book.outside(n) }]));
+      }
       if (c.op === 'book') return { order: K.orderText(c.order), take: K.takeText(c.take), note: K.noteText(c.fill, c.kind, c.body), alive: K.aliveText(c.maker, c.ts), cancel: K.cancelText(c.order_id), id: K.textId(K.orderText(c.order)), give: K.giveFor(c.order, c.take.get_amount) };
       return { error: 'unknown op' };
     } catch (e) {

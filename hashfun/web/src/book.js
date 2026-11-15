@@ -1,5 +1,5 @@
-// hashfun book: peer-to-peer atomic swaps between any two chains the site follows (Bitcoin and
-// every launch). This file is a trader's whole stack: it signs orders, answers takes, builds,
+// hashfun book: peer-to-peer atomic swaps between any two chains the site follows (Bitcoin,
+// Qwencoin and every launch). This file is a trader's whole stack: it signs orders, answers takes, builds,
 // checks and funds the swap contracts, and claims or refunds them. The server relays signed
 // messages and reads chains (hashfun/book.py); it never sees a key and never holds a coin.
 //
@@ -35,8 +35,10 @@ const CLAIM_VB = 180, REFUND_VB = 170;
 const MIN_OUTPUT = 2000; // a lock smaller than this is not worth its own claim fee
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// env: { api(path, body), W: { key, pub, addr }, cfg(): site config, store: localStorage-like,
+// env: { api(path, body), W: { key, pub, addr, qwenAddr? }, cfg(): site config, store: localStorage-like,
 //        unisat(): the wallet or null, onChange(rec), now(): milliseconds (optional) }
+// W.addr: where sats this key earns are sent on Bitcoin. W.qwenAddr: the same for QWEN on Qwencoin
+// (optional; without it QWEN stays at the key itself, which is the only signer the page has there).
 // The same engine runs in the page (app.js) and headless under node (maker.mjs).
 export function createBook(env) {
   const { api, W, cfg } = env;
@@ -53,27 +55,37 @@ export function createBook(env) {
   const pubHex = () => B.hex(W.pub);
   const sign = (text) => B.signText(W.key, text);
 
-  // The API speaks "btc" and tickers; signed orders name chains by id (btc:<net> or the launch id).
-  const nameOf = (id) => (id === cfg().btc_id ? 'btc' : Object.keys(cfg().launches).find((t) => cfg().launches[t].id === id));
-  const idOf = (name) => (name === 'btc' ? cfg().btc_id : cfg().launches[name].id);
-  const label = (name) => (name === 'btc' ? 'sats' : '$' + name);
+  // The API speaks "btc", "qwen" and tickers; signed orders name chains by id (btc:<net>,
+  // qwen:<net> or the launch id). Bitcoin and Qwencoin are the outside chains: not launches of
+  // this site, ten-minute blocks, and a key's balance there comes from a scan of the site's node.
+  // A key's address is the same string on both (Qwencoin kept Bitcoin's address forms), so the
+  // chain is always named beside it: coins sent on one chain are at that key on that chain only.
+  const outside = (name) => name === 'btc' || name === 'qwen';
+  const nameOf = (id) => (id === cfg().btc_id ? 'btc' : cfg().qwen_id && id === cfg().qwen_id ? 'qwen' : Object.keys(cfg().launches).find((t) => cfg().launches[t].id === id));
+  const idOf = (name) => (name === 'btc' ? cfg().btc_id : name === 'qwen' ? cfg().qwen_id : (cfg().launches[name] || {}).id);
+  const label = (name) => (name === 'btc' ? 'sats' : name === 'qwen' ? 'QWEN' : '$' + name);
   const myScript = () => B.p2wpkh(W.pub);
-  const addrOn = (name) => B.segwitEncode(name === 'btc' ? cfg().btc.hrp : cfg().launches[name].hrp, 0, B.hash160(W.pub));
-  // Bitcoin goes to the wallet's own address; launch coins stay at the hashfun key.
-  const destOn = (name) => (name === 'btc' ? B.addressToScript(W.addr, cfg().btc) : myScript());
-  const spacing = (name) => (name === 'btc' ? 600 : cfg().launches[name].target_spacing || 60);
-  const confsFor = (name) => (name === 'btc' ? 1 : cfg().book.confs);
+  const netOf = (name) => { const n = outside(name) ? cfg()[name] : cfg().launches[name]; if (!n) throw new Error(name === 'qwen' ? 'this site has no Qwencoin node' : `this site does not follow ${name}`); return n; };
+  const addrOn = (name) => B.segwitEncode(netOf(name).hrp, 0, B.hash160(W.pub));
+  // Sats go to the wallet's own address. QWEN and launch coins stay at the hashfun key (no wallet
+  // extension signs for those chains), unless a Qwencoin payout address was given.
+  const destOn = (name) => (name === 'btc' ? B.addressToScript(W.addr, cfg().btc) : name === 'qwen' && W.qwenAddr ? B.addressToScript(W.qwenAddr, cfg().qwen) : myScript());
+  const spacing = (name) => (outside(name) ? 600 : cfg().launches[name].target_spacing || 60);
+  // Confirmations before the other side acts: 1 on Bitcoin, 6 on Qwencoin (little work stands
+  // behind one of its blocks), the site's setting on a launch chain.
+  const confsFor = (name) => (name === 'btc' ? 1 : name === 'qwen' ? 6 : cfg().book.confs);
   // How long before the maker's refund opens a taker stops claiming: a claim that confirms after
   // the maker has refunded would hand the maker the secret and both sides of the swap.
   const margin = (name, lock) => Math.min(Math.max(600, 6 * spacing(name)), Math.floor(lock / 4));
 
   // ---------------------------------------------------------------- coins of the hashfun key
-  let btcCache = null;
+  const scanned = {}; // outside chain -> { t, list }
   const utxos = async (name) => {
     let list;
-    if (name === 'btc') { // a UTXO-set scan on the site's node: about a minute on mainnet, so keep the answer a while
-      if (!btcCache || ms() - btcCache.t > (cfg().btc.chain === 'main' ? 120000 : 3000)) btcCache = { t: ms(), list: (await api(`/chain/btc/address/${addrOn('btc')}`)).utxos.filter((u) => u.confirmations > 0) };
-      list = btcCache.list;
+    if (outside(name)) { // a UTXO-set scan on the site's node: about a minute on Bitcoin mainnet, so keep the answer a while
+      const keep = netOf(name).chain !== 'main' ? 3000 : name === 'btc' ? 120000 : 15000;
+      if (!scanned[name] || ms() - scanned[name].t > keep) scanned[name] = { t: ms(), list: (await api(`/chain/${name}/address/${addrOn(name)}`)).utxos.filter((u) => u.confirmations > 0) };
+      list = scanned[name].list;
     } else list = (await api(`/coin/${name}/address/${addrOn(name)}`)).utxos.filter((u) => u.spendable);
     const spent = load('hf_spent'); // outputs our own unconfirmed transactions already spend
     return list.filter((u) => !spent[`${name}:${u.txid}:${u.vout}`]);
@@ -115,6 +127,7 @@ export function createBook(env) {
 
   // ---------------------------------------------------------------- maker: orders
   async function post({ give, get, give_amount, get_amount, min_get, ttl }) {
+    if (!idOf(give) || !idOf(get)) throw new Error([give, get].includes('qwen') && !cfg().qwen_id ? 'this site has no Qwencoin node' : 'this site does not follow one of those chains');
     if (!(give_amount >= MIN_OUTPUT) || !(get_amount >= MIN_OUTPUT)) throw new Error('too small: both sides need at least ' + MIN_OUTPUT + ' base units');
     // A taker may claim my lock right up to its timelock as that chain's clock (median of the last
     // 11 blocks, so about 6 blocks behind) sees it; I then need time to claim theirs. The lock has
@@ -124,7 +137,7 @@ export function createBook(env) {
     // Everything I already offer from this chain counts: an offer is a promise the page must keep.
     const promised = (await mine().catch(() => [])).filter((x) => x.give === idOf(give)).reduce((a, x) => a + x.remaining, 0);
     let have = await balance(give);
-    if (have < give_amount + promised && give === 'btc') { btcCache = null; have = await balance(give); } // a deposit may have just confirmed
+    if (have < give_amount + promised && outside(give)) { delete scanned[give]; have = await balance(give); } // a deposit may have just confirmed
     if (have < give_amount + promised) throw new Error(`your hashfun key holds ${have} in spendable ${label(give)}: less than this offer${promised ? ' plus your other open offers' : ''}`);
     // The smallest take: both pieces of it must be worth locking.
     const floor = Math.max(MIN_OUTPUT, Math.ceil((MIN_OUTPUT * get_amount) / give_amount));
@@ -228,7 +241,7 @@ export function createBook(env) {
       } else {
         const tx = await buildLock(name, spk, amount);
         Object.assign(rec.my, { txid: tx.txid, vout: 0, hex: tx.hex }); rec.state = 'locking'; put(rec);
-        markSpent(tx.spends); if (name === 'btc') btcCache = null;
+        markSpent(tx.spends); if (outside(name)) delete scanned[name];
       }
     }
     if (rec.my.hex) await broadcast(name, rec.my.hex, rec.my);
@@ -377,5 +390,5 @@ export function createBook(env) {
 
   // A swap this page still has to act on: closing the tab now could cost its owner the other side.
   const pending = () => Object.values(recs()).some((r) => r.taker && ['locking', 'locked'].includes(r.state));
-  return { pending, post, cancel, mine, take: takeGuarded, tick, start, recs, balance, nameOf, idOf, addrOn, confsFor, list: (q = '') => api('/book' + q).then((r) => r.orders) };
+  return { pending, post, cancel, mine, take: takeGuarded, tick, start, recs, balance, nameOf, idOf, addrOn, confsFor, label, outside, list: (q = '') => api('/book' + q).then((r) => r.orders) };
 }
