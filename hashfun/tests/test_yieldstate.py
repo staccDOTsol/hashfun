@@ -1,4 +1,4 @@
-"""The sats leg's state machine (hashfun/yieldstate.py) against scenarios worked out by hand, one per
+"""The two legs' state machine (hashfun/yieldstate.py) against scenarios worked out by hand, one per
 rule, and against itself: the state after any sequence of connects and disconnects must equal the
 state of the same chain replayed from nothing.
 
@@ -31,21 +31,25 @@ def person(n: int) -> bytes:
 
 LID = H("launch")
 CREATOR_BTC = person(0xCC)
+CREATOR_QWEN = person(0xCD)
 A, B, C, E, M, M2 = (person(n) for n in (1, 2, 3, 5, 9, 10))
-PARAMS = S.Params(LID, min_payment=10_000, settle_deadline=20, btc_confs=1, creator_btc_script=CREATOR_BTC)
+# The two legs differ in everything a launch may set per quote, so a rule applied to the wrong one shows.
+PARAMS = S.Params(LID, min_payment=10_000, settle_deadline=20, btc_confs=1, creator_btc_script=CREATOR_BTC,
+                  qwen_min_payment=6_000, qwen_confs=2, creator_qwen_script=CREATOR_QWEN)
+BTC, QWEN = S.BTC, S.QWEN
 
 
-def draw_of(work_hash: bytes, owed: int, params=PARAMS):
+def draw_of(work_hash: bytes, owed: int, params=PARAMS, quote=BTC):
     seed = Y.draw_seed(params.launch_id, work_hash)
-    pay, payee = Y.compute_draw(owed, params.min_payment, seed)
+    pay, payee = Y.compute_draw(owed, params.min_pay(quote), seed)
     return seed, pay, payee
 
 
-def work_hash_for(owed: int, want, tag="", params=PARAMS) -> bytes:
+def work_hash_for(owed: int, want, tag="", params=PARAMS, quote=BTC) -> bytes:
     """A seed block hash whose draw satisfies want(seed, pay, payee)."""
     for k in range(200_000):
         wh = H("work", tag, k)
-        if want(*draw_of(wh, owed, params)):
+        if want(*draw_of(wh, owed, params, quote)):
             return wh
     raise AssertionError("no such draw")
 
@@ -62,23 +66,26 @@ class Chain:
     """Blocks made by hand, connected to a State as they are made."""
 
     def __init__(self, params=PARAMS):
-        self.p, self.btc, self.blocks, self.k = params, {}, [], 0
-        self.state = S.State(params, self.relay())
+        self.p, self.btc, self.qwen, self.blocks, self.k = params, {}, {}, [], 0
+        self.state = S.State(params, self.relay(), self.qrelay())
 
     def relay(self):
         return S.StubRelay(self.btc)
+
+    def qrelay(self):
+        return S.StubRelay(self.qwen)
 
     def tx(self, spends=(), outs=()) -> S.StateTx:
         self.k += 1
         return S.StateTx(H("tx", self.k), False, list(spends), list(outs))
 
-    def add(self, *txs, curve=False, owed=0, miner=None, reward=50, work_hash=None, cb_outs=None) -> S.Block:
+    def add(self, *txs, curve=False, owed=0, miner=None, reward=50, work_hash=None, cb_outs=None, quote=BTC) -> S.Block:
         h = len(self.blocks)
         self.k += 1
         outs = list(cb_outs) if cb_outs is not None else ([(reward, miner)] if miner else [])
         cb = S.StateTx(H("coinbase", self.k), True, [], outs)
         hash_ = H("block", h, self.k)
-        b = S.Block(h, hash_, work_hash or hash_, curve and h >= 1, owed, [cb, *txs])
+        b = S.Block(h, hash_, work_hash or hash_, curve and h >= 1, owed, [cb, *txs], quote)
         self.state.connect(b)
         self.blocks.append(b)
         return b
@@ -88,27 +95,28 @@ class Chain:
         return self.blocks.pop()
 
     def replayed(self) -> S.State:
-        return S.State.replay(self.p, self.relay, self.blocks)
+        return S.State.replay(self.p, self.relay, self.blocks, self.qrelay)
 
-    # ---- Bitcoin payments, as the stub relay sees them
-    def payment(self, pays, lists=None, confirmations=1):
-        """A Bitcoin transaction with outputs pays = [(script, sats, tag)], then its tag lists
+    # ---- payments on Bitcoin and on Qwencoin, as the stub relays see them
+    def payment(self, pays, lists=None, confirmations=1, chain="btc"):
+        """A transaction on that chain with outputs pays = [(script, amount, tag)], then its tag lists
         (default: one list, tag i for output i), alone in a block. Returns (block hash, raw tx)."""
         outs = [TxOut(sats, script) for script, sats, _ in pays]
         for tags in ([[t for _, _, t in pays]] if lists is None else lists):
             outs.append(TxOut(0, Y.payment_outputs_tag(tags)))
         self.k += 1
         raw = Tx(version=2, vin=[TxIn(H("funding", self.k), 0)], vout=outs).serialize(witness=False)
-        block = H("btc block", self.k)
-        self.btc[block] = (confirmations, sha256d(raw))
+        block = H(chain, "block", self.k)
+        (self.qwen if chain == "qwen" else self.btc)[block] = (confirmations, sha256d(raw))
         return block, raw
 
     def tag(self, height: int) -> bytes:
         return Y.pay_tag(self.p.launch_id, self.blocks[height].hash)
 
     @staticmethod
-    def proof(mint_height, btc_block, raw, vout=0, candidate=0):
-        return (0, Y.op_return(Y.PaymentProof(mint_height, btc_block, 0, [], vout, candidate, raw).payload()))
+    def proof(mint_height, btc_block, raw, vout=0, candidate=0, quote="btc"):
+        """A proof output: "HFP1" (a payment on Bitcoin) or, with quote="qwen", "HFP2" (on Qwencoin)."""
+        return (0, Y.op_return(Y.PaymentProof(mint_height, btc_block, 0, [], vout, candidate, raw).payload(quote)))
 
 
 def outpoint(block: S.Block, vout=0, tx=0):
@@ -353,8 +361,8 @@ class HeldCoinbase(unittest.TestCase):
         c, _ = self.chain(owed=20_000)                            # tip is 7; block 2's draw comes with block 8
         ob = c.state.obligation(2)
         self.assertEqual((ob["draw_known"], ob["draw_height"], ob["deadline_height"]), (False, 8, 2 + PARAMS.settle_deadline))
-        self.assertEqual(set(ob), {"height", "hash", "curve", "owed", "draw_known", "draw_height", "settled", "spendable",
-                                   "deadline_height", "tag"})
+        self.assertEqual(set(ob), {"height", "hash", "curve", "quote", "owed", "draw_known", "draw_height", "settled",
+                                   "spendable", "deadline_height", "tag"})
         self.assertEqual((ob["hash"], ob["tag"]), (c.blocks[2].hash[::-1].hex(), Y.pay_tag(LID, c.blocks[2].hash).hex()))
         c.add(work_hash=work_hash_for(20_000, lambda seed, pay, payee: payee == Y.HOLDER))
         self.assertEqual(set(c.state.obligation(2)) - set(ob), {"pay", "payee", "earning", "pay_script", "coin"})
@@ -573,6 +581,145 @@ class Settling(unittest.TestCase):
         self.assertEqual(c.state.relay.headers, [])
 
 
+class TwoQuotes(unittest.TestCase):
+    """Rule set 3: a curve block is on the BTC curve or on the QWEN curve and owes that curve's asset.
+    One draw, one lock; the chain a payment is made and proven on, the minimum payment, the creator's
+    script and the confirmations are the block's own quote's."""
+
+    def setUp(self):
+        c = self.c = Chain()
+        c.add()
+        c.add(miner=A, reward=1000)
+        c.add(curve=True, owed=20_000, miner=M, reward=50)                 # 2: on the BTC curve
+        c.add(curve=True, owed=20_000, miner=M2, reward=60, quote=QWEN)    # 3: on the QWEN curve
+        for _ in range(4):
+            c.add()                                                        # 4..7
+        want_a = holder_point_in(1000, 0, 1000)
+        c.add(work_hash=work_hash_for(20_000, want_a, "two"))              # 8: draw of 2, payee A
+        c.add(work_hash=work_hash_for(20_000, want_a, "three", quote=QWEN))  # 9: draw of 3, payee A
+        self.assertEqual([(c.state.obligation(h)["quote"], c.state.obligation(h)["pay_script"], c.state.obligation(h)["pay"])
+                          for h in (2, 3)], [("btc", A.hex(), 20_000), ("qwen", A.hex(), 20_000)])
+
+    def settled(self):
+        return [self.c.state.obligation(h)["settled"] for h in (2, 3)]
+
+    def test_a_block_settles_on_its_own_chain_only(self):
+        c = self.c
+        # The QWEN-curve block (3). A correct payment, made on Bitcoin: the right script, amount and tag.
+        on_btc, raw = c.payment([(A, 20_000, c.tag(3))], confirmations=9)
+        c.add(cb_outs=[c.proof(3, on_btc, raw)])                           # HFP1: a Bitcoin proof never settles it
+        self.assertEqual(self.settled(), [False, False])
+        c.add(cb_outs=[c.proof(3, on_btc, raw, quote="qwen")])             # HFP2 naming a block the Qwencoin relay does not know
+        self.assertEqual(self.settled(), [False, False])
+        # The same payment on Qwencoin, two confirmations deep.
+        on_qwen, raw_q = c.payment([(A, 20_000, c.tag(3))], confirmations=2, chain="qwen")
+        c.add(cb_outs=[c.proof(3, on_qwen, raw_q)])                        # ... proven with the Bitcoin tag: no
+        self.assertEqual(self.settled(), [False, False])
+        c.add(cb_outs=[c.proof(3, on_qwen, raw_q, quote="qwen")])
+        self.assertEqual(self.settled(), [False, True])
+        self.assertTrue(c.state.spendable(3) and not c.state.spendable(2))
+        # The BTC-curve block (2), the other way round.
+        on_qwen2, raw2 = c.payment([(A, 20_000, c.tag(2))], confirmations=9, chain="qwen")
+        c.add(cb_outs=[c.proof(2, on_qwen2, raw2, quote="qwen"), c.proof(2, on_qwen2, raw2)])
+        self.assertEqual(self.settled(), [False, True])
+        on_btc2, raw3 = c.payment([(A, 20_000, c.tag(2))])
+        c.add(cb_outs=[c.proof(2, on_btc2, raw3, quote="qwen")])
+        self.assertEqual(self.settled(), [False, True])
+        c.add(cb_outs=[c.proof(2, on_btc2, raw3)])
+        self.assertEqual(self.settled(), [True, True])
+        self.assertEqual(c.state.snapshot(), c.replayed().snapshot())
+
+    def test_one_payment_cannot_settle_a_block_of_each_curve(self):
+        """A transaction that pays both blocks' payee (the same script here) with both tags, on Bitcoin:
+        it settles the BTC-curve block and leaves the QWEN-curve block owing, whatever the proof says."""
+        c = self.c
+        btc, raw = c.payment([(A, 20_000, c.tag(2)), (A, 20_000, c.tag(3))], confirmations=5)
+        c.qwen[btc] = (0, c.btc[btc][1])  # the Qwencoin relay has heard of no such block
+        c.add(cb_outs=[c.proof(2, btc, raw, 0), c.proof(3, btc, raw, 1), c.proof(3, btc, raw, 1, quote="qwen")])
+        self.assertEqual(self.settled(), [True, False])
+
+    def test_confirmations_are_the_quotes_own(self):
+        c = self.c                                                         # btc_confs 1, qwen_confs 2
+        q, raw = c.payment([(A, 20_000, c.tag(3))], confirmations=1, chain="qwen")
+        c.add(cb_outs=[c.proof(3, q, raw, quote="qwen")])
+        self.assertEqual(self.settled(), [False, False])                   # one confirmation is Bitcoin's number
+        c.qwen[q] = (2, c.qwen[q][1])
+        c.add(cb_outs=[c.proof(3, q, raw, quote="qwen")])
+        self.assertEqual(self.settled(), [False, True])
+        b, raw = c.payment([(A, 20_000, c.tag(2))], confirmations=1)
+        c.add(cb_outs=[c.proof(2, b, raw)])
+        self.assertEqual(self.settled(), [True, True])
+
+    def test_the_minimum_payment_and_the_creators_script_are_the_quotes_own(self):
+        for quote, name, creator, minimum in ((BTC, "btc", CREATOR_BTC, 10_000), (QWEN, "qwen", CREATOR_QWEN, 6_000)):
+            for payee, script in ((Y.CREATOR, creator), (Y.DEV, Y.DEV_BTC_SCRIPT)):
+                c = Chain()
+                c.add()
+                c.add(miner=A, reward=1000)
+                c.add(curve=True, owed=8000, miner=M, reward=50, quote=quote)   # 8000: between the two minimums
+                for _ in range(5):
+                    c.add()
+                # On the QWEN curve 8000 is above the minimum and due as it is. On the BTC curve it is
+                # below: the lottery pays the minimum or nothing.
+                c.add(work_hash=work_hash_for(8000, lambda seed, pay, p, payee=payee: p == payee and pay > 0, quote=quote,
+                                              tag=name))
+                ob = c.state.obligation(2)
+                self.assertEqual((ob["quote"], ob["payee"], ob["pay"], ob["pay_script"]),
+                                 (name, S.PAYEE_NAMES[payee], 8000 if quote == QWEN else minimum, script.hex()))
+        # and with nothing drawn below the QWEN minimum either way
+        self.assertEqual({draw_of(H("m", k), 5000, quote=QWEN)[1] for k in range(64)}, {0, 6000})
+        self.assertEqual({draw_of(H("m", k), 5000, quote=BTC)[1] for k in range(64)}, {0, 10_000})
+
+    def test_a_block_evaluates_the_work_of_at_most_eight_qwencoin_headers(self):
+        c = self.c
+        hdr = [bytes([k + 1]) * 80 for k in range(24)]
+        out = lambda tag, hs: (0, Y.op_return(tag + b"".join(hs)))  # noqa: E731
+        # ten new ones in one output: the first eight
+        c.add(cb_outs=[out(b"HFH2", hdr[:10])])
+        self.assertEqual((c.state.qrelay.headers, c.state.info[-1].qrelayed), ([sha256d(x) for x in hdr[:8]],) * 2)
+        # headers the relay knows cost nothing; the limit is per block, over all of the coinbase's outputs in order
+        c.add(cb_outs=[out(b"HFH2", hdr[:8] + hdr[8:12]), out(b"HFH2", hdr[10:17]), out(b"HFH2", hdr[17:20])])
+        self.assertEqual(c.state.info[-1].qrelayed, [sha256d(x) for x in hdr[8:16]])
+        # Bitcoin headers are not limited, and do not use up the Qwencoin ones
+        c.add(cb_outs=[out(b"HFH1", hdr[:20]), out(b"HFH2", hdr[16:])])
+        self.assertEqual((len(c.state.info[-1].relayed), c.state.info[-1].qrelayed), (20, [sha256d(x) for x in hdr[16:]]))
+        self.assertEqual(c.state.snapshot(), c.replayed().snapshot())
+        for n in (16, 8, 0):
+            c.pop()
+            self.assertEqual(c.state.qrelay.headers, [sha256d(x) for x in hdr[:n]])
+        self.assertEqual(c.state.relay.headers, [])
+
+    def test_qwencoin_headers_count_in_the_coinbase_only(self):
+        """Checking a Qwencoin header costs every node a pass through the weights, and a header that
+        fails costs its relayer nothing: in any transaction, a block's eight checks could be bought for
+        a fee and put ahead of the miner's own. So an HFH2 output counts in the coinbase and is not
+        looked at anywhere else: no header added, none of the eight spent. Bitcoin headers and proofs
+        of either chain count wherever they are."""
+        c = self.c
+        hdr = [bytes([k + 1]) * 80 for k in range(24)]
+        out = lambda tag, hs: (0, Y.op_return(tag + b"".join(hs)))  # noqa: E731
+        c.add(c.tx(outs=[out(b"HFH2", hdr[:8])]))
+        self.assertEqual((c.state.qrelay.headers, c.state.info[-1].qrelayed), ([], []))
+        # the coinbase's eight are all its own, whatever the block's other transactions carry
+        c.add(c.tx(outs=[out(b"HFH2", hdr[8:16])]), c.tx(outs=[out(b"HFH2", hdr[:3])]), cb_outs=[out(b"HFH2", hdr[:8])])
+        self.assertEqual((c.state.qrelay.headers, c.state.info[-1].qrelayed), ([sha256d(x) for x in hdr[:8]],) * 2)
+        c.add(c.tx(outs=[out(b"HFH1", hdr[:5]), out(b"HFH2", hdr[8:12])]))
+        self.assertEqual((len(c.state.info[-1].relayed), c.state.info[-1].qrelayed), (5, []))
+        q, raw = c.payment([(A, 20_000, c.tag(3))], confirmations=2, chain="qwen")
+        b, raw_b = c.payment([(A, 20_000, c.tag(2))])
+        c.add(c.tx(outs=[c.proof(3, q, raw, quote="qwen")]), c.tx(outs=[c.proof(2, b, raw_b)]))
+        self.assertEqual(self.settled(), [True, True])
+        self.assertEqual(c.state.snapshot(), c.replayed().snapshot())
+        c.pop(), c.pop(), c.pop()
+        self.assertEqual(c.state.qrelay.headers, [])
+
+    def test_a_block_off_the_curves_has_no_quote_of_its_own(self):
+        c = self.c
+        c.add(quote=QWEN)  # (after graduation the node refuses the bit; the model reads such a block as on neither curve)
+        self.assertEqual((c.state.obligation(10)["quote"], c.state.obligation(10)["curve"], c.state.info[10].quote),
+                         ("btc", False, BTC))
+
+
 class Undo(unittest.TestCase):
     def test_disconnect_is_the_inverse_of_connect_for_everything_a_block_can_do(self):
         c = Chain()
@@ -619,11 +766,13 @@ class Undo(unittest.TestCase):
 
 
 class BtcSim:
-    """A regtest Bitcoin for the random scenario: headers with real proof of work at the regtest limit."""
+    """A regtest Bitcoin (or, under another name, a regtest Qwencoin: the same rules) for the random
+    scenario: headers with real proof of work at the regtest limit."""
 
-    def __init__(self):
+    def __init__(self, name="btc"):
+        self.name = name
         self.time = 1_600_000_000
-        self.anchor = self._header(bytes(32), H("anchor"))
+        self.anchor = self._header(bytes(32), H(name, "anchor"))
         self.chain = [self.anchor]   # headers, best chain
         self.roots = {}
 
@@ -636,7 +785,7 @@ class BtcSim:
 
     def mine(self, txids):
         """A block holding these transactions (after a made-up coinbase). Returns its hash."""
-        txids = [H("btc coinbase", len(self.chain))] + list(txids)
+        txids = [H(self.name, "coinbase", len(self.chain))] + list(txids)
         hdr = self._header(sha256d(self.chain[-1]), merkle_root(txids))
         self.chain.append(hdr)
         self.roots[sha256d(hdr)] = txids
@@ -644,27 +793,33 @@ class BtcSim:
 
 
 class RandomChains(unittest.TestCase):
-    """Random blocks, spends, payments (right and wrong), header relays and reorgs, with the real
-    header relay. After every step: the state equals the same chain replayed from nothing, and
-    every draw equals a payee worked out a second way."""
+    """Random blocks on both curves, spends, payments on both chains (right and wrong, also on the
+    wrong chain), header relays and reorgs, with the real header relays. After every step: the state
+    equals the same chain replayed from nothing, every draw equals a payee worked out a second way,
+    and the Qwencoin headers a block added are the ones the pass limit allows."""
 
     def run_one(self, seed: int, steps: int):
         rng = random.Random(seed)
-        btc = BtcSim()
-        params = S.Params(LID, 10_000, 30, rng.choice([1, 2]), CREATOR_BTC)
-        factory = lambda: S.HeaderRelay(btc.anchor, 0, 0, True)  # noqa: E731
-        state, blocks, counter = S.State(params, factory()), [], itertools.count()
+        sims = (BtcSim("btc"), BtcSim("qwen"))
+        params = S.Params(LID, 10_000, 30, rng.choice([1, 2]), CREATOR_BTC, qwen_min_payment=rng.choice([6_000, 10_000]),
+                          qwen_confs=rng.choice([1, 2, 3]), creator_qwen_script=CREATOR_QWEN)
+        factory = lambda: S.HeaderRelay(sims[0].anchor, 0, 0, True)  # noqa: E731
+        qfactory = lambda: S.HeaderRelay(chain=Y.QwenChain(sims[1].anchor, 0, 0, True))  # noqa: E731
+        state, blocks, counter = S.State(params, factory(), qfactory()), [], itertools.count()
+        replay = lambda: S.State.replay(params, factory, blocks, qfactory)  # noqa: E731
         people = [person(40 + k) for k in range(5)]
         proofs = []        # every proof output ever made (also the wrong ones): they may ride again after a reorg
-        stats = {"kills": 0, "settled": 0, "released_at_draw": 0, "reorgs": 0, "wrong": 0, "holder_draws": 0, "nobody_holds": 0,
-                 "past_the_end": 0, "reopened": 0}
-        curve_until, walked_back = steps // 2, False  # the sats leg ends at curve_until - 1 + 30, well inside the run
+        stats = {"kills": 0, "settled_btc": 0, "settled_qwen": 0, "released_at_draw": 0, "reorgs": 0, "wrong": 0,
+                 "wrong_chain": 0, "holder_draws": 0, "nobody_holds": 0, "past_the_end": 0, "reopened": 0, "pass_limit": 0,
+                 "qwen_headers": 0, "headers_outside_the_coinbase": 0}
+        curve_until, walked_back = steps * 2 // 5, False  # the legs end at curve_until - 1 + 30, well inside the run
 
         def make_block():
             h = len(blocks)
             hash_ = H("rc", seed, next(counter))
             curve = 1 <= h < curve_until
-            owed = rng.choice([0, 4000, 4000, 20_000, 20_000, 35_000]) if curve else 0
+            quote = rng.choice([BTC, QWEN]) if curve else BTC
+            owed = rng.choice([0, 4000, 4000, 8000, 20_000, 20_000, 35_000]) if curve else 0
             cb_outs = [(rng.choice([0, 1, 50, 500]), rng.choice(people)), (rng.choice([0, 3]), CREATOR_BTC)]
             if h == 0:
                 cb_outs = []  # as in a real launch: the genesis block makes no coin,
@@ -674,9 +829,22 @@ class RandomChains(unittest.TestCase):
                 cb_outs.append((0, Y.yield_tag_script(rng.choice([person(77), b"\x51", b""]))))  # a redirect, or a broken one
             # relay: the Bitcoin headers the launch has not seen, sometimes
             known = set(state.relay.chain.nodes)
-            missing = [x for x in btc.chain[1:] if sha256d(x) not in known]
+            missing = [x for x in sims[0].chain[1:] if sha256d(x) not in known]
             if missing and rng.random() < 0.8:
                 cb_outs.append((0, Y.op_return(b"HFH1" + b"".join(missing[:rng.randrange(1, 6)]))))
+            # ... and the Qwencoin headers, in one or two outputs, now and then more than a block may take,
+            # some of them known already, some not connecting yet
+            qknown = set(state.qrelay.chain.nodes)
+            qmissing = [x for x in sims[1].chain[1:] if sha256d(x) not in qknown]
+            if qmissing and rng.random() < 0.8:
+                lead = [x for x in sims[1].chain[1:] if sha256d(x) in qknown][-rng.randrange(0, 3) or len(sims[1].chain):]
+                batch = lead + qmissing[:rng.randrange(1, 14)]
+                if rng.random() < 0.2 and len(batch) > 2:
+                    batch = batch[1:] + batch[:1]  # the first header last: the ones after it may not connect before it
+                cut = rng.randrange(0, len(batch) + 1) if rng.random() < 0.4 else len(batch)
+                for part in (batch[:cut], batch[cut:]):
+                    if part:
+                        cb_outs.append((0, Y.op_return(b"HFH2" + b"".join(part))))
             for p in rng.sample(proofs, min(len(proofs), rng.randrange(0, 4))):
                 cb_outs.append(p)
             txs = []
@@ -689,15 +857,22 @@ class RandomChains(unittest.TestCase):
                 outs = [(rng.choice([0, 1, 10, 100, 1000]), rng.choice(people + [b"\x51", b"\x6a\x01\x00"]))
                         for _ in range(rng.randrange(1, 4))]
                 txs.append(S.StateTx(H("rtx", seed, next(counter)), False, spends, outs))
+            if qmissing and rng.random() < 0.25:
+                # Qwencoin headers in a transaction that is not the coinbase: real ones the relay lacks.
+                # They are not looked at there (the second opinion below reads the coinbase alone).
+                txs.insert(rng.randrange(len(txs) + 1), S.StateTx(H("relay tx", seed, next(counter)), False, [], [
+                    (0, Y.op_return(b"HFH2" + b"".join(qmissing[:rng.randrange(1, 10)])))]))
+                stats["headers_outside_the_coinbase"] += 1
             return S.Block(h, hash_, hash_ if rng.random() < 0.8 else H("parent of", hash_), curve, owed,
-                           [S.StateTx(H("rcb", seed, next(counter)), True, [], cb_outs)] + txs)
+                           [S.StateTx(H("rcb", seed, next(counter)), True, [], cb_outs)] + txs, quote)
 
         def pay_someone():
-            due = [h for h, i in enumerate(state.info) if i.draw_known and i.pay > 0 and not i.settled]
+            quote = rng.choice([BTC, QWEN])
+            due = [h for h, i in enumerate(state.info) if i.draw_known and i.pay > 0 and not i.settled and i.quote == quote]
             if not due:
                 return
             pick = rng.sample(due, min(len(due), rng.randrange(1, 4)))
-            wrong = rng.choice([None, None, None, "script", "short", "tag", "candidate", "two lists"])
+            wrong = rng.choice([None, None, None, None, "script", "short", "tag", "candidate", "two lists", "chain", "proof tag"])
             pays = [(state.info[h].pay_script, state.info[h].pay, Y.pay_tag(LID, state.info[h].hash)) for h in pick]
             lists, candidate = None, 0
             if wrong == "script":
@@ -714,18 +889,29 @@ class RandomChains(unittest.TestCase):
             for tags in ([[t for _, _, t in pays]] if lists is None else lists):
                 outs.append(TxOut(0, Y.payment_outputs_tag(tags)))
             raw = Tx(version=2, vin=[TxIn(H("fund", next(counter)), 0)], vout=outs).serialize(witness=False)
-            block = btc.mine([sha256d(raw)])
-            txids = btc.roots[block]
+            # "chain": everything right, paid on the other chain (and proven as a payment there).
+            # "proof tag": paid on the right chain, proven with the other chain's tag.
+            paid_on = 1 - quote if wrong == "chain" else quote
+            said = 1 - paid_on if wrong == "proof tag" else paid_on
+            sim = sims[paid_on]
+            block = sim.mine([sha256d(raw)])
+            txids = sim.roots[block]
             for vout, h in enumerate(pick):
-                proofs.append((0, Y.op_return(Y.PaymentProof(h, block, 1, merkle_branch(txids, 1), vout, candidate, raw).payload())))
+                proof = Y.PaymentProof(h, block, 1, merkle_branch(txids, 1), vout, candidate, raw)
+                proofs.append((0, Y.op_return(proof.payload(S.QUOTE_NAMES[said]))))
             stats["wrong"] += wrong is not None
+            stats["wrong_chain"] += wrong in ("chain", "proof tag")
+            # what is wrong with the whole transaction or its proofs spoils every block it pays; the rest only the first
+            return {h: wrong in ("candidate", "two lists", "chain", "proof tag") or (wrong is not None and k == 0)
+                    for k, h in enumerate(pick)}
 
         def second_opinion(b: S.Block):
             """The draw this block will make, from the live coins as they stand before it."""
             m = b.height - S.DRAW_DELAY
             if m < 1 or not state.info[m].curve:
                 return None
-            seed_, pay, payee = draw_of(b.work_hash, state.info[m].owed, params)
+            quote = blocks[m].quote
+            seed_, pay, payee = draw_of(b.work_hash, state.info[m].owed, params, quote)
             live = [c for c in state.coins if c.live]
             total = sum(c.value for c in live)
             if pay == 0 or (payee == Y.HOLDER and not total):
@@ -733,10 +919,33 @@ class RandomChains(unittest.TestCase):
             if payee == Y.DEV:
                 return pay, Y.DEV_BTC_SCRIPT, total
             if payee == Y.CREATOR:
-                return pay, CREATOR_BTC, total
+                return pay, CREATOR_QWEN if quote == QWEN else CREATOR_BTC, total
             sums = list(itertools.accumulate(c.value for c in live))
             return pay, live[bisect.bisect_right(sums, Y.candidate_point(seed_, 0, total))].script, total
 
+        def qwen_headers_allowed(b: S.Block):
+            """The Qwencoin headers this block may add, a second way: walk the HFH2 payloads of its
+            coinbase in order over the set of headers known before it; a known header and one whose
+            parent is unknown cost nothing, every other one costs one of the block's eight evaluations
+            and is added (on this regtest every header has its work and a later time)."""
+            known, left, added, skipped = set(state.qrelay.chain.nodes), Y.MAX_QWEN_PASSES, [], 0
+            for tx in b.txs[:1]:
+                self.assertTrue(tx.coinbase)
+                for _v, script in tx.outputs:
+                    data = Y.tagged_return(script, b"HFH2")
+                    for header in (Y.parse_btc_headers(data) or []) if data is not None else []:
+                        hh = sha256d(header)
+                        if hh in known or header[4:36] not in known:
+                            continue
+                        if left == 0:
+                            skipped += 1
+                            continue
+                        left -= 1
+                        known.add(hh)
+                        added.append(hh)
+            return added, skipped
+
+        never = {}  # mint height -> True for blocks only ever paid wrongly: they must not be settled
         for step in range(steps):
             depth = rng.randrange(1, 5) if blocks and rng.random() < 0.12 else 0
             if len(state.above) >= 2 and not walked_back:  # once per run: from past the end back to before it
@@ -748,20 +957,26 @@ class RandomChains(unittest.TestCase):
                     blocks.pop()
                 stats["reorgs"] += 1
                 stats["reopened"] += was_closed and not state.closed()
-                self.assertEqual(state.snapshot(), S.State.replay(params, factory, blocks).snapshot(), (seed, step, "undo"))
-            if rng.random() < 0.5:
-                pay_someone()
+                never = {h: v for h, v in never.items() if h < len(blocks)}
+                self.assertEqual(state.snapshot(), replay().snapshot(), (seed, step, "undo"))
+            if rng.random() < 0.6:
+                for h, wrong in (pay_someone() or {}).items():
+                    never[h] = never.get(h, True) and wrong
             if rng.random() < 0.3:
-                btc.mine([])
+                sims[0].mine([])
+            if rng.random() < 0.5:
+                for _ in range(rng.choice([1, 1, 2, 12])):
+                    sims[1].mine([])
             b = make_block()
             before = state.snapshot() if state.closed() else None
             expect = None if state.closed() else second_opinion(b)
+            qexpect = None if state.closed() else qwen_headers_allowed(b)
             if not state.connect(b):  # past the end: the block is not looked at
                 blocks.append(b)
                 stats["past_the_end"] += 1
                 self.assertEqual((state.height(), state.tracked(), state.earning()), (b.height, curve_until - 1 + 30, 0))
-                self.assertEqual((state.snapshot()[:2], state.snapshot()[3], state.above[:-1]), (before[:2], before[3], list(before[2])))
-                self.assertEqual(state.snapshot(), S.State.replay(params, factory, blocks).snapshot(), (seed, step))
+                self.assertEqual((state.snapshot()[:2], state.snapshot()[3:], state.above[:-1]), (before[:2], before[3:], list(before[2])))
+                self.assertEqual(state.snapshot(), replay().snapshot(), (seed, step))
                 self.assertEqual(state.obligation(b.height)["hash"], b.hash[::-1].hex())
                 continue
             blocks.append(b)
@@ -773,9 +988,14 @@ class RandomChains(unittest.TestCase):
                 stats["holder_draws"] += d.coin is not None
                 stats["nobody_holds"] += d.payee == Y.HOLDER and d.earning == 0
                 stats["released_at_draw"] += i.drew in i.released_here
+            self.assertEqual(i.qrelayed, qexpect[0], (seed, step))
+            stats["pass_limit"] += qexpect[1] > 0
+            stats["qwen_headers"] += len(i.qrelayed)
             stats["kills"] += len(i.killed)
-            stats["settled"] += len(i.settled_here)
-            self.assertEqual(state.snapshot(), S.State.replay(params, factory, blocks).snapshot(), (seed, step))
+            for m in i.settled_here:
+                stats["settled_qwen" if state.info[m].quote == QWEN else "settled_btc"] += 1
+                self.assertFalse(never.get(m, False), (seed, step, m, "settled by a payment that was wrong"))
+            self.assertEqual(state.snapshot(), replay().snapshot(), (seed, step))
             self.assertEqual(state.live_value(), sum(c.value for c in state.coins if c.live))
             self.assertEqual(state.earning(), 0 if state.closed() else state.live_value())
             self.assertEqual(state.closed(), not b.curve and b.height >= curve_until - 1 + 30)
@@ -788,11 +1008,11 @@ class RandomChains(unittest.TestCase):
     def test_random_chains(self):
         total = {}
         for seed in range(int(os.environ.get("HFYIELD_SEEDS", "6"))):
-            for k, v in self.run_one(seed, 140).items():
+            for k, v in self.run_one(seed, 170).items():
                 total[k] = total.get(k, 0) + v
         for k, v in total.items():  # the scenario has to have reached every path it is there for
             self.assertGreater(v, 0 if k == "nobody_holds" else 5, (k, total))
-        self.assertGreaterEqual(total["reopened"], 6)  # every run walked back over the end of the sats leg
+        self.assertGreaterEqual(total["reopened"], 6)  # every run walked back over the end of the legs
 
 
 class PureFunctions(unittest.TestCase):
@@ -849,11 +1069,224 @@ class PureFunctions(unittest.TestCase):
                 self.assertIn(f'HASHFUN_DEV_BTC_SCRIPT{{ParseHex("{Y.DEV_BTC_SCRIPT.hex()}")}}', f.read())
 
 
-def launch():
-    """A test launch at the regtest limit (2 hashes a block) that leaves the curve after a few blocks."""
-    d = D.make("yield model test", "YMT", person(0xEE), 8, test=True, pow_limit_bits=0x207FFFFF,
+class QwencoinHeaders(unittest.TestCase):
+    """The Qwencoin relay's rules for a real Qwencoin (TWIN.md section 5) on the real chain.
+
+    hashfun/tests/data/qwen_headers.json holds headers of the live chain around its genesis and its
+    first three retargets, each with its proof-of-work value (the pass through the chain's table,
+    computed once with the project's reference). The model takes those values as its work function,
+    so its retarget, limit, exact quotient and median-time logic are tested against what the Qwencoin
+    network itself accepted, with no table here."""
+
+    @classmethod
+    def setUpClass(cls):
+        import json
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "qwen_headers.json")) as f:
+            data = json.load(f)
+        cls.h = {x["height"]: bytes.fromhex(x["header"]) for x in data["headers"]}
+        cls.work = {bytes.fromhex(x["header"]): int(x["work"], 16) for x in data["headers"]}
+        cls.hashes = {x["height"]: x["hash"] for x in data["headers"]}
+        cls.starts = {int(k): v for k, v in data["period_starts"].items()}
+
+    def chain(self, anchor: int, period_start=None, work=None):
+        start = self.starts[anchor - anchor % 2016] if period_start is None else period_start
+        return Y.QwenChain(self.h[anchor], anchor, start, False, work or self.work.get)
+
+    def bits(self, height: int) -> int:
+        return int.from_bytes(self.h[height][72:76], "little")
+
+    def test_the_real_chain_is_accepted_across_every_retarget_it_has_had(self):
+        for anchor, last in ((0, 14), (1996, 2044), (2015, 2044), (2016, 2044), (4016, 4054), (6030, 6115)):
+            c = self.chain(anchor)
+            for height in range(anchor + 1, last + 1):
+                self.assertEqual(c.accept(self.h[height]), (True, ""), height)
+                self.assertEqual(sha256d(self.h[height])[::-1].hex(), self.hashes[height])  # a block's name is still its hash
+            self.assertEqual((c.nodes[c.best].height, c.confirmations(sha256d(self.h[anchor + 1]))), (last, last - anchor))
+        # each of the three retargets was a full step: the chain grew faster than four times its schedule
+        self.assertEqual([hex(self.bits(x)) for x in (2015, 2016, 4032, 6048)],
+                         ["0x2000ffff", "0x1f3fffc0", "0x1f0ffff0", "0x1f03fffc"])
+        for boundary in (2016, 4032, 6048):
+            t = bits_to_target(self.bits(boundary - 1))
+            self.assertEqual(bits_to_target(self.bits(boundary)), t // 4)
+
+    def test_a_header_with_the_previous_periods_bits_is_refused_and_so_is_one_with_any_other(self):
+        for boundary in (2016, 4032, 6048):
+            c = self.chain(boundary - 6)
+            for height in range(boundary - 5, boundary):
+                self.assertTrue(c.accept(self.h[height])[0])
+            real = self.h[boundary]
+            for bits in (self.bits(boundary - 1), self.bits(boundary) + 1, self.bits(boundary) - 1, 0x2000FFFF, 0x207FFFFF):
+                forged = real[:72] + bits.to_bytes(4, "little") + real[76:]
+                # (its work value is not known here; the refusal comes before work is looked at)
+                self.assertEqual(c.accept(forged), (False, "qwen header has wrong difficulty"), (boundary, hex(bits)))
+            self.assertEqual(c.accept(real), (True, ""))
+            self.assertEqual(c.accept(real), (False, "qwen header already known"))
+
+    def test_a_wrong_period_start_in_the_launch_refuses_the_real_chain_at_the_next_retarget(self):
+        """Why check_qwen_anchor exists: an anchor inside a period needs the true time of the period's
+        first block. With another one everything is accepted until the retarget, and nothing after.
+        (This period ran far ahead of schedule, so a start that is a little too late changes nothing, the
+        step is clamped either way; one that is too early by three weeks does. A start later than the
+        period's own last block is found out one block sooner, by the rule that a period does not close
+        before it opened.)"""
+        late = self.chain(4016, period_start=self.starts[2016] + 10_000)
+        self.assertTrue(all(late.accept(self.h[x])[0] for x in range(4017, 4033)))
+        later = self.chain(4016, period_start=self.starts[2016] + 500_000)
+        self.assertTrue(all(later.accept(self.h[x])[0] for x in range(4017, 4031)))
+        self.assertEqual(later.accept(self.h[4031]),
+                         (False, "qwen header closes a difficulty period before the time the period opened"))
+        c = self.chain(4016, period_start=self.starts[2016] - 2_000_000)
+        for height in range(4017, 4032):
+            self.assertTrue(c.accept(self.h[height])[0], height)
+        self.assertEqual(c.accept(self.h[4032]), (False, "qwen header has wrong difficulty"))
+
+    def test_work_is_the_pass_through_the_weights_and_the_hash_is_only_a_name(self):
+        c = self.chain(0)
+        # a model without the table can show no header to have work
+        self.assertEqual(Y.QwenChain(self.h[0], 0, self.starts[0], False).accept(self.h[1]),
+                         (False, "qwen header cannot be checked: Qwencoin's work table is not loaded"))
+        # the hash of a real block does not meet its target (it would have to be ground the Bitcoin way)
+        self.assertGreater(Y.sha256d_work(self.h[1]), bits_to_target(self.bits(1)))
+        self.assertEqual(self.chain(0, work=Y.sha256d_work).accept(self.h[1]), (False, "qwen header lacks proof of work"))
+        # a value one above the target is not enough, the target itself is
+        target = bits_to_target(self.bits(1))
+        self.assertEqual(self.chain(0, work=lambda _h: target + 1).accept(self.h[1]), (False, "qwen header lacks proof of work"))
+        self.assertEqual(self.chain(0, work=lambda _h: target).accept(self.h[1]), (True, ""))
+        self.assertEqual(c.accept(self.h[1]), (True, ""))
+        self.assertLessEqual(self.work[self.h[0]], bits_to_target(0x2000FFFF))  # the genesis block's own value
+
+    def test_the_pass_budget_is_spent_only_by_a_header_that_reaches_the_work_check(self):
+        c = self.chain(0)
+        budget = [2]
+        self.assertEqual(c.accept(self.h[2], budget), (False, "qwen header does not connect"))
+        wrong = self.h[1][:72] + (0x2000FFFE).to_bytes(4, "little") + self.h[1][76:]
+        self.assertEqual(c.accept(wrong, budget), (False, "qwen header has wrong difficulty"))
+        self.assertEqual(budget, [2])
+        self.assertTrue(c.accept(self.h[1], budget)[0])
+        self.assertEqual(c.accept(self.h[1], budget), (False, "qwen header already known"))
+        self.assertEqual(budget, [1])
+        no_work = self.h[2][:76] + b"\xff\xff\xff\xff"  # a nonce nobody found: the evaluation is spent on it all the same
+        self.assertEqual(c.accept(no_work, budget), (False, "qwen header lacks proof of work"))
+        self.assertEqual(budget, [0])
+        self.assertEqual(c.accept(self.h[2], budget),
+                         (False, "qwen header not looked at: this block has had its share of work checks"))
+        self.assertNotIn(sha256d(self.h[2]), c.nodes)
+        self.assertTrue(c.accept(self.h[2], [1])[0])
+
+    def test_the_limit_caps_a_retarget_and_the_quotient_is_exact(self):
+        """What the real chain has not done yet: a period slower than its schedule. With every header
+        given work (a stand-in work function), a period that took four times too long at the easiest
+        difficulty stays at the limit, and one from a harder difficulty eases by the exact quotient."""
+        T = Y.BTC_TIMESPAN
+        always = lambda _h: 0  # noqa: E731
+
+        def header(prev, time_, bits, salt=0):
+            return header_bytes(0x20000000, sha256d(prev), H("root", salt), time_, bits, 0)
+        for bits, span, want in ((0x2000FFFF, 4 * T, 0x2000FFFF), (0x2000FFFF, 9 * T, 0x2000FFFF),
+                                 (0x1F3FFFC0, 4 * T, 0x2000FFFF), (0x1F3FFFC0, 3 * T, None), (0x1F03FFFC, T + 1, None),
+                                 (0x1F03FFFC, T // 4, None), (0x1F03FFFC, 1, None)):
+            anchor = header_bytes(0x20000000, H("prev"), H("r"), 1_800_000_000 + span, bits, 0)
+            c = Y.QwenChain(anchor, 2015, 1_800_000_000, False, always)   # the anchor closes its period
+            t = bits_to_target(bits)
+            clamped = min(max(span, T // 4), 4 * T)
+            exact = min(t * clamped // T, bits_to_target(0x2000FFFF))
+            self.assertEqual(Y.muldiv(t, clamped, T), t * clamped // T)
+            expected = Y.target_to_bits(exact)
+            if want is not None:
+                self.assertEqual(expected, want)
+            nxt = header(anchor, 1_800_000_000 + span + 600, expected)
+            self.assertEqual(c.accept(header(anchor, 1_800_000_000 + span + 600, bits, 1))[0], expected == bits)
+            self.assertEqual(c.accept(nxt), (True, ""), (hex(bits), span))
+        # the product target * timespan does not fit in 256 bits at the limit: the quotient still is exact
+        t = bits_to_target(0x2000FFFF)
+        self.assertGreater(t * 4 * T, 2**256)
+        for num in (1, T // 4, T - 1, T, T + 1, 4 * T):
+            self.assertEqual(Y.muldiv(t, num, T), t * num // T)
+
+    def test_the_two_timestamp_rules_at_the_edges_of_a_difficulty_period(self):
+        """Qwencoin has two rules Bitcoin has not (Bitcoin Inquisition's consensus cleanup, with BIP94's
+        limit): the first block of a difficulty period is not stamped more than ten minutes before
+        its parent, and the last one is not stamped before the period's first. A relay without them
+        would follow a chain no Qwencoin node is on. Not on regtest, and not on the Bitcoin tree."""
+        always = lambda _h: 0  # noqa: E731  (every header has work: these rules are about time)
+        at = lambda header, t: header[:68] + t.to_bytes(4, "little") + header[72:]  # noqa: E731
+        time_of = lambda header: int.from_bytes(header[68:72], "little")  # noqa: E731
+        opens = "qwen header opens a difficulty period too long before its parent's time"
+        closes = "qwen header closes a difficulty period before the time the period opened"
+        # the real chain has crossed three such edges, and kept both rules at each
+        for boundary in (2016, 4032, 6048):
+            self.assertGreaterEqual(time_of(self.h[boundary]), time_of(self.h[boundary - 1]) - 600)
+            self.assertGreaterEqual(time_of(self.h[boundary - 1]), self.starts[boundary - 2016])
+            c = self.chain(boundary - 2)
+            for height in (boundary - 1, boundary, boundary + 1):
+                self.assertEqual(c.accept(self.h[height]), (True, ""), height)
+        # the first block of a period: ten minutes before its parent and no more
+        parent = time_of(self.h[2015])
+        for t, want in ((parent - 601, (False, opens)), (parent - 600, (True, "")), (parent, (True, "")), (parent + 600, (True, ""))):
+            c = self.chain(2014, work=always)
+            self.assertTrue(c.accept(self.h[2015])[0])
+            self.assertEqual(c.accept(at(self.h[2016], t)), want, t - parent)
+        # the last block of a period: the time of the period's first block and no earlier. Above an
+        # anchor inside the period that is the time the launch file gives (qwen_anchor_period_time).
+        for t, want in ((self.starts[0] - 1, (False, closes)), (self.starts[0], (True, "")), (time_of(self.h[2015]), (True, ""))):
+            c = self.chain(2014, work=always)
+            self.assertEqual(c.accept(at(self.h[2015], t)), want, t - self.starts[0])
+        # ... and once the tree holds the period's first block it is that block's own time. A first block
+        # stamped far ahead (nothing bounds it from above here) is still allowed, and so is a period that
+        # goes on from the old times: the median of eleven does not move for one block. Its last block has
+        # to reach the first one's time all the same.
+        c = self.chain(2015, work=always)
+        bits = self.bits(2016)
+        ahead = time_of(self.h[2015]) + 3_000_000
+        prev = header_bytes(0x20000000, sha256d(self.h[2015]), H("first"), ahead, bits, 0)
+        self.assertEqual(c.accept(prev), (True, ""))
+        for k in range(1, 2015):                                     # 2017 .. 4030
+            nxt = header_bytes(0x20000000, sha256d(prev), H("made up", k), time_of(self.h[2015]) + 600 * k, bits, 0)
+            self.assertEqual(c.accept(nxt), (True, ""), k)
+            prev = nxt
+        self.assertEqual(c.nodes[sha256d(prev)].height, 4030)
+        last = lambda t: header_bytes(0x20000000, sha256d(prev), H("last"), t, bits, 0)  # noqa: E731
+        self.assertEqual(c.accept(last(time_of(self.h[2015]) + 600 * 2015)), (False, closes))  # on schedule, before the first
+        self.assertEqual(c.accept(last(ahead - 1)), (False, closes))
+        self.assertEqual(c.accept(last(ahead)), (True, ""))
+        self.assertEqual(c.nodes[c.best].period_time, ahead)
+        # neither rule on a regtest Qwencoin, nor on Bitcoin's tree
+        from hashfun.ser import bits_to_target as target_of
+        for make in (lambda a: Y.QwenChain(a, 2014, 2_000_000_000, True), lambda a: Y.BtcChain(a, 2014, 2_000_000_000, True)):
+            def mined(prev_header, t):
+                for nonce in itertools.count():
+                    x = header_bytes(1, sha256d(prev_header), H("r", t), t, 0x207FFFFF, nonce)
+                    if int.from_bytes(sha256d(x), "little") <= target_of(0x207FFFFF):
+                        return x
+            anchor = mined(bytes(80), 1_900_000_000)
+            c = make(anchor)
+            closing = mined(anchor, 1_900_000_000 - 5000)            # 2015: before the "period start" the anchor names
+            self.assertEqual(c.accept(closing), (True, ""))
+            self.assertEqual(c.accept(mined(closing, 1_900_000_000 - 9000)), (True, ""))   # 2016: an hour before its parent
+        btc = Y.BtcChain(self.h[2014], 2014, self.starts[0], False, work_value=always)
+        self.assertEqual(btc.accept(at(self.h[2015], self.starts[0] - 1)), (True, ""))
+
+    def test_median_time_past_once_eleven_timestamps_are_known(self):
+        always = lambda _h: 0  # noqa: E731
+        c = self.chain(2020, work=always)
+        for height in range(2021, 2031):                                  # ten on top of the anchor: eleven timestamps
+            self.assertTrue(c.accept(self.h[height])[0])
+        times = sorted(int.from_bytes(self.h[x][68:72], "little") for x in range(2020, 2031))
+        real = self.h[2031]
+        at = lambda t: real[:68] + t.to_bytes(4, "little") + real[72:]  # noqa: E731
+        self.assertEqual(c.accept(at(times[5])), (False, "qwen header time is not past the median"))
+        self.assertEqual(c.accept(at(times[5] + 1)), (True, ""))
+        # with fewer than eleven known (close above the anchor) the rule cannot be applied and is not
+        c = self.chain(2020, work=always)
+        self.assertEqual(c.accept(self.h[2021][:68] + (1).to_bytes(4, "little") + self.h[2021][72:]), (True, ""))
+
+
+def launch(graduation_hashes=8):
+    """A test launch at the regtest limit (2 hashes a block) that leaves the curves after a few blocks."""
+    d = D.make("yield model test", "YMT", person(0xEE), graduation_hashes, test=True, pow_limit_bits=0x207FFFFF,
                target_spacing=10, lwma_window=10, genesis_time=1_700_000_000)
     d.sats_num, d.sats_shift = 2000, 0
+    d.qwen_num, d.qwen_shift = 3500, 0
     d.grind_genesis()
     return d
 
@@ -874,9 +1307,9 @@ class FakeNode:
         raw, js = next(x for x in self.chain if x[1]["hash"] == hash_hex)
         return raw.hex() if verbosity == 0 else js
 
-    def push(self, height, txs, merge_mined=False, salt=0):
+    def push(self, height, txs, merge_mined=False, salt=0, qwen=False):
         prev = bytes.fromhex(self.chain[-1][1]["hash"])[::-1] if self.chain else bytes(32)
-        version = 0x20000000 | (0x100 if merge_mined else 0)
+        version = 0x20000000 | (0x100 if merge_mined else 0) | (Y.LAUNCH_VERSION_QWEN if qwen else 0)
         header = header_bytes(version, prev, merkle_root([t.txid() for t in txs]), 1_700_000_000 + 10 * height + salt, 0x207FFFFF, 0)
         aux, js_aux = b"", None
         if merge_mined:
@@ -886,7 +1319,7 @@ class FakeNode:
             aux = serialize_auxpow(pcb, [], [], 0, parent)
             js_aux = {"parentblock": parent.hex() if height % 2 else {"hash": sha256d(parent)[::-1].hex()}}
         raw = header + aux + varint(len(txs)) + b"".join(t.serialize() for t in txs)
-        js = {"hash": sha256d(header)[::-1].hex(), "height": height, "bits": "207fffff", "tx": [{
+        js = {"hash": sha256d(header)[::-1].hex(), "height": height, "bits": "207fffff", "version": version, "tx": [{
             "txid": t.txid()[::-1].hex(),
             "vin": [{"coinbase": "00"}] if Y.is_coinbase(t) else [{"txid": i.prev_txid[::-1].hex(), "vout": i.prev_vout} for i in t.vin],
             "vout": [{"value": o.value / 100_000_000, "n": n, "scriptPubKey": {"hex": o.script_pubkey.hex()}} for n, o in enumerate(t.vout)],
@@ -916,9 +1349,10 @@ class FromANode(unittest.TestCase):
             node.push(h, [cbs[h]] + spend, merge_mined=h >= 6)
         f = S.Follower(d, node)
         self.assertEqual(f.sync(), (0, 8))
-        self.assertEqual(f.work, [0, 2, 4, 6, 8, 10, 12, 14])
-        self.assertEqual([(b.curve, b.owed) for b in f.blocks],
-                         [(False, 0)] + [(True, Y.owed(work_from_bits(0x207FFFFF), 2000, 0))] * on_curve + [(False, 0)] * (7 - on_curve))
+        self.assertEqual(f.work, [(w, 0) for w in (0, 2, 4, 6, 8, 10, 12, 14)])
+        self.assertEqual([(b.curve, b.owed, b.quote) for b in f.blocks],
+                         [(False, 0, BTC)] + [(True, Y.owed(work_from_bits(0x207FFFFF), 2000, 0), BTC)] * on_curve
+                         + [(False, 0, BTC)] * (7 - on_curve))
         self.assertEqual(f.blocks[1].owed, 4000)
         self.assertTrue(all(b.work_hash == b.hash for b in f.blocks[:6]))
         for b in f.blocks[6:]:                                    # merge-mined: the parent's hash carried the work
@@ -941,6 +1375,44 @@ class FromANode(unittest.TestCase):
         del node.chain[7:]
         self.assertEqual(f.sync(), (2, 0))
         self.assertEqual(f.state.snapshot(), f.rebuilt().snapshot())
+
+    def test_the_curve_of_a_block_is_read_from_its_version_and_each_curve_counts_its_own_work(self):
+        """Blocks on both curves, read from a node: the bit says which curve, each curve graduates on
+        its own work alone, a block owes its own curve's rate, and after graduation the bit means nothing."""
+        d, node = launch(graduation_hashes=8), FakeNode()
+        blocks_to_sell_out = (d.graduation_work + 1) // 2  # 2 hashes a block
+        self.assertTrue(3 <= blocks_to_sell_out <= 5, d.graduation_work)
+        node.push(0, [self.coinbase(0, [TxOut(0, b"\x6a")])])
+        # QWEN, BTC, QWEN, BTC, ... : the QWEN curve gets the odd heights and sells out first
+        pattern, wb, wq, expect, works = [], 0, 0, [(False, 0, BTC)], [(0, 0)]
+        for h in range(1, 2 * blocks_to_sell_out + 4):
+            qwen = h % 2 == 1
+            node.push(h, [self.coinbase(h, [TxOut(1000 + h, A)])], qwen=qwen)
+            curve = not d.graduated(wb, wq)
+            expect.append((curve, (7000 if qwen else 4000) if curve else 0, QWEN if curve and qwen else BTC))
+            if curve and qwen:
+                wq += 2
+            else:
+                wb += 2  # the BTC side, and everything after graduation whatever its bit says
+            works.append((wb, wq))
+            pattern.append(qwen)
+        f = S.Follower(d, node)
+        f.sync()
+        self.assertEqual([(b.curve, b.owed, b.quote) for b in f.blocks], expect)
+        self.assertEqual(f.work, works)
+        graduated_at = next(h for h, w in enumerate(works) if d.graduated(*w))
+        self.assertEqual(graduated_at, 2 * blocks_to_sell_out - 1)         # the QWEN curve's last block
+        self.assertTrue(works[graduated_at][1] >= d.graduation_work > works[graduated_at][0])
+        self.assertEqual(works[-1][1], works[graduated_at][1])             # nothing counts for the QWEN curve after it
+        self.assertEqual([f.state.obligation(h)["quote"] for h in range(1, 5)], ["qwen", "btc", "qwen", "btc"])
+        self.assertEqual(f.state.obligation(graduated_at + 2)["quote"], "btc")  # bit set, off the curves: on neither
+        self.assertEqual(f.state.snapshot(), f.rebuilt().snapshot())
+        # the subsidy the rules give each of these blocks, from the same two works
+        self.assertEqual(d.subsidy(0, 0, "qwen", 0x207FFFFF, 1), d.curve_supply(2))
+        self.assertEqual(d.subsidy(0, 2, "btc", 0x207FFFFF, 2), d.curve_supply(2))    # the BTC curve starts at its own zero
+        self.assertEqual(d.subsidy(2, 2, "qwen", 0x207FFFFF, 3), d.curve_supply(4) - d.curve_supply(2))
+        self.assertEqual(d.subsidy(*works[graduated_at], "qwen", 0x207FFFFF, graduated_at + 1), d.tail_reward_at(graduated_at + 1))
+        self.assertLess(d.curve_minted(*works[graduated_at]), 2 * d.graduation_tokens)  # the BTC curve's rest is never minted
 
     def test_the_two_ways_of_reading_a_block_are_checked_against_each_other(self):
         d, node = launch(), FakeNode()

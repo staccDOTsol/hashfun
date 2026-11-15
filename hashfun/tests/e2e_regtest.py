@@ -15,12 +15,19 @@ Phases, in order (each check prints PASS/FAIL):
   9  Electrum servers + HD wallet + maker: atomic swap BTC -> launch coins
   10 sats leg in detail on a third launch: curve blocks owe real BTC to a drawn payee; Bitcoin headers
      and SPV payment proofs ride in coinbases; unsettled coinbases cannot be spent
-  11 the pool settles on its own: Settler relays headers, pays each drawn payee from a Bitcoin
-     wallet and publishes the proofs while a stratum miner mines a fresh sats-leg launch
+  11 the pool settles on its own: two stratum miners at once, one per curve (ADDRESS/btc, ADDRESS/qwen);
+     the Settler relays both chains' headers, pays each block on its own chain (Bitcoin wallet, Qwencoin
+     wallet) and publishes the proofs (HFP1 / HFP2)
+  12 the QWEN leg in detail on phase 10's chain: HFH2 relay (coinbase only), QWEN-curve draws, payments on
+     the Qwencoin stand-in proven with HFP2 at its confirmations; cross-chain proofs and another block's
+     tag do not settle; reorg, maturity, restart
+  13 graduation by the QWEN curve; merge mining starts only there
+Every launch has two curves (TWIN.md): blocks on the QWEN curve owe qwen on a regtest Qwencoin, played
+by a second stock bitcoind (hashfun/tests/qwenreg.py).
 
 --workdir keeps chains, wallets and results between invocations, so the phases
 can be split across processes on hosts that cap a command's runtime:
-  --workdir W --phases 1-6;  --workdir W --phases 7-8;  --workdir W --phases 9;  ... --phases 10;  --phases 11
+  --workdir W --phases 1-6;  --workdir W --phases 7-8;  --workdir W --phases 9;  ... --phases 10;  ... 11, 12, 13
 Genesis is dated a day back and phases 1-6 run on mocktime, so the real-time
 phases (7-9) start with every chain clock behind the wall clock.
 """
@@ -52,7 +59,8 @@ from hashfun.stratum import LaunchSource, MergedSource, StratumServer
 from hashfun.swap import KeyStore, Maker, NodeChain, relay_handler
 from hashfun.wallet import Wallet, LAUNCH_COIN_BASE
 from hashfun import yieldmodel as Y
-from hashfun.settler import Settler
+from hashfun.settler import Settler, merkle_branch
+from hashfun.tests.qwenreg import QwenNode
 
 COIN = 100_000_000
 DAY = 86400
@@ -161,10 +169,15 @@ def solve(header76: bytes, target: int) -> bytes:
 
 
 def block_from_gbt(t, payout_spk, *, extra_value=0, drop_creator=False, bits=None, version=None, auxpow=b"",
-                   extra_outs=(), extra_txs=(), cb_prefix=None):
-    outs = [TxOut(t["coinbasevalue"] + extra_value, payout_spk)]
-    if "creatorfee" in t and not drop_creator:
-        outs.append(TxOut(t["creatorfee"]["amount"], bytes.fromhex(t["creatorfee"]["script"])))
+                   extra_outs=(), extra_txs=(), cb_prefix=None, curve=None):
+    """A block from a template. curve: "btc" or "qwen" takes that curve's version, coinbase value and
+    creator fee from the template's `launchcurves` (before graduation); None: the template's top level
+    (the node's own mining curve)."""
+    c = (t.get("launchcurves") or {}).get(curve) if curve else None
+    c = c or t
+    outs = [TxOut(c["coinbasevalue"] + extra_value, payout_spk)]
+    if "creatorfee" in c and not drop_creator:
+        outs.append(TxOut(c["creatorfee"]["amount"], bytes.fromhex(c["creatorfee"]["script"])))
     outs += list(extra_outs)
     commitment = bytes.fromhex(t["default_witness_commitment"])
     if extra_txs:  # the commitment covers every wtxid, so it has to be redone
@@ -178,7 +191,7 @@ def block_from_gbt(t, payout_spk, *, extra_value=0, drop_creator=False, bits=Non
                                  [b"\0" * 32])], vout=outs)
     txs = [cb] + [Tx.parse(bytes.fromhex(x["data"])) for x in t["transactions"]] + list(extra_txs)
     b = bits if bits is not None else int(t["bits"], 16)
-    v = version if version is not None else t["version"]
+    v = version if version is not None else c["version"]
     hdr = header_bytes(v, bytes.fromhex(t["previousblockhash"])[::-1], merkle_root([x.txid() for x in txs]),
                        t["curtime"], b, 0)
     if not auxpow:
@@ -233,6 +246,11 @@ class E2E:
         a = self.a
         self.btc = Node(a.bitcoind, os.path.join(self.dir, "btc"), ["-regtest"], free_port())
         self.nodes.append(self.btc)
+        # The regtest Qwencoin: a second stock bitcoind, no peers. Every launch here has a QWEN leg on it.
+        self.qn = QwenNode(a.bitcoind, os.path.join(self.dir, "qwen"))
+        self.nodes.append(self.qn)
+        self.wq = self.qn.funded_wallet()
+        self.qwen_addr = self.wq.getnewaddress("", "bech32")
         self.n1 = Node(a.hashfund, os.path.join(self.dir, "n1"), [f"-launch={os.path.join(self.dir, 'GRAD.json')}"],
                        free_port())
         self.nodes.append(self.n1)
@@ -274,6 +292,18 @@ class E2E:
         """Python's own chainwork above genesis, from the headers' nBits."""
         return sum(work_from_bits(self.header(h)[1]) for h in range(1, height + 1))
 
+    def curve_works(self, height):
+        """(Wb, Wq) after block `height`, from the headers: a block's work counts on the QWEN curve when
+        its header has bit 0x200 set (TWIN.md section 3), else on the BTC curve."""
+        wb = wq = 0
+        for h in range(1, height + 1):
+            _, bits, version = self.header(h)
+            if version & D.LAUNCH_VERSION_QWEN:
+                wq += work_from_bits(bits)
+            else:
+                wb += work_from_bits(bits)
+        return wb, wq
+
     def mine_paced(self, node, w, n, addr, spacing):
         """Mine n launch blocks spaced at the target, never behind the wall clock. A real-time
         burst on a 10 s LWMA chain ratchets difficulty ~1.4x per block (phase 7 leaves GRAD at
@@ -295,21 +325,27 @@ class E2E:
         node.rpc.setmocktime(max(int(time.time()), tip["time"] + (6 if heavy else 1) * spacing))
 
     def settle_curve(self, node, d, payout_spk) -> bool:
-        """Every launch has a sats leg, so curve coinbases are locked until their Bitcoin payment
-        is proven. Run the Settler for all of this chain's curve blocks, carrying its headers and
-        proofs in hand-built blocks, until every one of them is spendable."""
+        """Every launch has two legs, so curve coinbases are locked until their payment is proven:
+        sats on Bitcoin for a BTC-curve block, qwen on Qwencoin for a QWEN-curve block. Run the Settler
+        (both wallets) for all of this chain's curve blocks, carrying its headers and proofs in
+        hand-built blocks, until every one of them is spendable."""
         settler = Settler(node.rpc, self.wb, os.path.join(self.dir, f"settler-{d.ticker}-{int(time.time())}.json"),
-                          pay_depth=0)
+                          pay_depth=0, qwen_wallet=self.wq)
         grad = node.rpc.getlaunchinfo()["graduation_height"]
         last = grad if grad > 0 else node.rpc.getblockcount()
         for h in range(1, last + 1):
             settler.add_block(h, node.rpc.getblockhash(h))
-        for _ in range(40):
+        for _ in range(80):  # the Qwencoin relay catches up 8 headers a block
             if all(node.rpc.getmintobligation(h)["spendable"] for h in range(1, last + 1)):
-                print(f"   {d.ticker}: {last} curve blocks settled, {settler.status()}", flush=True)
+                obs = [node.rpc.getmintobligation(h) for h in range(1, last + 1)]
+                self.settled_quotes = sorted({o["quote"] for o in obs if o["settled"]})
+                self.due_quotes = sorted({o["quote"] for o in obs if o.get("pay", 0) > 0})
+                print(f"   {d.ticker}: {last} curve blocks settled (by payment on {self.settled_quotes}, "
+                      f"owed on {self.due_quotes}), {settler.status()}", flush=True)
                 return True
             outs = settler.coinbase_outputs()
             self.wb.generatetoaddress(1, self.btc_addr)
+            self.qn.mine(1, self.qwen_addr)
             self.pace(node, d.target_spacing)
             t = node.rpc.getblocktemplate({"rules": ["segwit"]})
             r = node.rpc.submitblock(ser_block(*block_from_gbt(t, payout_spk, extra_outs=outs)))
@@ -334,22 +370,36 @@ class E2E:
     def p2(self):
         d1, n1 = self.d1, self.n1
         ok, detail = True, ""
-        for _ in range(12):
+        ok_curve, ok_quote = True, True
+        for i in range(12):
+            # every third block on the QWEN curve: both curves have coins before the BTC curve sells out
+            curve = "qwen" if i % 3 == 1 else "btc"
+            n1.rpc.setminecurve(curve)
             self.step(d1.target_spacing)
             blk = n1.rpc.getblock(self.w1.generatetoaddress(1, self.addr1)[0], 2)
             h = blk["height"]
-            model = d1.subsidy(self.rel_work(h - 1), int(blk["bits"], 16), h)
+            on = D.curve_of_version(blk["version"])
+            ok_curve &= on == curve
+            model = d1.subsidy(*self.curve_works(h - 1), on, int(blk["bits"], 16), h)
             total = coinbase_total(blk)
             creator = sum(coins_to_sats(o["value"]) for o in blk["tx"][0]["vout"]
                           if o["scriptPubKey"]["hex"] == self.creator_spk.hex())
             if ok and not (total == model and creator >= d1.creator_fee(model) > 0):
-                ok, detail = False, f"h{h}: coinbase {total} model {model} creator {creator}/{d1.creator_fee(model)}"
-        check("2 coinbase == Python curve subsidy, creator paid", ok, detail)
+                ok, detail = False, f"h{h} ({on}): coinbase {total} model {model} creator {creator}/{d1.creator_fee(model)}"
+            ob = n1.rpc.getmintobligation(h)
+            ok_quote &= ob.get("quote") == on and ob["owed"] == d1.owed(work_from_bits(int(blk["bits"], 16)), on)
+        n1.rpc.setminecurve("btc")
+        check("2 the node's miner puts each block on the curve setminecurve names (header bit 0x200)", ok_curve)
+        check("2 coinbase == Python subsidy on the block's own curve, creator paid", ok, detail)
+        check("2 getmintobligation names each block's quote and owes that curve's rate", ok_quote)
         info = n1.rpc.getlaunchinfo()
-        w = self.rel_work(info["height"])
-        check("2 relative work C++ == Python", int(info["work"], 16) == w, f"{info['work']} vs {w:x}")
-        check("2 curve_supply == Python S(W)", info["curve_supply"] == d1.curve_supply(w),
-              f"{info['curve_supply']} vs {d1.curve_supply(w)}")
+        wb, wq = self.curve_works(info["height"])
+        check("2 relative work C++ == Python", int(info["work"], 16) == wb + wq, f"{info['work']} vs {wb + wq:x}")
+        check("2 each curve's work C++ == Python",
+              (int(info["curves"]["btc"]["work"], 16), int(info["curves"]["qwen"]["work"], 16)) == (wb, wq) and wq > 0,
+              f"{info['curves']['btc']['work']} {info['curves']['qwen']['work']} vs {wb:x} {wq:x}")
+        check("2 curve_supply == Python S(Wb) + S(Wq)", info["curve_supply"] == d1.curve_minted(wb, wq),
+              f"{info['curve_supply']} vs {d1.curve_minted(wb, wq)}")
 
     def p3(self):
         n1, spk = self.n1, self.spk1
@@ -431,7 +481,7 @@ class E2E:
         check("5 stall relief: target 8x easier after 18T", abs(ratio - 8) < 0.01, f"{ratio}")
         r = n1.rpc.submitblock(ser_block(*block_from_gbt(t, self.spk1, bits=base)))
         check("5 stall relief: un-relieved nBits rejected", r == "bad-diffbits", r)
-        model = d1.subsidy(self.rel_work(tip), want, tip + 1)
+        model = d1.subsidy(*self.curve_works(tip), "btc", want, tip + 1)
         check("5 stall relief: relieved block mints by its own work",
               t["coinbasevalue"] + t.get("creatorfee", {}).get("amount", 0) == model,
               f"{t['coinbasevalue']} + fee vs {model}")
@@ -451,20 +501,19 @@ class E2E:
             self.w1.generatetoaddress(1, self.addr1)
         info = n1.rpc.getlaunchinfo()
         tip = info["height"]
-        works = [work_from_bits(self.header(h)[1]) for h in range(1, tip + 1)]
-        acc, model_gh = 0, None
-        for i, wk in enumerate(works, 1):
-            acc += wk
-            if acc >= d1.graduation_work:
-                model_gh = i
-                break
-        check("6 graduation height C++ == Python", info["graduation_height"] == model_gh,
-              f"{info['graduation_height']} vs {model_gh}")
-        check("6 curve supply == G at graduation", info["curve_supply"] == d1.graduation_tokens,
-              f"{info['curve_supply']} vs {d1.graduation_tokens}")
+        model_gh = next((h for h in range(1, tip + 1) if d1.graduated(*self.curve_works(h))), None)
+        check("6 graduation height C++ == Python (the first block where either curve's work reaches W_g)",
+              info["graduation_height"] == model_gh, f"{info['graduation_height']} vs {model_gh}")
+        check("6 the BTC curve sold out first and graduated the launch", info.get("graduated_by") == "btc",
+              str(info.get("graduated_by")))
         if model_gh:
+            wb0, wq0 = self.curve_works(model_gh - 1)
+            check("6 curve supply at graduation == G + what the QWEN curve had sold (the rest of it is never minted)",
+                  info["curve_supply"] == d1.graduation_tokens + d1.curve_supply(wq0) and wq0 > 0
+                  and info["curves"]["qwen"]["supply"] == d1.curve_supply(wq0) < d1.graduation_tokens,
+                  f"{info['curve_supply']} vs {d1.graduation_tokens} + {d1.curve_supply(wq0)}")
             cross = coinbase_total(n1.rpc.getblock(n1.rpc.getblockhash(model_gh), 2))
-            expect = d1.graduation_tokens - d1.curve_supply(sum(works[:model_gh - 1]))
+            expect = d1.graduation_tokens - d1.curve_supply(wb0)
             check("6 crossing block mints exactly up to G", cross == expect, f"{cross} vs {expect}")
         self.step(d1.target_spacing)
         cbv = coinbase_total(n1.rpc.getblock(self.w1.generatetoaddress(1, self.addr1)[0], 2))
@@ -505,7 +554,7 @@ class E2E:
                 continue
             parent = n1.rpc.getblock(n1.rpc.getblockhash(a_h), 1)["auxpow"]["parentblock"]
             parent_hash = sha256d(bytes.fromhex(parent)) if isinstance(parent, str) else bytes.fromhex(parent["hash"])[::-1]
-            pay_amt, payee = Y.compute_draw(ob["owed"], d1.sats_min_payment, Y.draw_seed(d1.id, parent_hash))
+            pay_amt, payee = Y.compute_draw(ob["owed"], d1.min_payment(ob["quote"]), Y.draw_seed(d1.id, parent_hash))
             if payee == 0 and ob["earning"] == 0:
                 pay_amt = 0
             seeded.append((ob["height"], (ob["pay"], ob["payee"]) == (pay_amt, ("holder", "creator", "dev")[payee])))
@@ -549,7 +598,10 @@ class E2E:
         # Coinbase maturity on both chains. BTC regtest never retargets; GRAD is paced.
         wb.generatetoaddress(101, self.btc_addr)
         self.mine_paced(n1, w1, max(2, 102 - n1.rpc.getblockcount()), self.addr1, d1.target_spacing)
-        check("9 curve coinbases unlocked by proven Bitcoin payments (settler)", self.settle_curve(n1, d1, self.spk1))
+        self.settled_quotes = self.due_quotes = None
+        check("9 curve coinbases unlocked by proven payments, each on its own block's chain (settler with both wallets)",
+              self.settle_curve(n1, d1, self.spk1) and self.settled_quotes == self.due_quotes,
+              f"settled on {self.settled_quotes}, owed on {self.due_quotes}")
         for _ in range(20):  # the maker needs mature launch coins before it can lock its leg
             if w1.getbalance() >= 1000:
                 break
@@ -624,8 +676,11 @@ class E2E:
         if os.path.exists(path):
             d = D.load(path)
         else:
+            # The QWEN leg (phase 12) is anchored at the Qwencoin stand-in's tip: few headers to catch up.
+            qtip = self.qn.rpc.getblockcount()
             d = D.make("SATS e2e", "SATS", self.creator_spk, 10**6, test=True, pow_limit_bits=0x207FFFFF,
-                       target_spacing=10, lwma_window=10, genesis_time=int(time.time()) - DAY)
+                       target_spacing=10, lwma_window=10, genesis_time=int(time.time()) - DAY,
+                       qwen_anchor=(qtip, self.qn.header(qtip).hex()))
             d.ftl = 7200
             d.btc_anchor_header = bytes.fromhex(btc.rpc.getblockheader(btc.rpc.getblockhash(0), False))
             d.sats_num, d.sats_shift, d.creator_btc_script = NUM, SHIFT, btc_script(creator_btc)
@@ -882,6 +937,7 @@ class E2E:
         n3 = Node(a.hashfund, os.path.join(self.dir, "n3"), args, free_port())
         self.nodes.append(n3)
         n3.rpc.setmocktime(T[0])
+        self.n3 = n3  # phase 12 goes on with this chain
         check("10 a restarted node rebuilds the same state from its blocks: every obligation, the relay, the earning value",
               [n3.rpc.getmintobligation(h) for h in range(1, tip + 1)] == snap and n3.rpc.getbtcrelay() == relay
               and n3.rpc.getlaunchinfo()["earning"] == earning)
@@ -896,8 +952,10 @@ class E2E:
         creator_btc, miner_btc = wb.getnewaddress("", "bech32"), wb.getnewaddress("", "bech32")
         tag = f"{int(time.time())}"
         path = os.path.join(self.dir, f"AUTO-{tag}.json")
+        qa = max(0, self.qn.rpc.getblockcount() - 20)  # a few coinbases of Qwencoin header catch-up (8 a block)
         d = D.make("AUTO e2e", "AUTO", self.creator_spk, 10**9, test=True, pow_limit_bits=0x207FFFFF,
-                   target_spacing=10, lwma_window=10, genesis_time=int(time.time()) - DAY)
+                   target_spacing=10, lwma_window=10, genesis_time=int(time.time()) - DAY,
+                   qwen_anchor=(qa, self.qn.header(qa).hex()))
         d.ftl = 7200
         d.btc_anchor_height = max(0, btc.rpc.getblockcount() - 450)  # a few coinbases of header catch-up
         d.btc_anchor_header = bytes.fromhex(btc.rpc.getblockheader(btc.rpc.getblockhash(d.btc_anchor_height), False))
@@ -911,23 +969,31 @@ class E2E:
         n4 = Node(a.hashfund, os.path.join(self.dir, f"n4-{tag}"), [f"-launch={path}"], free_port())
         self.nodes.append(n4)
         w4 = open_wallet(n4.rpc)
+        spk_l = lambda addr: address_to_script(addr, d.hrp)  # noqa: E731
         miner_addr = w4.getnewaddress("", "bech32")
-        settler = Settler(n4.rpc, wb, os.path.join(self.dir, f"settler-{tag}.json"), max_pay_sats=COIN, pay_depth=0)
+        miner2_addr = w4.getnewaddress("", "bech32")
+        settler = Settler(n4.rpc, wb, os.path.join(self.dir, f"settler-{tag}.json"), max_pay_sats=COIN, pay_depth=0,
+                          qwen_wallet=self.wq, max_pay_qwen=COIN)
         src = LaunchSource(n4.rpc, d.hrp, d.ticker, settler=settler, yield_hrp="bcrt")
         port = free_port()
         asyncio.run_coroutine_threadsafe(StratumServer(src, "127.0.0.1", port, difficulty=1e-6,
                                                        poll_interval=0.2).serve(), self.loop)
         time.sleep(1)
-        m = StratumMiner("127.0.0.1", port, f"{miner_addr},{miner_btc}", batch=4096)
-        FIRST = 8  # the first FIRST pool blocks must all end up spendable
+        # Two miners on one pool at once, one on each curve (the username names it).
+        m = StratumMiner("127.0.0.1", port, f"{miner_addr}/btc,{miner_btc}", batch=4096)
+        mq = StratumMiner("127.0.0.1", port, f"{miner2_addr}/qwen,{miner_btc}", batch=4096)
+        FIRST = 12  # the first FIRST pool blocks must all end up spendable
         t0 = time.time()
 
         def obligations():
             return [n4.rpc.getmintobligation(h) for h in range(1, min(n4.rpc.getblockcount(), FIRST) + 1)]
 
-        while time.time() - t0 < 110:
-            asyncio.run_coroutine_threadsafe(m.run(duration=1.0), self.loop).result(60)
+        while time.time() - t0 < 150:
+            futs = [asyncio.run_coroutine_threadsafe(x.run(duration=1.0), self.loop) for x in (m, mq)]
+            for f in futs:
+                f.result(60)
             wb.generatetoaddress(1, self.btc_addr)
+            self.qn.mine(1, self.qwen_addr)
             obs = obligations()
             if len(obs) == FIRST and all(o["spendable"] for o in obs):
                 break
@@ -936,15 +1002,52 @@ class E2E:
         allobs = [n4.rpc.getmintobligation(h) for h in range(1, tip + 1)]
         paid = [o for o in allobs if o["settled"]]
         lottery_free = [o for o in allobs if o["draw_known"] and o["pay"] == 0]
-        print(f"   AUTO: {tip} blocks in {time.time() - t0:.0f}s; settled by payment {len(paid)}, "
+        print(f"   AUTO: {tip} blocks in {time.time() - t0:.0f}s ({sum(o['quote'] == 'qwen' for o in allobs)} on the QWEN curve); "
+              f"settled by payment {len(paid)} ({sum(o['quote'] == 'qwen' for o in paid)} on Qwencoin), "
               f"nothing due {len(lottery_free)}, relay at {n4.rpc.getbtcrelay()['height']}/{btc.rpc.getblockcount()}, "
+              f"Qwencoin relay at {n4.rpc.getqwenrelay()['height']}/{self.qn.rpc.getblockcount()}, "
               f"settler {settler.status()}", flush=True)
         check("11 pool mined a sats-leg launch through stratum", tip >= FIRST, f"{tip} blocks")
         check("11 first blocks all spendable without manual steps", len(obs) == FIRST and all(o["spendable"] for o in obs),
               json.dumps([(o["height"], o.get("pay"), o["settled"]) for o in obs]))
-        check("11 settler paid and proved at least one obligation on Bitcoin", len(paid) >= 1, f"{len(paid)}")
+        check("11 settler paid and proved at least one obligation on Bitcoin", any(o["quote"] == "btc" for o in paid),
+              f"{len(paid)}")
+        check("11 settler paid and proved at least one obligation on Qwencoin", any(o["quote"] == "qwen" for o in paid),
+              f"{len(paid)}")
         check("11 settler relayed Bitcoin headers through coinbases",
               n4.rpc.getbtcrelay()["height"] >= btc.rpc.getblockcount() - 3, json.dumps(n4.rpc.getbtcrelay()))
+        check("11 settler relayed Qwencoin headers (HFH2) through coinbases",
+              n4.rpc.getqwenrelay()["height"] >= self.qn.rpc.getblockcount() - 3, json.dumps(n4.rpc.getqwenrelay()))
+        # Who mined what: the username's curve decided each block's header bit, and each block was paid
+        # on its own chain. A proof names the block of its payment; the two stand-ins share only genesis,
+        # so a Bitcoin block hash is unknown to the Qwencoin node and the reverse.
+        by_curve = {"btc": set(), "qwen": set()}
+        proofs, wrong = 0, []
+        for h in range(1, tip + 1):
+            blk = n4.rpc.getblock(n4.rpc.getblockhash(h), 2)
+            cb0 = blk["tx"][0]["vout"][0]["scriptPubKey"]["hex"]
+            by_curve[D.curve_of_version(blk["version"])].add(cb0)
+            for o in blk["tx"][0]["vout"]:
+                sc = bytes.fromhex(o["scriptPubKey"]["hex"])
+                for quote, node in (("btc", btc.rpc), ("qwen", self.qn.rpc)):
+                    data = Y.tagged_return(sc, Y.PROOF_TAG[quote])
+                    pr = Y.PaymentProof.parse(data) if data else None
+                    if pr is None:
+                        continue
+                    proofs += 1
+                    try:
+                        node.getblockheader(pr.btc_block[::-1].hex())
+                        on_chain = True
+                    except RPCError:
+                        on_chain = False
+                    if not on_chain or n4.rpc.getmintobligation(pr.mint_height)["quote"] != quote:
+                        wrong.append((h, quote, pr.mint_height))
+        a_spk, q_spk = spk_l(miner_addr).hex(), spk_l(miner2_addr).hex()
+        check("11 two miners at once: ADDRESS/btc got only BTC-curve blocks and ADDRESS/qwen only QWEN-curve blocks",
+              a_spk in by_curve["btc"] and q_spk in by_curve["qwen"] and a_spk not in by_curve["qwen"]
+              and q_spk not in by_curve["btc"], f"{ {k: sorted(v) for k, v in by_curve.items()} } btc miner {a_spk} qwen miner {q_spk}")
+        check("11 every proof the settler published names a block of its own chain and settles a block of that quote",
+              proofs >= 2 and not wrong, f"{proofs} proofs, wrong {wrong}")
         cb = n4.rpc.getblock(n4.rpc.getblockhash(2), 2)["tx"][0]
         check("11 miner's coinbase is registered for BTC yield at its Bitcoin address",
               any(o["scriptPubKey"]["hex"] == Y.yield_tag_script(spk(miner_btc)).hex() for o in cb["vout"]))
@@ -953,6 +1056,345 @@ class E2E:
             check("11 holder draws go to the miner's redirect address or the creator's own script",
                   all(o["pay_script"] in (spk(miner_btc).hex(), self.creator_spk.hex()) and o.get("coin") for o in holders),
                   json.dumps(holders[0]))
+
+    # ------------------------------------------------------------ phase 12: the QWEN leg in detail
+    def p12(self):
+        """Phase 10's SATS chain again, now with blocks on the QWEN curve: Qwencoin headers relayed with
+        HFH2 (in a coinbase only), payments on the Qwencoin stand-in proven with HFP2, and the proofs
+        that must not settle: a payment on the wrong chain under either tag, another block's tag, too
+        few confirmations."""
+        a, btc, wb, qn, wq = self.a, self.btc, self.wb, self.qn, self.wq
+        btc.rpc.setmocktime(0)
+        path = os.path.join(self.dir, "SATS.json")
+        if not os.path.exists(path):
+            raise RuntimeError("phase 12 continues phase 10's SATS chain")
+        d = D.load(path)
+        dev_spk = bytes.fromhex("5120c2cc659454f102e1b1ae85697405163154acc4a8946f6065f7821913ea29aa53")
+        args = [f"-launch={path}", "-datacarriersize=1000000"]
+        if getattr(self, "n3", None):  # phase 10 ran in this process: its node holds the data directory
+            self.n3.stop()
+            self.nodes.remove(self.n3)
+        n3 = Node(a.hashfund, os.path.join(self.dir, "n3"), args, free_port())
+        self.nodes.append(n3)
+        T = [d.genesis_time + 100 + 10 * n3.rpc.getblockcount()]
+        n3.rpc.setmocktime(T[0])
+        w3 = open_wallet(n3.rpc)
+        pay_addr = w3.getnewaddress("", "legacy")
+        pay_spk = bytes.fromhex(w3.getaddressinfo(pay_addr)["scriptPubKey"])
+        raw = lambda hexhash: bytes.fromhex(hexhash)[::-1]  # noqa: E731
+        chains = {"btc": (btc.rpc, wb), "qwen": (qn.rpc, wq)}
+        relay_rpc = {"btc": n3.rpc.getbtcrelay, "qwen": n3.rpc.getqwenrelay}
+        cbs = {}
+
+        def obl(h):
+            return n3.rpc.getmintobligation(h)
+
+        def mine(extra_outs=(), extra_txs=(), curve=None, expect=None):
+            T[0] += d.target_spacing
+            n3.rpc.setmocktime(T[0])
+            t = n3.rpc.getblocktemplate({"rules": ["segwit"]})
+            hdr, txs = block_from_gbt(t, pay_spk, extra_outs=extra_outs, extra_txs=extra_txs, curve=curve)
+            r = n3.rpc.submitblock(ser_block(hdr, txs))
+            if r != expect:
+                raise RuntimeError(f"submitblock: {r}")
+            if r is None:
+                cbs[t["height"]] = txs[0]
+            return t["height"]
+
+        def headers(quote):
+            node, have = chains[quote][0], relay_rpc[quote]()
+            tip = node.getblockcount()
+            last = min(tip, have["height"] + (Y.MAX_QWEN_PASSES if quote == "qwen" else 200))
+            return b"".join(bytes.fromhex(node.getblockheader(node.getblockhash(h), False))
+                            for h in range(have["height"] + 1, last + 1))
+
+        def relay(*quotes):
+            outs = []
+            for q in quotes:
+                hdrs = headers(q)
+                if hdrs:
+                    outs.append(TxOut(0, Y.op_return(Y.HEADER_TAG[q] + hdrs)))
+            return outs
+
+        def caught_up(quote):
+            r = relay_rpc[quote]()
+            return r["height"] == chains[quote][0].getblockcount() and r["best"] == chains[quote][0].getbestblockhash()
+
+        def catch_up():
+            for _ in range(40):
+                if caught_up("btc") and caught_up("qwen"):
+                    return
+                mine(relay("btc", "qwen"))
+            raise RuntimeError("the relays did not catch up")
+
+        def pay(height, chain, *, tag=None):
+            """Pay block `height`'s draw on `chain` (its script, its amount, one tag list); returns the txid."""
+            ob = obl(height)
+            rawtx = Tx(version=2, vin=[], vout=[TxOut(ob["pay"], bytes.fromhex(ob["pay_script"])),
+                                                TxOut(0, Y.payment_outputs_tag([bytes.fromhex(tag or ob["tag"])]))])
+            w = chains[chain][1]
+            funded = w.fundrawtransaction(rawtx.serialize(witness=False).hex(), {"changePosition": 2}, False)
+            return w.sendrawtransaction(w.signrawtransactionwithwallet(funded["hex"])["hex"])
+
+        def confirm(chain, n):
+            if chain == "btc":
+                wb.generatetoaddress(n, self.btc_addr)
+            else:
+                qn.mine(n, self.qwen_addr)
+
+        def proof(height, txid, chain, tag_quote):
+            """The SPV proof of payment `txid` (output 0) on `chain`, under the tag of `tag_quote`
+            (HFP1 for "btc", HFP2 for "qwen")."""
+            node, w = chains[chain]
+            bh = w.gettransaction(txid)["blockhash"]
+            txids = node.getblock(bh, 1)["tx"]
+            pos = txids.index(txid)
+            nowit = Tx.parse(bytes.fromhex(node.getrawtransaction(txid))).serialize(witness=False)
+            pr = Y.PaymentProof(height, raw(bh), pos, merkle_branch([raw(x) for x in txids], pos), 0, 0, nowit)
+            return TxOut(0, Y.op_return(pr.payload(tag_quote)))
+
+        catch_up()
+        check("12 Qwencoin headers relayed with HFH2 in coinbases are tracked (at most 8 a block)",
+              caught_up("qwen") and n3.rpc.getqwenrelay()["confirmations_required"] == d.qwen_confs == 2,
+              json.dumps(n3.rpc.getqwenrelay()))
+
+        # HFH2 counts in a coinbase only; HFH1 still counts in any transaction.
+        confirm("qwen", 1)
+        confirm("btc", 1)
+        q_before, b_before = n3.rpc.getqwenrelay(), n3.rpc.getbtcrelay()
+        coin = max((u for u in w3.listunspent(1) if u["spendable"]), key=lambda u: u["amount"], default=None)
+        if coin is None or coin["amount"] < 0.01:
+            raise RuntimeError(f"phase 12 needs a spendable coin in the SATS wallet: {coin}")
+        rt = Tx.parse(bytes.fromhex(w3.createrawtransaction([{"txid": coin["txid"], "vout": coin["vout"]}],
+                                                            [{pay_addr: f"{coin['amount'] - 0.001:.8f}"}])))
+        rt.vout += relay("qwen") + relay("btc")
+        signed = w3.signrawtransactionwithwallet(rt.serialize(witness=False).hex())
+        if not signed.get("complete"):
+            raise RuntimeError(f"could not sign: {signed}")
+        side = Tx.parse(bytes.fromhex(signed["hex"]))
+        mine(extra_txs=[side])
+        in_block = n3.rpc.getrawtransaction(side.txid()[::-1].hex(), True).get("confirmations", 0) >= 1
+        check("12 an HFH2 output in a transaction that is not the coinbase is ignored",
+              in_block and n3.rpc.getqwenrelay() == q_before, f"in a block {in_block}, {json.dumps(n3.rpc.getqwenrelay())}")
+        check("12 (HFH1 in the same transaction still counts)",
+              n3.rpc.getbtcrelay()["height"] == b_before["height"] + 1 and caught_up("btc"), json.dumps(n3.rpc.getbtcrelay()))
+        mine(relay("qwen"))
+        check("12 the same Qwencoin header in a coinbase is taken", caught_up("qwen"), json.dumps(n3.rpc.getqwenrelay()))
+
+        # Four blocks on the QWEN curve, then enough on the BTC curve for their draws.
+        qs = [mine(curve="qwen") for _ in range(4)]
+        for _ in range(Y.DRAW_DELAY + 1):
+            mine()
+        ok, detail = True, ""
+        for h in qs:
+            ob = obl(h)
+            hdr = n3.rpc.getblockheader(ob["hash"])
+            owed = d.owed(work_from_bits(int(hdr["bits"], 16)), "qwen")
+            seed = Y.draw_seed(d.id, raw(n3.rpc.getblockhash(h + Y.DRAW_DELAY)))
+            pay_amt, payee = Y.compute_draw(owed, d.min_payment("qwen"), seed)
+            if payee == 0 and ob["earning"] == 0:
+                pay_amt = 0
+            want = (True, True, "qwen", owed, True, pay_amt, ("holder", "creator", "dev")[payee],
+                    Y.pay_tag(d.id, raw(ob["hash"])).hex(), False)
+            got = (bool(hdr["version"] & D.LAUNCH_VERSION_QWEN), ob["curve"], ob["quote"], ob["owed"], ob["draw_known"],
+                   ob["pay"], ob["payee"], ob["tag"], ob["settled"])
+            script_ok = pay_amt == 0 or ob["pay_script"] == {"creator": d.creator_qwen_script, "dev": dev_spk}.get(
+                ob["payee"], bytes.fromhex(ob.get("pay_script", ""))).hex()
+            if got != want or not script_ok or (ob["payee"] == "holder" and pay_amt and not ob.get("coin")):
+                ok, detail = False, f"h{h}: {got} vs {want} {ob.get('pay_script')}"
+        check("12 a QWEN-curve block owes qwen at qwen_num / qwen_shift, its draw uses qwen_min_payment and the creator's "
+              "Qwencoin script: C++ == Python", ok, detail)
+        due = [h for h in qs if obl(h)["pay"] > 0]
+        if len(due) < 3:
+            raise RuntimeError(f"phase 12 needs three QWEN-curve blocks with something due: {due}")
+        q1, q2, q3 = due[:3]
+        tip = n3.rpc.getblockcount()
+        b1 = next((h for h in range(tip - Y.DRAW_DELAY, 0, -1) if obl(h)["quote"] == "btc" and obl(h)["draw_known"]
+                   and obl(h).get("pay", 0) > 0 and not obl(h)["settled"] and obl(h)["deadline_height"] > tip + 40), None)
+        if b1 is None:
+            raise RuntimeError("phase 12 needs an unsettled BTC-curve block with something due")
+
+        # A correct payment on Bitcoin for a QWEN-curve block: neither HFP1 nor HFP2 settles it.
+        tx = pay(q1, "btc")
+        confirm("btc", 1)
+        mine(relay("btc"))
+        mine([proof(q1, tx, "btc", "btc"), proof(q1, tx, "btc", "qwen")])
+        check("12 a correct payment made on Bitcoin does not settle a QWEN-curve block (proven as HFP1 or as HFP2)",
+              obl(q1)["settled"] is False, json.dumps(obl(q1)))
+        # And the reverse: a correct payment on Qwencoin for a BTC-curve block.
+        tx = pay(b1, "qwen")
+        confirm("qwen", 2)
+        mine(relay("qwen"))
+        mine([proof(b1, tx, "qwen", "qwen"), proof(b1, tx, "qwen", "btc")])
+        check("12 a correct payment made on Qwencoin does not settle a BTC-curve block (proven as HFP2 or as HFP1)",
+              caught_up("qwen") and obl(b1)["settled"] is False, json.dumps(obl(b1)))
+        # The right chain and the right script, another block's tag.
+        tx = pay(q2, "qwen", tag=obl(q3)["tag"])
+        confirm("qwen", 2)
+        mine(relay("qwen"))
+        mine([proof(q2, tx, "qwen", "qwen")])
+        check("12 a payment on Qwencoin to the right script carrying another block's tag does not settle",
+              obl(q2)["settled"] is False and obl(q3)["settled"] is False, json.dumps(obl(q2)))
+        # The right payment: it counts once it has qwen_confs (2) confirmations on the Qwencoin relay.
+        tx = pay(q1, "qwen")
+        confirm("qwen", 1)
+        mine(relay("qwen"))
+        good = proof(q1, tx, "qwen", "qwen")
+        mine([good])
+        one_conf = obl(q1)["settled"]
+        confirm("qwen", 1)
+        relay_h = mine(relay("qwen"))
+        mine([good])
+        o = obl(q1)
+        check("12 a Qwencoin payment proven with HFP2 settles the QWEN-curve block at 2 confirmations, not at 1",
+              one_conf is False and o["settled"] and o["spendable"], f"at one confirmation {one_conf}; {json.dumps(o)}")
+        tx = pay(b1, "btc")
+        confirm("btc", 1)
+        mine(relay("btc"))
+        mine([proof(b1, tx, "btc", "btc")])
+        check("12 the BTC-curve block settles with its own Bitcoin payment and HFP1", obl(b1)["settled"], json.dumps(obl(b1)))
+        # A reorg of the launch chain takes the Qwencoin header and the settlement away, and back.
+        q_after, earning = n3.rpc.getqwenrelay(), n3.rpc.getlaunchinfo()["earning"]
+        top = n3.rpc.getbestblockhash()
+        rh = n3.rpc.getblockhash(relay_h)
+        n3.rpc.invalidateblock(rh)
+        undone = obl(q1)["settled"] is False and n3.rpc.getqwenrelay()["height"] == q_after["height"] - 1
+        n3.rpc.reconsiderblock(rh)
+        check("12 a reorg of the launch chain undoes and redoes the HFH2 header and the HFP2 settlement",
+              undone and n3.rpc.getbestblockhash() == top and obl(q1)["settled"] and n3.rpc.getqwenrelay() == q_after
+              and n3.rpc.getlaunchinfo()["earning"] == earning, f"undone {undone}")
+
+        def spend(h, fee=10_000):
+            cb = cbs[h]
+            rawtx = w3.createrawtransaction([{"txid": cb.txid()[::-1].hex(), "vout": 0}],
+                                            {pay_addr: (cb.vout[0].value - fee) / COIN})
+            return w3.signrawtransactionwithwallet(rawtx)["hex"]
+
+        while n3.rpc.getblockcount() < max(q1, q2) + 101:
+            mine()
+        r1, r2 = n3.rpc.testmempoolaccept([spend(q1)])[0], n3.rpc.testmempoolaccept([spend(q2)])[0]
+        check("12 the settled QWEN-curve coinbase is spendable after maturity; an unsettled one is not",
+              r1["allowed"] and not r2["allowed"] and r2.get("reject-reason") == "bad-txns-unsettled-coinbase",
+              json.dumps([r1, r2]))
+        sent = n3.rpc.sendrawtransaction(spend(q1))
+        mine()
+        check("12 (and the spend is mined)", n3.rpc.getrawtransaction(sent, True).get("confirmations", 0) >= 1)
+        tip = n3.rpc.getblockcount()
+        snap = [obl(h) for h in range(1, tip + 1)]
+        relays, earning = (n3.rpc.getbtcrelay(), n3.rpc.getqwenrelay()), n3.rpc.getlaunchinfo()["earning"]
+        curves = n3.rpc.getlaunchinfo()["curves"]
+        n3.stop()
+        self.nodes.remove(n3)
+        n3 = Node(a.hashfund, os.path.join(self.dir, "n3"), args, free_port())
+        self.nodes.append(n3)
+        n3.rpc.setmocktime(T[0])
+        check("12 a restarted node rebuilds the same state: every obligation, both relays, both curves, the earning value",
+              [n3.rpc.getmintobligation(h) for h in range(1, tip + 1)] == snap
+              and (n3.rpc.getbtcrelay(), n3.rpc.getqwenrelay()) == relays
+              and n3.rpc.getlaunchinfo()["earning"] == earning and n3.rpc.getlaunchinfo()["curves"] == curves)
+
+    # ------------------------------------------------------------ phase 13: graduation by the QWEN curve
+    def p13(self):
+        """A launch whose QWEN curve sells out first: it graduates on it, the BTC curve's unsold part is
+        never minted, and merge mining starts there and not before."""
+        a = self.a
+        path = os.path.join(self.dir, "QGRD.json")
+        if os.path.exists(path):
+            d = D.load(path)
+        else:
+            d = mk_launch("QGRD", self.creator_spk, 20, int(time.time()) - DAY)
+            with open(path, "w") as f:
+                f.write(d.dumps())
+        n5 = Node(a.hashfund, os.path.join(self.dir, "n5"), [f"-launch={path}"], free_port())
+        self.nodes.append(n5)
+        T = [d.genesis_time + 100 + 10 * n5.rpc.getblockcount()]
+        n5.rpc.setmocktime(T[0])
+        w5 = open_wallet(n5.rpc)
+        addr = w5.getnewaddress("", "bech32")
+        spk = address_to_script(addr, d.hrp)
+        if n5.rpc.getlaunchinfo()["graduated"]:
+            raise RuntimeError("phase 13 needs a fresh QGRD chain (new --workdir)")
+
+        def block(curve):
+            T[0] += d.target_spacing
+            n5.rpc.setmocktime(T[0])
+            n5.rpc.setminecurve(curve)
+            return w5.generatetoaddress(1, addr)[0]
+
+        def aux_block(version):
+            T[0] += d.target_spacing
+            n5.rpc.setmocktime(T[0])
+            t = n5.rpc.getblocktemplate({"rules": ["segwit"]})
+            hdr, txs = block_from_gbt(t, spk, version=version(t) | 0x100, auxpow=b"pending")
+            tree = AuxTree({d.chain_id: sha256d(hdr)})
+            pcb = Tx(version=1, vin=[TxIn(b"\0" * 32, 0xFFFFFFFF, push_int(1) + tree.commitment_push(), 0xFFFFFFFF)],
+                     vout=[TxOut(0, b"\x6a")])
+            phdr = solve(header_bytes(0x20000000, os.urandom(32), pcb.txid(), t["curtime"], 0x207FFFFF, 0)[:76],
+                         bits_to_target(int(t["bits"], 16)))
+            return n5.rpc.submitblock(ser_block(hdr, txs, serialize_auxpow(pcb, [], [], 0, phdr)))
+
+        for _ in range(3):
+            block("btc")
+        works = []  # (curve, work) per height from 1
+        for _ in range(400):
+            info = n5.rpc.getlaunchinfo()
+            if info["graduated"]:
+                break
+            if len(works) == 6:  # well before graduation: merge mining is refused on either curve
+                try:
+                    n5.rpc.createauxblock(addr)
+                    pre_cab = "accepted"
+                except RPCError as e:
+                    pre_cab = e.message or ""
+                pre_aux = aux_block(lambda t: t["version"])
+            block("qwen")
+            works = []
+            for h in range(1, n5.rpc.getblockcount() + 1):
+                hh = n5.rpc.getblockheader(n5.rpc.getblockhash(h))
+                works.append((D.curve_of_version(hh["version"]), work_from_bits(int(hh["bits"], 16))))
+        check("13 before graduation merge mining is refused (createauxblock and a hand-built AuxPoW block)",
+              "graduat" in pre_cab and pre_aux == "auxpow-before-graduation", f"{pre_cab} / {pre_aux}")
+        info = n5.rpc.getlaunchinfo()
+        wb = wq = 0
+        model_gh = None
+        for h, (c, wk) in enumerate(works, 1):
+            before = (wb, wq)
+            if c == "qwen":
+                wq += wk
+            else:
+                wb += wk
+            if model_gh is None and d.graduated(wb, wq):
+                model_gh, at_cross = h, before
+        check("13 the QWEN curve sold out first: the launch graduated on it, at the height the model says",
+              info["graduated"] and info.get("graduated_by") == "qwen" and info["graduation_height"] == model_gh,
+              f"{info.get('graduated_by')} {info['graduation_height']} vs {model_gh}")
+        wb0, wq0 = at_cross
+        cross = coinbase_total(n5.rpc.getblock(n5.rpc.getblockhash(model_gh), 2))
+        check("13 the crossing block mints exactly up to G on the QWEN curve", cross == d.graduation_tokens - d.curve_supply(wq0),
+              f"{cross} vs {d.graduation_tokens - d.curve_supply(wq0)}")
+        check("13 the BTC curve's unsold part is never minted: curve supply is G + what the BTC curve had sold",
+              info["curve_supply"] == d.graduation_tokens + d.curve_supply(wb0) and 0 < d.curve_supply(wb0) < d.graduation_tokens
+              and info["curves"]["btc"]["supply"] == d.curve_supply(wb0), f"{info['curve_supply']}")
+        n5.rpc.setminecurve("qwen")
+        T[0] += d.target_spacing
+        n5.rpc.setmocktime(T[0])
+        t = n5.rpc.getblocktemplate({"rules": ["segwit"]})
+        check("13 after graduation the template has no curves and the bit stays clear, whatever the mining curve",
+              "launchcurves" not in t and not t["version"] & D.LAUNCH_VERSION_QWEN and info["next"]["auxpow_allowed"] is True,
+              f"{t.get('launchcurves')} {t['version']:#x}")
+        try:
+            n5.rpc.createauxblock(addr)
+            cab = None
+        except RPCError as e:
+            cab = e.message
+        r_bad = aux_block(lambda t: t["version"] | D.LAUNCH_VERSION_QWEN)
+        r_good = aux_block(lambda t: t["version"])
+        tipv = n5.rpc.getblockheader(n5.rpc.getbestblockhash())["version"]
+        check("13 merge mining starts at graduation: createauxblock works and an AuxPoW block is accepted",
+              cab is None and r_good is None and tipv & 0x100, f"{cab} / {r_good}")
+        check("13 an AuxPoW block that claims the QWEN curve is refused", r_bad == "bad-curve-version", str(r_bad))
+        cbv = coinbase_total(n5.rpc.getblock(n5.rpc.getbestblockhash(), 2))
+        check("13 the merge-mined block mints the tail", cbv == d.tail_reward_at(n5.rpc.getblockcount()), str(cbv))
 
 
 def parse_phases(s):
@@ -968,7 +1410,7 @@ def main():
     ap.add_argument("--hashfund", required=True)
     ap.add_argument("--bitcoind", required=True, help="stock Bitcoin Core bitcoind")
     ap.add_argument("--workdir", help="persist chains, wallets and results here (lets --phases span runs)")
-    ap.add_argument("--phases", default="1-11", help="e.g. 1-6 or 7,8 (in order, each once)")
+    ap.add_argument("--phases", default="1-13", help="e.g. 1-6 or 7,8 (in order, each once)")
     ap.add_argument("--keep", action="store_true", help="keep the temporary datadirs")
     a = ap.parse_args()
     phases = parse_phases(a.phases)

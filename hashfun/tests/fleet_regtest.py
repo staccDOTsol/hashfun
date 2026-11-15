@@ -19,9 +19,18 @@ mining RPCs gated on peers); only the Bitcoin their sats leg follows is regtest.
       settler pays nothing for the orphaned blocks
   F8  a second launch graduates and is merge-mined by the first launch's pool; AuxPoW blocks
       propagate and a late joiner syncs the mixed chain
-  F9  verifychain; two pools with two Bitcoin wallets settle everything they mined
+  F9  verifychain; two pools, one on each curve, each settler with one wallet (pool A: Bitcoin,
+      pool B: Qwencoin) settle everything they mined; neither pays a block on the other curve
   F10 stall relief in real time: a cached template is rebuilt when the clock enters the next
       relief step (getblocktemplate and createauxblock), nBits equals the model, peers accept
+  F11 a reorganisation on Qwencoin removes the block of a payment after its headers reached the
+      launch: the proof made for it stops counting; the settler, restarted in the middle, makes
+      it again against the payment's new block, and pays nothing twice
+
+Every launch has two curves (TWIN.md). A second stock bitcoind plays the regtest Qwencoin
+(hashfun/tests/qwenreg.py), with a block every 2 s like Bitcoin. Pool A mines the BTC curve with a
+settler that has only a Bitcoin wallet and relays Qwencoin headers from a node; pool B mines the QWEN
+curve with a settler that has only a Qwencoin wallet and relays Bitcoin headers from a node.
 """
 import argparse
 import asyncio
@@ -45,6 +54,7 @@ from hashfun.ser import TxOut, address_to_script, bits_to_target, header_bytes
 from hashfun.settler import Settler
 from hashfun.stratum import LaunchSource, StratumServer
 from hashfun.tests.e2e_regtest import RESULTS, check, free_port, open_wallet, block_from_gbt, ser_block, COIN, DAY
+from hashfun.tests.qwenreg import QwenNode
 
 GBT = {"rules": ["segwit"]}
 
@@ -116,32 +126,48 @@ class FNode:
 
 
 class BtcTicker(threading.Thread):
-    """Bitcoin, compressed: a regtest block every `interval` seconds."""
+    """Bitcoin (or the Qwencoin stand-in), compressed: a regtest block every `interval` seconds."""
 
     def __init__(self, wallet: RPC, addr: str, interval: float):
         super().__init__(daemon=True)
         self.wallet, self.addr, self.interval = wallet, addr, interval
         self.halt = threading.Event()
+        self.hold = threading.Event()  # set: no blocks for now
+        self.idle = threading.Event()
 
     def run(self):
         while not self.halt.wait(self.interval):
+            if self.hold.is_set():
+                self.idle.set()
+                continue
+            self.idle.clear()
             try:
                 self.wallet.generatetoaddress(1, self.addr)
             except Exception:
                 pass
+
+    def pause(self):
+        self.hold.set()
+        self.idle.clear()
+        self.idle.wait(3 * self.interval + 5)
+
+    def resume(self):
+        self.hold.clear()
 
 
 class Rig:
     """What `hashfun mine` runs: a pool on one node (templates, settler, merge-mined children)
     and a CPU miner pointed at it."""
 
-    def __init__(self, loop, node, d, payout, btc_payout, settler, children=None, duty=1.0):
+    def __init__(self, loop, node, d, payout, btc_payout, settler, children=None, duty=1.0, curve="btc"):
         self.loop, self.node, self.settler = loop, node, settler
-        self.src = LaunchSource(node.rpc, d.hrp, d.ticker, settler=settler, yield_hrp="bcrt", children=children)
+        self.src = LaunchSource(node.rpc, d.hrp, d.ticker, settler=settler, yield_hrp="bcrt", children=children,
+                                curve=curve)
         self.port = free_port()
         self.server = StratumServer(self.src, "127.0.0.1", self.port, difficulty=2e-6, poll_interval=0.2)
         asyncio.run_coroutine_threadsafe(self.server.serve(), loop)
-        self.miner = StratumMiner("127.0.0.1", self.port, f"{payout},{btc_payout}", batch=4096, duty=duty)
+        # the curve in the username too, the way a miner picks it
+        self.miner = StratumMiner("127.0.0.1", self.port, f"{payout}/{curve},{btc_payout}", batch=4096, duty=duty)
         self.fut = None
         time.sleep(0.6)
 
@@ -181,21 +207,23 @@ FLOOR_WORK = 32768
 
 
 def mk_launch(ticker, creator_spk, creator_btc_spk, graduation_hashes):
-    """Production-mode launch on a regtest Bitcoin: 2 s blocks, a floor a CPU miner clears in a
-    fraction of a second, and 1/4 sat per hash, so blocks owe real sats from the start (a
-    floor block's 8,192 sats are a lottery for the 10,000 minimum; heavier blocks pay in full).
+    """Production-mode launch on a regtest Bitcoin and a regtest Qwencoin: 2 s blocks, a floor a CPU
+    miner clears in a fraction of a second, 1/4 sat per hash on the BTC curve, so blocks owe real sats
+    from the start (a floor block's 8,192 sats are a lottery for the 10,000 minimum; heavier blocks pay
+    in full), and 1/2 qwen-sat per hash on the QWEN curve (always above the minimum).
     LWMA raises difficulty about 8% per block at best with this window, so a CPU pool reaches
     its 2 s equilibrium within a few dozen blocks."""
     d = D.make(f"{ticker} fleet", ticker, creator_spk, graduation_hashes, test=False, btc_regtest=True,
                pow_limit_bits=FLOOR_BITS, target_spacing=2, lwma_window=15, genesis_time=int(time.time()) - 2 * DAY,
-               creator_btc_script=creator_btc_spk, _validate=False)
+               creator_btc_script=creator_btc_spk, qwen_regtest=True, _validate=False)
     d.sats_num, d.sats_shift = 1, 2
+    d.qwen_num, d.qwen_shift = 1, 1
     D.validate(d)
     d.grind_genesis()
     return d
 
 
-def mine_gbt(node, payout_spk, extra_outs=()):
+def mine_gbt(node, payout_spk, extra_outs=(), curve=None):
     """One block by hand from getblocktemplate (plain PoW solved in Python). No settler knows it."""
     for _ in range(200):
         try:
@@ -209,7 +237,7 @@ def mine_gbt(node, payout_spk, extra_outs=()):
             time.sleep(0.25)
     else:
         raise RuntimeError("template stayed time-too-new")
-    hdr, txs = block_from_gbt(t, payout_spk, extra_outs=extra_outs)
+    hdr, txs = block_from_gbt(t, payout_spk, extra_outs=extra_outs, curve=curve)
     r = node.rpc.submitblock(ser_block(hdr, txs))
     if r is not None:
         raise RuntimeError(f"hand-built block rejected: {r}")
@@ -242,7 +270,7 @@ def snapshot(node) -> dict:
     info = r.getlaunchinfo()
     return {"tip": best, "height": tip["height"], "chainwork": tip["chainwork"],
             "launch": {k: info.get(k) for k in ("graduated", "graduation_height", "curve_supply")},
-            "relay": r.getbtcrelay(), "utxo": r.gettxoutsetinfo("muhash")["muhash"],
+            "relay": r.getbtcrelay(), "qrelay": r.getqwenrelay(), "utxo": r.gettxoutsetinfo("muhash")["muhash"],
             "obligations": [r.getmintobligation(h) for h in range(1, tip["height"] + 1)],
             "still": r.getbestblockhash() == best}
 
@@ -280,7 +308,7 @@ class Fleet:
         self.a = a
         self.dir = os.path.abspath(a.workdir) if a.workdir else tempfile.mkdtemp(prefix="hashfun-fleet-")
         os.makedirs(self.dir, exist_ok=True)
-        self.nodes, self.rigs, self.ticker = [], [], None
+        self.nodes, self.rigs, self.ticker, self.qticker = [], [], None, None
         self.loop = asyncio.new_event_loop()
         threading.Thread(target=self.loop.run_forever, daemon=True).start()
 
@@ -304,8 +332,9 @@ class Fleet:
     def stop(self):
         for r in self.rigs:
             r.stop()
-        if self.ticker:
-            self.ticker.halt.set()
+        for t in (self.ticker, self.qticker):
+            if t:
+                t.halt.set()
         for n in self.nodes:
             n.stop()
 
@@ -327,6 +356,12 @@ class Fleet:
         wb.generatetoaddress(110, btc_addr)
         wb.sendtoaddress(w2.getnewaddress("", "bech32"), 50)
         wb.generatetoaddress(1, btc_addr)
+
+        # ---- the regtest Qwencoin: one wallet, pool B's (the only one that pays on Qwencoin)
+        qn = QwenNode(a.bitcoind, os.path.join(self.dir, "qwen"))
+        self.nodes.append(qn)
+        wq = qn.funded_wallet()
+        qaddr = wq.getnewaddress("", "bech32")
 
         def bspk(addr):
             return bytes.fromhex(wb.getaddressinfo(addr)["scriptPubKey"])
@@ -392,8 +427,11 @@ class Fleet:
         phase("F3 pool + settler on A, three nodes follow")
         self.ticker = BtcTicker(wb, btc_addr, 2.0)
         self.ticker.start()
-        # Default pay_depth (12): a block is paid once its draw block is 6 deep.
-        setA = Settler(A.rpc, wb, os.path.join(self.dir, "settler-A.json"), max_pay_sats=COIN)
+        self.qticker = BtcTicker(wq, qaddr, 2.0)
+        self.qticker.start()
+        # Default pay_depth (12): a block is paid once its draw block is 6 deep. Pool A pays on Bitcoin
+        # only; it reads Qwencoin headers from a node (no wallet there) and relays them all the same.
+        setA = Settler(A.rpc, wb, os.path.join(self.dir, "settler-A.json"), max_pay_sats=COIN, qwen_node=qn.rpc)
         rigA = Rig(self.loop, A, dF, addrA, miner_btc, setA,
                    children={"GRD": {"rpc": G1.rpc, "hrp": dG.hrp, "payout": addrG}})
         self.rigs.append(rigA)
@@ -416,7 +454,10 @@ class Fleet:
                     rogue.append((h, bh))
                 if len(rogue) >= 3:
                     break
-        print(f"   rogue (unsettled) blocks at {[h for h, _ in rogue]}, "
+            # A block on the QWEN curve, given to the settler that has no Qwencoin wallet: never paid.
+            a_other = mine_gbt(A, spkA, curve="qwen")
+            setA.add_block(*a_other)
+        print(f"   rogue (unsettled) blocks at {[h for h, _ in rogue]}, a QWEN-curve block for settler A at {a_other[0]}, "
               f"work/block now {int(A.rpc.getlaunchinfo()['next']['work'], 16)}", flush=True)
 
         def settled_by_payment():
@@ -429,6 +470,10 @@ class Fleet:
             check("F3 the pool settled obligations with Bitcoin payments, automatically", len(paid) >= 3, f"{len(paid)}")
             relay, btc_tip = A.rpc.getbtcrelay(), btc.rpc.getblockcount()
             check("F3 the header relay tracks Bitcoin", relay["height"] >= btc_tip - 6, f"{relay['height']}/{btc_tip}")
+            qrel, q_tip = A.rpc.getqwenrelay(), qn.rpc.getblockcount()
+            check("F3 the Qwencoin relay tracks Qwencoin, fed by a settler with no Qwencoin wallet (HFH2 from a node)",
+                  qrel["height"] >= q_tip - 6 and setA.status()["relays"] == ["btc", "qwen"]
+                  and setA.status()["wallets"] == ["btc"], f"{qrel['height']}/{q_tip} {setA.status()}")
             print(f"   FLT {A.rpc.getblockcount()} blocks, {len(paid)} settled by payment, relay {relay['height']}/{btc_tip}, "
                   f"settler {setA.status()}", flush=True)
 
@@ -491,8 +536,10 @@ class Fleet:
 
         # ================================================================= F7b
         phase("F7 partition: the pool's own node loses to a second pool")
-        setB = Settler(B.rpc, w2, os.path.join(self.dir, "settler-B.json"), max_pay_sats=COIN)
-        rigB = Rig(self.loop, B, dF, addrB, miner2_btc, setB)
+        # Pool B mines the QWEN curve and pays on Qwencoin only; Bitcoin headers it reads from a node.
+        setB = Settler(B.rpc, None, os.path.join(self.dir, "settler-B.json"), qwen_wallet=wq, max_pay_qwen=COIN,
+                       btc_node=btc.rpc)
+        rigB = Rig(self.loop, B, dF, addrB, miner2_btc, setB, curve="qwen")
         self.rigs.append(rigB)
         rigA.stop()
         time.sleep(1)
@@ -547,6 +594,10 @@ class Fleet:
 
         # ================================================================= F6
         phase("F6 mempool: the settlement lock and transaction relay")
+        with paused(rigA, rigB):
+            # A block on the BTC curve, given to the settler that has no Bitcoin wallet: never paid.
+            b_other = mine_gbt(B, address_to_script(addrB, dF.hrp))
+            setB.add_block(*b_other)
         need = max([h for h, _ in rogue] + [0]) + 102
         wait(lambda: A.rpc.getblockcount() >= need, 900, f"FLT at {need} (coinbase maturity)")
 
@@ -599,18 +650,28 @@ class Fleet:
             ok, why, snap = agree([A, B, C, Dn])
             check("F9 all four nodes still agree, after verifychain", ok, why)
             if snap:
-                skip = {h for h, _ in rogue}
+                skip = {h for h, _ in rogue} | {a_other[0], b_other[0]}
                 obs = [o for o in snap["obligations"] if o["height"] <= snap["height"] - 60 and o["height"] not in skip]
                 stuck = [o["height"] for o in obs if not o["spendable"]]
                 paid = [o for o in obs if o["settled"]]
-                check("F9 every pool block older than 60 is settled or owes nothing (two pools, two wallets)",
+                check("F9 every pool block older than 60 is settled or owes nothing (two pools, one per curve, one wallet each)",
                       not stuck, f"unsettled: {stuck[:20]}")
+                quotes = {q: sum(o["quote"] == q for o in paid) for q in ("btc", "qwen")}
+                check("F9 blocks were settled by payments on both chains (pool A on Bitcoin, pool B on Qwencoin)",
+                      quotes["btc"] > 0 and quotes["qwen"] > 0, str(quotes))
+                unpaid = []
+                for st, (h, bh), quote in ((setA, a_other, "qwen"), (setB, b_other, "btc")):
+                    o = A.rpc.getmintobligation(h)
+                    unpaid.append(o["hash"] == bh and o["quote"] == quote and not o["settled"]
+                                  and not any(k.startswith(f"{h}:") for k in st.st["paid"]))
+                check("F9 a settler pays only its own curve's blocks: the QWEN-curve block of the Bitcoin-only settler and "
+                      "the BTC-curve block of the Qwencoin-only settler stay unpaid", all(unpaid), str(unpaid))
                 payees = {o["payee"] for o in paid}
                 check("F9 payments went to holders (and creator or dev draws are honoured too)", "holder" in payees,
                       str(payees))
                 print(f"   FLT {snap['height']} blocks: {len(paid)} settled by payment to {sorted(payees)}, "
-                      f"{sum(o['pay'] for o in paid)} sats; settler A {setA.status()}, settler B {setB.status()}", flush=True)
-            check("F9 no Bitcoin payment was wasted by either pool", not setA.st["lost"] and not setB.st["lost"],
+                      f"{sum(o['pay'] for o in paid if o['quote'] == 'btc')} sats and {sum(o['pay'] for o in paid if o['quote'] == 'qwen')} qwen-sats; settler A {setA.status()}, settler B {setB.status()}", flush=True)
+            check("F9 no payment was wasted by either pool (on Bitcoin or on Qwencoin)", not setA.st["lost"] and not setB.st["lost"],
                   json.dumps([setA.st["lost"], setB.st["lost"]]))
 
             # ============================================================= F10
@@ -637,6 +698,68 @@ class Fleet:
             bh = sha256d(hdr)[::-1].hex()
             ok = r is None and wait(lambda: all(n.rpc.getbestblockhash() == bh for n in (B, C, Dn)), 30, "relief block relayed")
             check("F10 every peer accepts the block mined at the relieved difficulty", ok, str(r))
+
+        # ================================================================= F11
+        phase("F11 a Qwencoin reorganisation under a payment; the settler restarted in the middle")
+        spkB = address_to_script(addrB, dF.hrp)
+        with paused(rigA, rigB):
+            self.qticker.pause()
+            # Pool B's own block on the QWEN curve, mined by hand so that every step below is ours to time.
+            hq, bq = mine_gbt(B, spkB, curve="qwen")
+            setB.add_block(hq, bq)
+            key = f"{hq}:{bq}"
+            for _ in range(30):  # draw known and buried (pay_depth 12): the settler pays (pool B's poller drives it)
+                if key in setB.st["paid"]:
+                    break
+                mine_gbt(B, spkB, extra_outs=setB.relay_outputs())
+                setB.pay_due()
+            paid = setB.st["paid"].get(key)
+            if not check("F11 (setup) the Qwencoin-only settler paid its QWEN-curve block on Qwencoin",
+                         paid is not None and paid.get("quote") == "qwen", json.dumps(B.rpc.getmintobligation(hq))):
+                self.qticker.resume()
+                return
+            txid = paid["txid"]
+            q1 = qn.rpc.generatetoaddress(1, qaddr)[0]
+            qn.rpc.generatetoaddress(1, qaddr)
+            in_q1 = txid in qn.rpc.getblock(q1, 1)["tx"]
+            mine_gbt(B, spkB, extra_outs=setB.relay_outputs())  # the payment's block and one on top reach the launch
+            stale = [o for o in setB.proof_outputs()
+                     if (lambda d_: d_ is not None and Y.PaymentProof.parse(d_).mint_height == hq)(
+                         Y.tagged_return(o.script_pubkey, b"HFP2"))]
+            check("F11 (setup) the payment is in a Qwencoin block, relayed, and its proof is ready",
+                  in_q1 and len(stale) == 1 and B.rpc.getqwenrelay()["best"] == qn.rpc.getbestblockhash(),
+                  f"in block {in_q1}, proofs {len(stale)}, {json.dumps(B.rpc.getqwenrelay())}")
+            # The settler stops here and starts again from its state file.
+            setB = Settler(B.rpc, None, os.path.join(self.dir, "settler-B.json"), qwen_wallet=wq, max_pay_qwen=COIN,
+                           btc_node=btc.rpc)
+            rigB.settler = rigB.src.settler = setB
+            check("F11 the restarted settler knows the payment from its state file",
+                  setB.st["paid"].get(key, {}).get("txid") == txid, json.dumps(setB.st["paid"].get(key)))
+            # Qwencoin reorganises: a longer branch without the payment replaces its block.
+            qn.rpc.invalidateblock(q1)
+            for _ in range(3):
+                qn.rpc.generateblock(qaddr, [])
+            mine_gbt(B, spkB, extra_outs=setB.relay_outputs())
+            gone = qn.rpc.getblockheader(q1)["confirmations"] < 0
+            check("F11 the launch follows the Qwencoin branch with more work",
+                  gone and B.rpc.getqwenrelay()["best"] == qn.rpc.getbestblockhash(), json.dumps(B.rpc.getqwenrelay()))
+            mine_gbt(B, spkB, extra_outs=stale)
+            check("F11 the proof made for the payment's old block does not count any more",
+                  B.rpc.getmintobligation(hq)["settled"] is False, json.dumps(B.rpc.getmintobligation(hq)))
+            # The payment is mined again on the new branch; the restarted settler proves it again.
+            qn.rpc.generatetoaddress(2, qaddr)
+            for _ in range(6):
+                if B.rpc.getmintobligation(hq)["settled"]:
+                    break
+                mine_gbt(B, spkB, extra_outs=setB.coinbase_outputs())
+            o = B.rpc.getmintobligation(hq)
+            again = wq.gettransaction(txid)
+            check("F11 the restarted settler proved the same payment again in its new block: settled, nothing paid twice",
+                  o["settled"] and again["confirmations"] >= 2 and again["blockhash"] != q1 and not setB.st["lost"],
+                  f"{json.dumps(o)} confs {again.get('confirmations')} lost {setB.st['lost']}")
+            ok, why, _ = agree([A, B, C, Dn])
+            check("F11 all four nodes agree after the Qwencoin reorganisation, Qwencoin relay included", ok, why)
+            self.qticker.resume()
 
 
 def main():

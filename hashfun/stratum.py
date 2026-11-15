@@ -14,6 +14,12 @@ Two job sources share one stratum frontend:
 Usernames: "<payout_address>[.<worker>]". For merged mining the parent payout is
 the username address; child payouts default to the pool config's aux_payout map
 and can be overridden: "<btc_addr>,<TICKER>=<addr>,...".
+
+A launch has two curves before it graduates, and a block is mined on one of them: the miner's
+choice, because the block then owes that curve's asset (sats on Bitcoin, qwen on Qwencoin).
+"<payout_address>/btc" or "<payout_address>/qwen" picks the curve; without it the pool's default
+curve is mined. The yield address and the worker follow as before:
+"<payout_address>[/btc|/qwen][,<yield address>][.<worker>]".
 """
 import asyncio
 import json
@@ -130,6 +136,18 @@ class JobSource:
         raise NotImplementedError
 
 
+CURVES = ("btc", "qwen")
+
+
+def split_username(username: Optional[str]) -> tuple:
+    """(payout address, curve or None, yield address or None) of a launch pool's username:
+    "<address>[/btc|/qwen][,<yield address>][.<worker>]". The curve is returned as written, lowercased
+    (so that one that is not a curve can be refused); None when the name asks for none."""
+    parts = (username or "").split(".")[0].split(",")
+    addr, _, curve = parts[0].partition("/")
+    return addr, (curve.lower() or None) if "/" in parts[0] else None, (parts[1] if len(parts) > 1 and parts[1] else None)
+
+
 def _gbt_txs(tmpl):
     return [bytes.fromhex(t["txid"])[::-1] for t in tmpl["transactions"]], [t["data"] for t in tmpl["transactions"]]
 
@@ -201,13 +219,16 @@ class AuxSet:
 
 class LaunchSource(JobSource):
     def __init__(self, rpc: RPC, hrp: str, ticker: str, default_payout: str = None,
-                 children: Optional[Dict[str, dict]] = None, settler=None, yield_hrp: str = "bc"):
-        """settler: hashfun.settler.Settler for launches with a sats leg (pays and proves the
-        Bitcoin owed by the blocks this pool finds). Miners who log in as
-        "<launch address>,<bitcoin address>" get their coinbase registered for BTC yield."""
+                 children: Optional[Dict[str, dict]] = None, settler=None, yield_hrp: str = "bc", curve: str = "btc"):
+        """settler: hashfun.settler.Settler (pays and proves what the blocks this pool finds owe, on
+        Bitcoin and on Qwencoin). Miners who log in as "<launch address>,<bitcoin address>" get their
+        coinbase's yield paid at that address instead of at their launch key.
+        curve: the curve a miner mines who names none ("btc" or "qwen")."""
         super().__init__()
+        if curve not in CURVES:
+            raise ValueError(f"curve: {curve!r} is not one of {', '.join(CURVES)}")
         self.auxset = AuxSet({k: v for k, v in (children or {}).items() if k != ticker})
-        self.settler, self.yield_hrp = settler, yield_hrp
+        self.settler, self.yield_hrp, self.curve = settler, yield_hrp, curve
         self.settle_outs: List[TxOut] = []
         self.rpc, self.hrp, self.ticker = rpc, hrp, ticker
         self.name = ticker
@@ -240,7 +261,7 @@ class LaunchSource(JobSource):
         if self.settler:
             try:
                 outs = await asyncio.to_thread(self.settler.coinbase_outputs)
-            except Exception as e:  # the Bitcoin node being down must not stop mining
+            except Exception as e:  # a quote chain's node being down must not stop mining
                 log.warning("[%s] settler: %s", self.ticker, e)
                 outs = self.settle_outs
             settle_changed = [o.script_pubkey for o in outs] != [o.script_pubkey for o in self.settle_outs]
@@ -256,8 +277,27 @@ class LaunchSource(JobSource):
         self.template_tag += 1
         return True
 
+    # ---- who a job is for
+    def check_username(self, username: str) -> Optional[str]:
+        """Why this pool cannot serve that username, or None. A miner who asks for a curve must get
+        that curve or nothing: the curve decides which coin its blocks owe."""
+        curve = split_username(username)[1]
+        if curve is not None and curve not in CURVES:
+            return f"'{curve}' is not a curve: log in as ADDRESS, ADDRESS/btc or ADDRESS/qwen"
+        return None
+
+    def curve_of(self, username: str) -> str:
+        """The curve this miner's blocks are on while the launch has curves: the one its username
+        names, else the pool's."""
+        curve = split_username(username)[1]
+        if curve is None:
+            return self.curve
+        if curve not in CURVES:
+            raise ValueError(f"'{curve}' is not a curve")
+        return curve
+
     def payout_script(self, username: str) -> bytes:
-        addr = username.split(".")[0].split(",")[0] if username else self.default_payout
+        addr = split_username(username)[0] if username else self.default_payout
         try:
             return address_to_script(addr, self.hrp)
         except Exception:
@@ -265,35 +305,60 @@ class LaunchSource(JobSource):
                 return address_to_script(self.default_payout, self.hrp)
             raise
 
-    def make_job(self, job_id: str, username: str, clean: bool) -> Job:
+    def yield_script(self, username: str) -> Optional[bytes]:
+        """scriptPubKey from "<launch address>[/curve],<bitcoin address>[.worker]", if given: where
+        this miner's coin is paid its yield, on Bitcoin and on Qwencoin (Qwencoin's addresses are
+        Bitcoin's)."""
+        addr = split_username(username)[2]
+        if not addr:
+            return None
+        try:
+            return address_to_script(addr, self.yield_hrp)
+        except Exception:
+            return None
+
+    # ---- the job
+    def curve_values(self, curve: str) -> dict:
+        """What a block on `curve` has in its header and coinbase: version (bit 9 set on the QWEN
+        curve), coinbasevalue, creatorfee. Before graduation the node gives them per curve
+        ("launchcurves"); after it there are no curves and the template's top level is the block."""
         t = self.tmpl
-        outs = [TxOut(t["coinbasevalue"], self.payout_script(username))]
-        if "creatorfee" in t:
-            outs.append(TxOut(t["creatorfee"]["amount"], bytes.fromhex(t["creatorfee"]["script"])))
-        yield_script = self.yield_script(username)
-        if yield_script:
-            outs.append(TxOut(0, yield_tag_script(yield_script)))
-        outs += self.settle_outs
+        c = (t.get("launchcurves") or {}).get(curve)
+        if c is None:
+            c = t
+        return {"version": c["version"], "coinbasevalue": c["coinbasevalue"], "creatorfee": c.get("creatorfee")}
+
+    def on_curves(self) -> bool:
+        """Has the template two curves to choose from (the launch has not graduated)?"""
+        return bool(self.tmpl and self.tmpl.get("launchcurves"))
+
+    def build_job(self, job_id: str, clean: bool, curve: str, payout: List[TxOut], extra: List[TxOut] = (),
+                  ctx: Optional[dict] = None) -> Job:
+        """A job on `curve` whose coinbase starts with `payout` (output 0 is the miner's own: the only
+        one a yield redirect applies to), then the creator's output, `extra`, and what the settler
+        has for this block (headers and proofs)."""
+        t, v = self.tmpl, self.curve_values(curve)
+        outs = list(payout)
+        if v["creatorfee"]:
+            outs.append(TxOut(v["creatorfee"]["amount"], bytes.fromhex(v["creatorfee"]["script"])))
+        outs += list(extra) + self.settle_outs
         has_commit = "default_witness_commitment" in t
         if has_commit:
             outs.append(TxOut(0, bytes.fromhex(t["default_witness_commitment"])))
-        extra, auxctx = self.auxset.commit()
-        c1, c2 = coinbase_parts(t["height"], outs, extra=extra, prefix=_cb_prefix(t))
+        aux_extra, auxctx = self.auxset.commit()
+        c1, c2 = coinbase_parts(t["height"], outs, extra=aux_extra, prefix=_cb_prefix(t))
         txids, datas = _gbt_txs(t)
         return Job(job_id, self, bytes.fromhex(t["previousblockhash"])[::-1], c1, c2,
-                   merkle_branch_for_first([b"\0" * 32] + txids), t["version"], int(t["bits"], 16), t["curtime"],
+                   merkle_branch_for_first([b"\0" * 32] + txids), v["version"], int(t["bits"], 16), t["curtime"],
                    t["height"], datas, has_commit, clean,
-                   {"target": int(t["target"], 16), "fixed_ntime": True, **auxctx})
+                   {"target": int(t["target"], 16), "fixed_ntime": True, "curve": curve if self.on_curves() else None,
+                    **auxctx, **(ctx or {})})
 
-    def yield_script(self, username: str) -> Optional[bytes]:
-        """Bitcoin scriptPubKey from "<launch address>,<bitcoin address>[.worker]", if given."""
-        parts = (username or "").split(".")[0].split(",")
-        if len(parts) < 2 or not parts[1]:
-            return None
-        try:
-            return address_to_script(parts[1], self.yield_hrp)
-        except Exception:
-            return None
+    def make_job(self, job_id: str, username: str, clean: bool) -> Job:
+        curve = self.curve_of(username)
+        payout = [TxOut(self.curve_values(curve)["coinbasevalue"], self.payout_script(username))]
+        yield_script = self.yield_script(username)
+        return self.build_job(job_id, clean, curve, payout, [TxOut(0, yield_tag_script(yield_script))] if yield_script else [])
 
     async def on_solution(self, job, header, coinbase, hash_int):
         aux_events = await self.auxset.submit(job, header, coinbase, hash_int)
@@ -304,12 +369,14 @@ class LaunchSource(JobSource):
             return aux_events
         res = await asyncio.to_thread(self.rpc.submitblock, job.block_hex(header, coinbase))
         h = sha256d(header)[::-1].hex()
-        ev = {"chain": self.ticker, "kind": "block", "height": job.height, "hash": h, "result": res}
+        ev = {"chain": self.ticker, "kind": "block", "height": job.height, "hash": h, "result": res,
+              "curve": job.ctx.get("curve")}
         self.blocks_found.append(ev)
         self.last_full = 0
         if res is None and self.settler:
             self.settler.add_block(job.height, h)
-        log.info("[%s] block %s at %d: %s", self.ticker, h, job.height, res or "accepted")
+        log.info("[%s] block %s at %d%s: %s", self.ticker, h, job.height,
+                 f" on the {ev['curve'].upper()} curve" if ev["curve"] else "", res or "accepted")
         return [ev]
 
 
@@ -441,7 +508,13 @@ class Session:
             # Version rolling would overwrite the auxpow chain ID bits (16..28).
             self.send({"id": mid, "result": {"version-rolling": False}, "error": None})
         elif method == "mining.authorize":
-            self.username = params[0] if params else ""
+            username = params[0] if params else ""
+            check = getattr(self.server.source, "check_username", None)
+            why = check(username) if check else None
+            if why:  # a name this pool cannot serve as asked (a curve it does not have): no work rather than other work
+                self.send({"id": mid, "result": False, "error": [24, why, None]})
+                return
+            self.username = username
             self.send({"id": mid, "result": True, "error": None})
             self.notify("mining.set_difficulty", [self.difficulty])
             self.push_job(True)
@@ -508,6 +581,7 @@ class StratumServer:
         self._last_version_tag = -1
         self.stats_path = stats_path
         self.started = time.time()
+        self.listening = False  # set once the port is open: serve() asks the node for a first template before that
 
     def next_job_id(self) -> str:
         self._job += 1
@@ -575,6 +649,7 @@ class StratumServer:
     async def serve(self):
         await self.poll_once()
         server = await asyncio.start_server(self._client, self.host, self.port)
+        self.listening = True
         log.info("stratum %s listening on %s:%d", self.source.name, self.host, self.port)
         asyncio.get_running_loop().create_task(self._poller())
         async with server:

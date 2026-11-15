@@ -109,7 +109,9 @@ class DownstreamSession:
     def pick(self):
         now = time.time()
         if self.active is not None:
-            self.given[self.active.index] = self.given.get(self.active.index, 0) + (now - self.slice_start)
+            spent = now - self.slice_start
+            self.given[self.active.index] = self.given.get(self.active.index, 0) + spent
+            self.proxy.time[self.active.name] = self.proxy.time.get(self.active.name, 0) + spent
         self.slice_start = now
         ready = [u for u in self.ups if u.last_notify is not None]
         if not ready:
@@ -184,12 +186,18 @@ class StrataProxy:
         self.host, port = listen.rsplit(":", 1)
         self.port = int(port)
         self.work: Dict[str, float] = {}
+        self.time: Dict[str, float] = {}
         self.sessions: List[DownstreamSession] = []
 
     def stats(self):
+        """Per upstream: the share of the hash it was to get (weight), the share of the miners' time
+        it was given (time: what the proxy decides), and its share of the work the upstreams
+        accepted (delivered: what came of it, which also depends on each pool turning shares down)."""
         total = sum(self.work.values()) or 1
+        clock = sum(self.time.values()) or 1
         want = sum(float(s.get("weight", 1)) for s in self.strata)
         return {s.get("name", s["url"]): {"weight": float(s.get("weight", 1)) / want,
+                                         "time": self.time.get(s.get("name", s["url"]), 0) / clock,
                                          "delivered": self.work.get(s.get("name", s["url"]), 0) / total}
                 for s in self.strata}
 

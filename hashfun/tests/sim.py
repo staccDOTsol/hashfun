@@ -111,6 +111,8 @@ class SimChain:
         self.index[g.hash] = 0
         self.txloc[cb.txid()] = 0
         self.works = [work_from_bits(g.bits)]
+        self.curve_works = [(0, 0)]  # (Wb, Wq) at each height: the work mined on the BTC and on the QWEN curve
+        self.mine_curve = "btc"      # the curve the chain's own miner and the top of a template use (setminecurve)
 
     # ------------------------------------------------------------ consensus model
     @property
@@ -121,21 +123,29 @@ class SimChain:
         h = self.height if height is None else height
         return sum(self.works[1:h + 1])
 
+    def works_at(self, height=None) -> tuple:
+        return self.curve_works[self.height if height is None else height]
+
     def next_bits(self, block_time: Optional[int] = None) -> int:
         if not self.launch:
             return 0x207FFFFF
         return self.launch.next_bits([b.time for b in self.blocks], [b.bits for b in self.blocks], block_time)
 
-    def subsidy(self, height: int, bits: int) -> int:
+    def subsidy(self, height: int, bits: int, curve: str = "btc") -> int:
+        """What the block at `height` mints on `curve` (which nothing reads once the parent has graduated)."""
         if not self.launch:
             return (50 * COIN) >> (height // 150)
-        return self.launch.subsidy(self.rel_work(height - 1), bits, height)
+        return self.launch.subsidy(*self.works_at(height - 1), curve, bits, height)
 
     def graduated(self, height=None) -> bool:
-        return bool(self.launch) and self.rel_work(height) >= self.launch.graduation_work
+        return bool(self.launch) and self.launch.graduated(*self.works_at(height))
 
-    def version(self) -> int:
-        return (4 | (self.launch.chain_id << 16)) if self.launch else 0x20000000
+    def version(self, curve: Optional[str] = None) -> int:
+        """The version of the next block: on a launch that still has curves, bit 9 says it is on the QWEN curve."""
+        if not self.launch:
+            return 0x20000000
+        qwen = (curve or self.mine_curve) == "qwen" and not self.graduated()
+        return 4 | (self.launch.chain_id << 16) | (D.LAUNCH_VERSION_QWEN if qwen else 0)
 
     def mtp(self, height=None) -> int:
         h = self.height if height is None else height
@@ -206,6 +216,8 @@ class SimChain:
                     return "high-hash"
             if self.launch and (blk.version >> 16) != self.launch.chain_id:
                 return "bad-chainid"
+            if blk.version & D.LAUNCH_VERSION_QWEN and (not self.launch or self.graduated() or blk.auxpow):
+                return "bad-curve-version"  # the bit only where there is a curve to be on
             if blk.time <= self.mtp():
                 return "time-too-old"
             txids = [t.txid() for t in blk.txs]
@@ -234,7 +246,7 @@ class SimChain:
                 except RPCError as e:
                     return e.message
                 self._apply(t, view, height)
-            sub = self.subsidy(height, blk.bits)
+            sub = self.subsidy(height, blk.bits, D.curve_of_version(blk.version))
             if sum(o.value for o in cb.vout) > sub + fees:
                 return "bad-cb-amount"
             if self.launch and self.launch.creator_fee_bps:
@@ -247,6 +259,11 @@ class SimChain:
             self.blocks.append(blk)
             self.index[blk.hash] = height
             self.works.append(work_from_bits(blk.bits))
+            if self.launch:
+                from hashfun.yieldstate import works_after
+                self.curve_works.append(works_after(self.launch, self.curve_works[-1], blk.bits, blk.version, height))
+            else:
+                self.curve_works.append((0, 0))
             for t in blk.txs:
                 self.txloc[t.txid()] = height
                 self.mempool.pop(t.txid(), None)
@@ -258,11 +275,11 @@ class SimChain:
             return None
 
     # ------------------------------------------------------------ templates
-    def template(self, payout_spk: bytes = None):
+    def template(self, payout_spk: bytes = None, curve: Optional[str] = None):
         with self.lock:
             height = self.height + 1
             bits = self.next_bits(max(self.clock, self.mtp() + 1))
-            sub = self.subsidy(height, bits)
+            sub = self.subsidy(height, bits, curve or self.mine_curve)
             fee = self.launch.creator_fee(sub) if self.launch else 0
             txs = list(self.mempool.values())
             view = dict(self.utxos)
@@ -279,8 +296,8 @@ class SimChain:
             return {"height": height, "bits": bits, "subsidy": sub, "creator_fee": fee, "fees": fees, "txs": ok,
                     "commitment": witness_commitment_script(wt), "time": max(self.clock, self.mtp() + 1)}
 
-    def build_block(self, payout_spk: bytes, en: bytes = b"", aux=False) -> Block:
-        t = self.template()
+    def build_block(self, payout_spk: bytes, en: bytes = b"", aux=False, curve: Optional[str] = None) -> Block:
+        t = self.template(curve=curve)
         outs = [TxOut(t["subsidy"] - t["creator_fee"] + t["fees"], payout_spk)]
         if t["creator_fee"]:
             outs.append(TxOut(t["creator_fee"], self.launch.creator_script))
@@ -289,15 +306,15 @@ class SimChain:
         cb = Tx(version=2, vin=[TxIn(b"\0" * 32, 0xFFFFFFFF, head + push(en or b"\x00\x00"), 0xFFFFFFFF,
                                      [b"\0" * 32])], vout=outs)
         txs = [cb] + t["txs"]
-        version = self.version() | (0x100 if aux else 0)
+        version = self.version(curve) | (0x100 if aux else 0)
         hdr = header_bytes(version, self.blocks[-1].hash, merkle_root([x.txid() for x in txs]), t["time"], t["bits"], 0)
         return Block(hdr, txs)
 
-    def mine(self, n=1, payout_spk: bytes = None) -> List[str]:
+    def mine(self, n=1, payout_spk: bytes = None, curve: Optional[str] = None) -> List[str]:
         out = []
         for _ in range(n):
             spk = payout_spk or self.wallet_spk()
-            b = self.build_block(spk, en=struct.pack("<I", len(self.blocks)))
+            b = self.build_block(spk, en=struct.pack("<I", len(self.blocks)), curve=curve)
             target = bits_to_target(b.bits)
             nonce = 0
             while True:
@@ -330,6 +347,7 @@ class SimChain:
             g = self.blocks[0]
             clock = self.clock
             self.blocks, self.index, self.works = [g], {g.hash: 0}, [work_from_bits(g.bits)]
+            self.curve_works = [(0, 0)]
             self.utxos, self.txloc = {}, {g.txs[0].txid(): 0}
             mem = {t.txid(): t for t in dropped}  # disconnected txs go back to the mempool first
             mem.update(self.mempool)
@@ -474,7 +492,22 @@ def r_getblocktemplate(c, req=None):
         out["creatorfee"] = {"script": c.launch.creator_script.hex(), "amount": t["creator_fee"]}
     if c.launch:
         out["launchcoinbase"] = c.launch.coinbase_prefix(t["height"]).hex()
+    if c.launch and not c.graduated():
+        # the same block on either curve: its version, what its coinbase may pay, the creator's output
+        out["launchcurves"] = {}
+        for curve in D.QUOTES:
+            sub = c.subsidy(t["height"], t["bits"], curve)
+            fee = c.launch.creator_fee(sub)
+            out["launchcurves"][curve] = {"version": c.version(curve), "coinbasevalue": sub - fee + t["fees"],
+                                          **({"creatorfee": {"script": c.launch.creator_script.hex(), "amount": fee}} if fee else {})}
     return out
+
+
+def r_setminecurve(c, curve):
+    if curve not in D.QUOTES:
+        err(-8, "curve must be btc or qwen")
+    old, c.mine_curve = c.mine_curve, curve
+    return old
 
 
 def r_submitblock(c, hexdata):
@@ -485,25 +518,35 @@ def r_getlaunchinfo(c):
     if not c.launch:
         err(-1, "not a hashfun launch chain")
     d = c.launch
-    w = c.rel_work()
-    cs = d.curve_supply(w)
-    grad = w >= d.graduation_work
-    gh = -1
-    if grad:
-        gh = next(h for h in range(1, c.height + 1) if c.rel_work(h) >= d.graduation_work)
+    grad = c.graduated()
+    gh = next(h for h in range(1, c.height + 1) if c.graduated(h)) if grad else -1
+    wb, wq = c.works_at(gh if grad else None)  # as they stood when the launch graduated: nothing is on a curve after
+    cs = d.curve_minted(wb, wq)
     tail = sum(d.tail_reward_at(h) for h in range(gh + 1, c.height + 1)) if grad else 0
     nb = c.next_bits()
-    ns = c.subsidy(c.height + 1, nb)
+    ns = c.subsidy(c.height + 1, nb, c.mine_curve)
+    curves = {}
+    for curve, w in (("btc", wb), ("qwen", wq)):
+        num, shift = d.owed_rate(curve)
+        mined = [h for h in range(1, (gh if grad else c.height) + 1)
+                 if D.curve_of_version(c.blocks[h].version) == curve]
+        curves[curve] = {"work": _hex_be(w), "supply": d.curve_supply(w), "progress": d.curve_supply(w) / d.graduation_tokens,
+                         "hashes_per_coin": d.hashes_per_coin(w), "owed_num": num, "owed_shift": shift,
+                         "owed_per_coin": d.price_per_coin(w, curve), "min_payment": d.min_payment(curve),
+                         "confs": d.confs(curve), "creator_script": d.creator_quote_script(curve).hex(),
+                         "blocks": len(mined), "last_height": mined[-1] if mined else 0}
+    by = None if not grad else "btc" if wb >= d.graduation_work else "qwen"
     return {"launch_id": d.id_hex, "name": d.name, "ticker": d.ticker, "hrp": d.hrp, "genesis_hash": d.genesis_hash,
-            "chain_id": d.chain_id, "height": c.height, "work": _hex_be(w), "curve_supply": cs, "tail_minted": tail,
-            "supply": cs + tail, "progress": cs / d.graduation_tokens, "graduated": grad, "graduation_height": gh,
-            "hashes_per_coin": d.hashes_per_coin(w),
+            "chain_id": d.chain_id, "height": c.height, "work": _hex_be(c.rel_work()), "curve_supply": cs, "tail_minted": tail,
+            "supply": cs + tail, "progress": max(x["progress"] for x in curves.values()), "graduated": grad,
+            "graduation_height": gh, "graduated_by": by, "curves": curves,
+            "hashes_per_coin": curves["btc"]["hashes_per_coin"],
             "curve": {"virtual_work": _hex_be(d.virtual_work), "virtual_tokens": d.virtual_tokens,
                       "graduation_tokens": d.graduation_tokens, "graduation_work": _hex_be(d.graduation_work),
                       "tail_reward": d.tail_reward, "tail_halving_interval": d.tail_halving_interval},
             "creator": {"script": d.creator_script.hex(), "fee_bps": d.creator_fee_bps},
             "next": {"bits": f"{nb:08x}", "work": _hex_be(work_from_bits(nb)), "subsidy": ns,
-                     "creator_fee": d.creator_fee(ns), "auxpow_allowed": grad},
+                     "creator_fee": d.creator_fee(ns), "auxpow_allowed": grad, "curve": c.mine_curve},
             "descriptor": d.to_json()}
 
 

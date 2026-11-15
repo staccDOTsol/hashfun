@@ -331,11 +331,18 @@ class Wallet:
         self.save()
         self.chains[name] = ChainAccount(self, name, self.data["chains"][name])
 
-    # ---- BTC yield ----
-    # Holding launch coins earns BTC from later buyers, paid on Bitcoin at the holder's own launch
-    # script. A launch is a Bitcoin fork, so the same key spends it there.
+    # ---- yield: BTC and QWEN ----
+    # Holding launch coins earns from later buyers: BTC from those who buy on the BTC curve, QWEN from
+    # those who buy on the QWEN curve, each paid on its own chain at the holder's own launch script. A
+    # launch is a Bitcoin fork and so is Qwencoin, so the same key spends it on either. `btc` in the
+    # three methods below names the chain to look on: "BTC", or the name Qwencoin was added under.
+    def quote_chains(self) -> List[str]:
+        """The chains yield is paid on that this wallet follows: every chain that is not a launch
+        (Bitcoin, and Qwencoin once it is added with `add-chain`)."""
+        return [n for n, c in self.chains.items() if c.cfg.get("kind") != "launch"]
+
     def yield_utxos(self, btc: str = "BTC") -> List[dict]:
-        """Bitcoin UTXOs sitting at this wallet's launch keys."""
+        """UTXOs on that chain (Bitcoin, or Qwencoin) sitting at this wallet's launch keys."""
         b, out = self.chains[btc], []
         for name, c in self.chains.items():
             if c.cfg.get("kind") != "launch":
@@ -353,7 +360,8 @@ class Wallet:
         return by
 
     def claim_yield(self, btc: str = "BTC", feerate: Optional[int] = None) -> Optional[str]:
-        """Sweep all earned BTC into the wallet's Bitcoin account. None if there is nothing worth moving."""
+        """Sweep everything earned on that chain into the wallet's own account there. None if there is
+        nothing worth moving."""
         b = self.chains[btc]
         utxos = self.yield_utxos(btc)
         total = sum(u["value"] for u in utxos)
@@ -495,6 +503,9 @@ def main(argv=None):
     p.add_argument("--hrp")
     p.add_argument("--coin-type", type=int)
     p.add_argument("--descriptor", help="launch descriptor; sets hrp and coin type")
+    p.add_argument("--qwen", action="store_true",
+                   help="the chain is Qwencoin (add it like Bitcoin: --hrp bc, and a --coin-type of its own, e.g. 1 on "
+                        "regtest; `yield` and `claim-yield` then cover the QWEN earned by holding as well)")
     sub.add_parser("balance")
     p = sub.add_parser("receive")
     p.add_argument("chain")
@@ -508,8 +519,12 @@ def main(argv=None):
         p.add_argument("amount")
         p.add_argument("--relay", required=True)
     p = sub.add_parser("swaps")
-    sub.add_parser("yield", help="BTC earned by holding launch coins (paid at your launch keys on Bitcoin)")
-    sub.add_parser("claim-yield", help="sweep earned BTC into the wallet's Bitcoin account")
+    for name, text in (("yield", "BTC and QWEN earned by holding launch coins (paid at your launch keys on Bitcoin and on "
+                                 "Qwencoin)"),
+                       ("claim-yield", "sweep what was earned into the wallet's own account on that chain")):
+        p = sub.add_parser(name, help=text)
+        p.add_argument("--chain", help="only this chain (default: every chain that is not a launch: BTC, and Qwencoin if "
+                                       "it was added)")
     a = ap.parse_args(argv)
     def ask(prompt, confirm=False):
         pw = os.environ.get("HASHFUN_WALLET_PASSWORD")
@@ -544,7 +559,7 @@ def main(argv=None):
             hrp, ct = d.hrp, LAUNCH_COIN_BASE + d.chain_id
         else:
             hrp, ct = a.hrp, a.coin_type
-        w.add_chain(a.name, a.electrum, hrp, ct, "launch" if a.descriptor else "btc")
+        w.add_chain(a.name, a.electrum, hrp, ct, "launch" if a.descriptor else "qwen" if a.qwen else "btc")
         print(json.dumps({"chain": a.name, "hrp": hrp, "coin_type": ct}))
     elif a.cmd == "balance":
         print(json.dumps({n: {k: coins(v) for k, v in c.balance().items()} for n, c in w.chains.items()}, indent=2))
@@ -555,10 +570,17 @@ def main(argv=None):
     elif a.cmd in ("buy", "sell"):
         rec = w.swap(a.relay.rstrip("/"), a.ticker, a.cmd, sats(a.amount))
         print(json.dumps({k: v for k, v in rec.items() if k != "secret"}, indent=2))
-    elif a.cmd == "yield":
-        print(json.dumps({k: coins(v) for k, v in w.yield_balance().items()}, indent=2))
-    elif a.cmd == "claim-yield":
-        print(json.dumps({"txid": w.claim_yield()}))
+    elif a.cmd in ("yield", "claim-yield"):
+        if a.chain and a.chain not in w.quote_chains():
+            sys.exit(f"{a.chain}: not a chain yield is paid on (this wallet has {', '.join(w.quote_chains()) or 'none'})")
+        names = [a.chain] if a.chain else w.quote_chains()
+        if a.cmd == "yield":
+            by = {n: {k: coins(v) for k, v in w.yield_balance(n).items()} for n in names}
+            # one chain (a wallet that follows Bitcoin only): the amounts per launch, as before
+            print(json.dumps(by[names[0]] if len(names) == 1 else by, indent=2))
+        else:
+            txids = {n: w.claim_yield(n) for n in names}
+            print(json.dumps({"txid": txids[names[0]]} if len(names) == 1 else {"txid": txids}))
     elif a.cmd == "swaps":
         print(json.dumps({k: {kk: vv for kk, vv in v.items() if kk != "secret"} for k, v in w.data.get("swaps", {}).items()},
                          indent=2))

@@ -1,34 +1,44 @@
-"""The sats leg's state machine, as a plain model.
+"""The state machine of a launch's two legs (sats and qwen), as a plain model.
 
 The node keeps this state in src/launchyieldstate.cpp. This file is written from the rules, not
 from that code, and it is the reference the node is compared with (hashfun/tests/yield_regtest.py):
 lists and linear scans, nothing clever, nothing cached.
 
-The rules it implements:
+The rules it implements (contrib/hashfun/TWIN.md for what rule set 3 added):
+
+  Quotes. A block mined before graduation is on one of two curves, the BTC curve or the QWEN curve
+  (bit 9 of its version), and owes that curve's asset: sats on Bitcoin, qwen on Qwencoin. The draw,
+  the coins and the lock are one mechanism for both; the minimum payment, the creator's script,
+  the header relay, the proof tag and the confirmations are per quote.
 
   Coins. A coin is a transaction output with a positive value and an earning script. Its yield
-  script is its own script (a coinbase may redirect its output 0: yieldmodel.registered_outputs).
-  Coins are kept in the order they are appended. A coin is live from the moment it is appended
-  until a transaction input spends its outpoint; then it is dead and stays in the list, weight 0.
+  script is its own script (a coinbase may redirect its output 0: yieldmodel.registered_outputs),
+  on Bitcoin and on Qwencoin alike. Coins are kept in the order they are appended. A coin is live
+  from the moment it is appended until a transaction input spends its outpoint; then it is dead and
+  stays in the list, weight 0.
 
-  Held coinbases. The coins of the coinbase of a block that is on the curve and owes sats are not
-  appended when the block is connected. They are appended later, all at once: at that block's draw
-  if the draw says nothing is due, or when a payment proof for that block is accepted. Never
+  Held coinbases. The coins of the coinbase of a block that is on a curve and owes something are
+  not appended when the block is connected. They are appended later, all at once: at that block's
+  draw if the draw says nothing is due, or when a payment proof for that block is accepted. Never
   otherwise.
 
   Connecting block B at height h:
-    1. the draw of block m = h - 6, if m >= 1 and m is on the curve. Seed from the hash that
+    1. the draw of block m = h - 6, if m >= 1 and m is on a curve. Seed from the hash that
        carried B's work (B's hash, or the parent block's hash when B is merge-mined). A holder
        draw is one point into the value of the coins that are live right now, that is at the end
        of block h - 1; with nothing live, the holders' share is owed to no one (pay becomes 0, it
        does not go to the creator). Who is paid is decided only when something is due, it is
        fixed here, and nothing later changes it.
-    2. B's transactions in order: inputs kill coins; HFH1 outputs relay Bitcoin headers and HFP1
-       outputs settle, in output order; then the transaction's own coins are appended (or held).
+    2. B's transactions in order: inputs kill coins; HFH1 outputs relay Bitcoin headers, HFH2
+       outputs of the coinbase relay Qwencoin headers (at most 8 work evaluations of those per
+       block; an HFH2 output of any other transaction is not looked at), HFP1 outputs settle
+       blocks of the BTC curve against the Bitcoin relay and HFP2 outputs blocks of the QWEN
+       curve against the Qwencoin relay, in output order; then the transaction's own coins are
+       appended (or held).
 
-  The end. Let c be the height of the last block on the curve and D the settlement deadline. The
+  The end. Let c be the height of the last block on a curve and D the settlement deadline. The
   last draw happens at c + 6 and no proof counts above c + D, so once the tip is not a curve block
-  and stands at c + D or higher the sats leg is over: the state is closed. Blocks above that
+  and stands at c + D or higher both legs are over: the state is closed. Blocks above that
   height are not looked at (their coins, spends, headers and proofs change nothing; only their
   hashes are kept, to answer for them). Nothing earns any more. A reorg that goes back below c + D
   reopens the state by the ordinary undo.
@@ -46,21 +56,36 @@ from .ser import Reader, Tx, TxOut, work_from_bits
 
 DRAW_DELAY = Y.DRAW_DELAY
 PAYEE_NAMES = ("holder", "creator", "dev")
+BTC, QWEN = Y.BTC, Y.QWEN                # a block's quote, as an index
+QUOTE_NAMES = Y.QUOTE_NAMES              # ... and as the node names it
 Outpoint = Tuple[bytes, int]  # (txid in internal byte order, output index)
 
 
 @dataclass(frozen=True)
 class Params:
     launch_id: bytes  # internal byte order
-    min_payment: int
+    min_payment: int  # of the sats leg
     settle_deadline: int
     btc_confs: int
     creator_btc_script: bytes
-    dev_btc_script: bytes = Y.DEV_BTC_SCRIPT
+    dev_btc_script: bytes = Y.DEV_BTC_SCRIPT  # the dev is paid at these same script bytes on Qwencoin
+    qwen_min_payment: int = 10_000
+    qwen_confs: int = 6
+    creator_qwen_script: bytes = b""
 
     @classmethod
     def from_launch(cls, d) -> "Params":
-        return cls(d.id, d.sats_min_payment, d.settle_deadline, d.btc_confs, d.creator_btc_script)
+        return cls(d.id, d.sats_min_payment, d.settle_deadline, d.btc_confs, d.creator_btc_script,
+                   qwen_min_payment=d.qwen_min_payment, qwen_confs=d.qwen_confs, creator_qwen_script=d.creator_qwen_script)
+
+    def min_pay(self, quote: int) -> int:
+        return self.qwen_min_payment if quote == QWEN else self.min_payment
+
+    def confs(self, quote: int) -> int:
+        return self.qwen_confs if quote == QWEN else self.btc_confs
+
+    def creator_script(self, quote: int) -> bytes:
+        return self.creator_qwen_script if quote == QWEN else self.creator_btc_script
 
 
 @dataclass
@@ -77,15 +102,18 @@ class Block:
     hash: bytes       # internal byte order
     work_hash: bytes  # the hash that carried the work: the block's own, or its auxpow parent's
     curve: bool
-    owed: int
+    owed: int         # in base units of the block's quote
     txs: List[StateTx]
+    quote: int = BTC  # the curve the block is on (bit 9 of its version); BTC for a block on neither
 
 
-# ---------------------------------------------------------------- the Bitcoin header relay
+# ---------------------------------------------------------------- the header relays (Bitcoin, Qwencoin)
 class Relay:
-    """What the state asks of the Bitcoin header relay."""
+    """What the state asks of a header relay: the Bitcoin one, or the Qwencoin one."""
 
-    def accept(self, header: bytes) -> bool:  # True if the header was added (and must be undone)
+    def accept(self, header: bytes, budget: Optional[List[int]] = None) -> bool:
+        """True if the header was added (and must be undone). budget: [work evaluations this launch
+        block has left], where they are limited (the Qwencoin relay)."""
         raise NotImplementedError
 
     def remove(self, hash_: bytes) -> None:
@@ -102,17 +130,27 @@ class Relay:
 
 
 class HeaderRelay(Relay):
-    """The real rules: yieldmodel.BtcChain from the launch's anchor."""
+    """The real rules: yieldmodel.BtcChain from the launch's anchor (or, with chain=, any header
+    tree with that interface: yieldmodel.QwenChain for the Qwencoin relay)."""
 
-    def __init__(self, anchor_header: bytes, anchor_height: int, anchor_period_time: int, regtest: bool):
-        self.chain = Y.BtcChain(anchor_header, anchor_height, anchor_period_time, regtest)
+    def __init__(self, anchor_header: bytes = b"", anchor_height: int = 0, anchor_period_time: int = 0,
+                 regtest: bool = False, chain=None):
+        self.chain = chain if chain is not None else Y.BtcChain(anchor_header, anchor_height, anchor_period_time, regtest)
 
     @classmethod
     def from_launch(cls, d) -> "HeaderRelay":
         return cls(d.btc_anchor_header, d.btc_anchor_height, d.btc_anchor_period_time, d.btc_regtest)
 
-    def accept(self, header: bytes) -> bool:
-        return self.chain.accept(header)[0]
+    @classmethod
+    def qwen_from_launch(cls, d, work_value=Y.no_qwork) -> "HeaderRelay":
+        """The Qwencoin relay of a launch. work_value: a Qwencoin header's proof-of-work value, for a
+        launch that follows a real Qwencoin (hashfun.qwork.work_value with the table; without one no
+        header can be shown to have work, and none is accepted)."""
+        return cls(chain=Y.QwenChain(d.qwen_anchor_header, d.qwen_anchor_height, d.qwen_anchor_period_time,
+                                     d.qwen_regtest, work_value))
+
+    def accept(self, header: bytes, budget: Optional[List[int]] = None) -> bool:
+        return self.chain.accept(header, budget)[0]
 
     def remove(self, hash_: bytes) -> None:
         self.chain.remove(hash_)
@@ -145,10 +183,14 @@ class StubRelay(Relay):
         self.blocks = blocks if blocks is not None else {}  # shared with the test, which may add to it
         self.headers: List[bytes] = []
 
-    def accept(self, header: bytes) -> bool:
+    def accept(self, header: bytes, budget: Optional[List[int]] = None) -> bool:
         h = sha256d(header)
         if h in self.headers:
             return False
+        if budget is not None:  # every new header is one that reaches the work check
+            if budget[0] <= 0:
+                return False
+            budget[0] -= 1
         self.headers.append(h)
         return True
 
@@ -171,7 +213,7 @@ class Coin:
     txid: bytes
     vout: int
     value: int
-    script: bytes  # where its yield is paid on Bitcoin
+    script: bytes  # where its yield is paid, on Bitcoin and on Qwencoin
     live: bool = True
 
 
@@ -185,9 +227,9 @@ class Info:
     released: bool = False                                     # ... and whether they have been appended since
     draw_known: bool = False
     seed: bytes = b""
-    pay: int = 0                                   # sats due (0 also when a holder draw found nobody holding)
+    pay: int = 0                                   # due, in the block's quote (0 also when a holder draw found nobody holding)
     payee: int = Y.HOLDER                          # the class the draw gave, also when nothing is due
-    pay_script: bytes = b""                        # the Bitcoin script to pay; empty when nothing is due
+    pay_script: bytes = b""                        # the script to pay on the quote's chain; empty when nothing is due
     coin: Optional[Tuple[bytes, int, int]] = None  # the payee coin of a holder draw: (txid, vout, value)
     earning: int = 0                               # live value at the draw
     settled: bool = False
@@ -198,22 +240,31 @@ class Info:
     settled_here: List[int] = field(default_factory=list)   # mint heights it settled
     relayed: List[bytes] = field(default_factory=list)      # Bitcoin headers it added
     drew: int = -1                                         # the mint height whose draw it made
+    quote: int = BTC                                       # the curve the block is on
+    qrelayed: List[bytes] = field(default_factory=list)     # Qwencoin headers it added
 
 
 class State:
-    def __init__(self, params: Params, relay: Relay):
+    def __init__(self, params: Params, relay: Relay, qrelay: Optional[Relay] = None):
+        """relay: the Bitcoin header relay. qrelay: the Qwencoin one (a StubRelay that knows no block
+        when none is given: then nothing on the QWEN curve can settle)."""
         self.p, self.relay = params, relay
+        self.qrelay = qrelay if qrelay is not None else StubRelay()
         self.coins: List[Coin] = []
         self.info: List[Info] = []    # one per tracked height, from genesis
-        self.above: List[bytes] = []  # hashes of the blocks past the end of the sats leg: nothing else of them is kept
+        self.above: List[bytes] = []  # hashes of the blocks past the end of the legs: nothing else of them is kept
 
     @classmethod
-    def replay(cls, params: Params, relay_factory: Callable[[], Relay], blocks: List[Block]) -> "State":
+    def replay(cls, params: Params, relay_factory: Callable[[], Relay], blocks: List[Block],
+               qrelay_factory: Optional[Callable[[], Relay]] = None) -> "State":
         """The state of a chain, from nothing: the definition everything else must equal."""
-        s = cls(params, relay_factory())
+        s = cls(params, relay_factory(), qrelay_factory() if qrelay_factory else None)
         for b in blocks:
             s.connect(b)
         return s
+
+    def relay_of(self, quote: int) -> Relay:
+        return self.qrelay if quote == QWEN else self.relay
 
     # ---- queries
     def height(self) -> int:
@@ -254,13 +305,14 @@ class State:
 
     def obligation(self, height: int) -> dict:
         """What the node reports as `getmintobligation HEIGHT`."""
-        if height > self.tracked():  # a block past the end of the sats leg: it owes nothing and never did
+        if height > self.tracked():  # a block past the end of the legs: it owes nothing and never did
             hash_ = self.above[height - len(self.info)]
-            return {"height": height, "hash": hash_[::-1].hex(), "curve": False, "owed": 0, "draw_known": False,
-                    "draw_height": height + DRAW_DELAY, "settled": False, "spendable": True,
+            return {"height": height, "hash": hash_[::-1].hex(), "curve": False, "quote": "btc", "owed": 0,
+                    "draw_known": False, "draw_height": height + DRAW_DELAY, "settled": False, "spendable": True,
                     "deadline_height": height + self.p.settle_deadline, "tag": Y.pay_tag(self.p.launch_id, hash_).hex()}
         i = self.info[height]
-        r = {"height": height, "hash": i.hash[::-1].hex(), "curve": i.curve, "owed": i.owed, "draw_known": i.draw_known,
+        r = {"height": height, "hash": i.hash[::-1].hex(), "curve": i.curve, "quote": QUOTE_NAMES[i.quote], "owed": i.owed,
+             "draw_known": i.draw_known,
              "draw_height": height + DRAW_DELAY, "settled": i.settled, "spendable": self.spendable(height),
              "deadline_height": height + self.p.settle_deadline, "tag": Y.pay_tag(self.p.launch_id, i.hash).hex()}
         if i.draw_known:
@@ -276,8 +328,9 @@ class State:
         coins = tuple((c.txid, c.vout, c.value, c.script, c.live) for c in self.coins)
         info = tuple((i.hash, i.curve, i.owed, None if i.held is None else tuple(i.held), i.released, i.draw_known, i.seed,
                       i.pay, i.payee, i.pay_script, i.coin, i.earning, i.settled, i.coins_before, tuple(i.killed),
-                      tuple(i.released_here), tuple(i.settled_here), tuple(i.relayed), i.drew) for i in self.info)
-        return coins, info, tuple(self.above), self.relay.snapshot()
+                      tuple(i.released_here), tuple(i.settled_here), tuple(i.relayed), i.drew, i.quote,
+                      tuple(i.qrelayed)) for i in self.info)
+        return coins, info, tuple(self.above), self.relay.snapshot(), self.qrelay.snapshot()
 
     # ---- connect
     def connect(self, b: Block) -> bool:
@@ -289,18 +342,19 @@ class State:
             self.above.append(b.hash)
             return False
         h = len(self.info)
-        cur = Info(hash=b.hash, curve=b.curve, owed=b.owed if b.curve else 0, coins_before=len(self.coins))
+        cur = Info(hash=b.hash, curve=b.curve, owed=b.owed if b.curve else 0, coins_before=len(self.coins),
+                   quote=b.quote if b.curve else BTC)
 
         # 1. The draw of block h - 6, over the coins that are live at the end of block h - 1.
         m = h - DRAW_DELAY
         if m >= 1 and self.info[m].curve:
             d = self.info[m]
             seed = Y.draw_seed(self.p.launch_id, b.work_hash)
-            pay, payee = Y.compute_draw(d.owed, self.p.min_payment, seed)
+            pay, payee = Y.compute_draw(d.owed, self.p.min_pay(d.quote), seed)
             total = self.live_value()
             if payee == Y.HOLDER and total == 0:
                 pay = 0  # nobody holds yet: the holders' share is owed to no one
-            script, coin = self._payee(payee, seed, total) if pay > 0 else (b"", None)
+            script, coin = self._payee(payee, seed, total, d.quote) if pay > 0 else (b"", None)
             d.draw_known, d.seed, d.pay, d.payee, d.pay_script, d.coin, d.earning = True, seed, pay, payee, script, coin, total
             cur.drew = m
             if pay == 0:
@@ -308,6 +362,7 @@ class State:
 
         # 2. The transactions.
         self.info.append(cur)
+        passes = [Y.MAX_QWEN_PASSES]  # Qwencoin headers whose work this block may still have evaluated
         for tx in b.txs:
             if not tx.coinbase:
                 for outpoint in tx.inputs:
@@ -322,12 +377,25 @@ class State:
                         if self.relay.accept(header):
                             cur.relayed.append(sha256d(header))
                     continue
-                data = Y.tagged_return(script, b"HFP1")
+                data = Y.tagged_return(script, b"HFH2")
                 if data is not None:
-                    proof = Y.PaymentProof.parse(data)
-                    if proof is not None and self._try_settle(proof, h):
-                        cur.settled_here.append(proof.mint_height)
-                        self._release(proof.mint_height, cur)
+                    # Qwencoin headers count in the coinbase only. Checking one costs every node a pass
+                    # through the weights and a header that fails costs its relayer nothing: in any
+                    # transaction, a block's eight checks could be bought for a fee and put ahead of the
+                    # miner's own. Anywhere else the output is not looked at and costs nothing.
+                    if tx.coinbase:
+                        for header in Y.parse_btc_headers(data) or []:
+                            if self.qrelay.accept(header, passes):
+                                cur.qrelayed.append(sha256d(header))
+                    continue
+                for quote, tag in ((BTC, b"HFP1"), (QWEN, b"HFP2")):
+                    data = Y.tagged_return(script, tag)
+                    if data is not None:
+                        proof = Y.PaymentProof.parse(data)
+                        if proof is not None and self._try_settle(proof, h, quote):
+                            cur.settled_here.append(proof.mint_height)
+                            self._release(proof.mint_height, cur)
+                        break
             coins = Y.registered_outputs(SimpleNamespace(vout=[TxOut(v, s) for v, s in tx.outputs]), tx.coinbase)
             if tx.coinbase and cur.curve and cur.owed > 0:
                 cur.held = [(tx.txid, vout, value, script) for vout, value, script in coins]
@@ -335,12 +403,14 @@ class State:
                 self.coins.extend(Coin(tx.txid, vout, value, script) for vout, value, script in coins)
         return True
 
-    def _payee(self, payee: int, seed: bytes, total: int) -> Tuple[bytes, Optional[Tuple[bytes, int, int]]]:
-        """Who a draw with something due pays: (Bitcoin script, the payee coin of a holder draw)."""
+    def _payee(self, payee: int, seed: bytes, total: int, quote: int = BTC) -> Tuple[bytes, Optional[Tuple[bytes, int, int]]]:
+        """Who a draw with something due pays: (the script on the quote's chain, the payee coin of a
+        holder draw). The dev's script and a holder's are the same bytes on both chains; the creator
+        named one per chain."""
         if payee == Y.DEV:
             return self.p.dev_btc_script, None
         if payee == Y.CREATOR:
-            return self.p.creator_btc_script, None
+            return self.p.creator_script(quote), None
         x = Y.candidate_point(seed, 0, total)  # total > 0: a holder draw over nothing is not due
         acc = 0
         for c in self.coins:
@@ -367,18 +437,23 @@ class State:
         d.released = True
         cur.released_here.append(mint_height)
 
-    def _try_settle(self, proof: Y.PaymentProof, h: int) -> bool:
+    def _try_settle(self, proof: Y.PaymentProof, h: int, quote: int = BTC) -> bool:
+        """quote: the chain the proof speaks of (HFP1: Bitcoin, HFP2: Qwencoin). It settles only a
+        block of that quote's curve, against that chain's relay."""
         m = proof.mint_height
         if m < 1 or h <= m + DRAW_DELAY or h > m + self.p.settle_deadline:
             return False
         d = self.info[m]  # exists: m < h
         if not d.curve or not d.draw_known or d.pay == 0 or d.settled:
             return False
+        if d.quote != quote:
+            return False
         if proof.candidate != 0:
             return False
-        if self.relay.confirmations(proof.btc_block) < self.p.btc_confs:
+        relay = self.relay_of(quote)
+        if relay.confirmations(proof.btc_block) < self.p.confs(quote):
             return False
-        root = self.relay.merkle_root(proof.btc_block)
+        root = relay.merkle_root(proof.btc_block)
         if root is None:
             return False
         ok, _why = Y.verify_btc_payment(proof, root, Y.pay_tag(self.p.launch_id, d.hash), d.pay_script, d.pay)
@@ -396,6 +471,8 @@ class State:
         cur = self.info.pop()
         for hash_ in reversed(cur.relayed):  # children before parents
             self.relay.remove(hash_)
+        for hash_ in reversed(cur.qrelayed):
+            self.qrelay.remove(hash_)
         for m in cur.settled_here:
             self.info[m].settled = False
         for m in cur.released_here:
@@ -410,11 +487,29 @@ class State:
 
 
 # ---------------------------------------------------------------- blocks from a node
-def _on_curve_and_owed(d, height: int, bits: int, work_before: int) -> Tuple[bool, int]:
-    """work_before: the chain's work above genesis at the parent. A block is on the curve while its
-    parent has not graduated; a curve block owes sats for its own work."""
-    curve = height >= 1 and work_before < d.graduation_work
-    return curve, (Y.owed(work_from_bits(bits), d.sats_num, d.sats_shift) if curve else 0)
+Works = Tuple[int, int]  # (Wb, Wq): the work mined on the BTC and on the QWEN curve, genesis in neither
+
+
+def _curve_quote_owed(d, height: int, bits: int, version: int, before: Works) -> Tuple[bool, int, int]:
+    """before: the two curves' work at the parent. A block is on a curve while its parent has not
+    graduated; bit 9 of its version says which one, and it owes that curve's asset for its own work.
+    Returns (on a curve, quote, owed)."""
+    curve = height >= 1 and not d.graduated(*before)
+    quote = QWEN if curve and version & Y.LAUNCH_VERSION_QWEN else BTC
+    return curve, quote, (d.owed(work_from_bits(bits), QUOTE_NAMES[quote]) if curve else 0)
+
+
+def works_after(d, before: Works, bits: int, version: int, height: int) -> Works:
+    """The two curves' work once a block with these bits and this version stands on `before`. A block
+    counts for the QWEN curve only if its bit is set and its parent has not graduated (on a valid
+    chain the bit is never set after graduation); everything else above genesis counts for the BTC
+    side, the tail included."""
+    if height < 1:
+        return before
+    w = work_from_bits(bits)
+    if version & Y.LAUNCH_VERSION_QWEN and not d.graduated(*before):
+        return before[0], before[1] + w
+    return before[0] + w, before[1]
 
 
 def _state_tx(tx: Tx) -> StateTx:
@@ -423,10 +518,10 @@ def _state_tx(tx: Tx) -> StateTx:
                    [(o.value, o.script_pubkey) for o in tx.vout])
 
 
-def block_from_raw(d, raw: bytes, height: int, work_before: int) -> Tuple[Block, int]:
+def block_from_raw(d, raw: bytes, height: int, before: Works) -> Tuple[Block, Works]:
     """A node's serialized block (`getblock HASH 0`) as the model's block, with nothing taken on
     trust: amounts are the integers in the block, and the hash that carried the work is computed
-    here. Returns (block, the block's own work)."""
+    here. before: the two curves' work at the parent. Returns (block, the two curves' work after it)."""
     r = Reader(raw)
     header = r.read(80)
     version = int.from_bytes(header[:4], "little", signed=True)
@@ -445,13 +540,14 @@ def block_from_raw(d, raw: bytes, height: int, work_before: int) -> Tuple[Block,
     txs = [Tx._parse(r) for _ in range(r.varint())]
     if not r.done():
         raise ValueError("trailing bytes after the block")
-    curve, owed = _on_curve_and_owed(d, height, bits, work_before)
-    return Block(height, sha256d(header), work_hash, curve, owed, [_state_tx(t) for t in txs]), work_from_bits(bits)
+    curve, quote, owed = _curve_quote_owed(d, height, bits, version, before)
+    return (Block(height, sha256d(header), work_hash, curve, owed, [_state_tx(t) for t in txs], quote),
+            works_after(d, before, bits, version, height))
 
 
-def block_from_json(d, blk: dict, work_before: int) -> Tuple[Block, int]:
+def block_from_json(d, blk: dict, before: Works) -> Tuple[Block, Works]:
     """The same from `getblock HASH 2`. Amounts come as decimal coins: exact once rounded to units."""
-    height, bits = blk["height"], int(blk["bits"], 16)
+    height, bits, version = blk["height"], int(blk["bits"], 16), blk["version"]
     hash_ = bytes.fromhex(blk["hash"])[::-1]
     work_hash = hash_
     aux = blk.get("auxpow")
@@ -467,33 +563,36 @@ def block_from_json(d, blk: dict, work_before: int) -> Tuple[Block, int]:
         txs.append(StateTx(bytes.fromhex(t["txid"])[::-1], coinbase,
                            [] if coinbase else [(bytes.fromhex(i["txid"])[::-1], i["vout"]) for i in t["vin"]],
                            [(round(o["value"] * 100_000_000), bytes.fromhex(o["scriptPubKey"]["hex"])) for o in t["vout"]]))
-    curve, owed = _on_curve_and_owed(d, height, bits, work_before)
-    return Block(height, hash_, work_hash, curve, owed, txs), work_from_bits(bits)
+    curve, quote, owed = _curve_quote_owed(d, height, bits, version, before)
+    return Block(height, hash_, work_hash, curve, owed, txs, quote), works_after(d, before, bits, version, height)
 
 
 class Follower:
     """A State kept in step with a node's active chain, built from the node's own blocks.
 
     sync() follows whatever the node did: new blocks are connected, and after a reorg the model
-    disconnects down to the fork first. rebuilt() is the same chain replayed from nothing."""
+    disconnects down to the fork first. rebuilt() is the same chain replayed from nothing.
 
-    def __init__(self, d, rpc, check_json: bool = True):
-        self.d, self.rpc, self.check_json = d, rpc, check_json
-        self.state = State(Params.from_launch(d), HeaderRelay.from_launch(d))
+    qwork: a Qwencoin header's work value, for a launch that follows a real Qwencoin (see
+    HeaderRelay.qwen_from_launch); a regtest Qwencoin needs none."""
+
+    def __init__(self, d, rpc, check_json: bool = True, qwork=Y.no_qwork):
+        self.d, self.rpc, self.check_json, self.qwork = d, rpc, check_json, qwork
+        self.state = State(Params.from_launch(d), HeaderRelay.from_launch(d), HeaderRelay.qwen_from_launch(d, qwork))
         self.blocks: List[Block] = []
-        self.work: List[int] = []  # work above genesis at each height
+        self.work: List[Works] = []  # (Wb, Wq) at each height
 
-    def _read(self, height: int) -> Tuple[Block, int]:
+    def _read(self, height: int) -> Tuple[Block, Works]:
         hash_hex = self.rpc.getblockhash(height)
-        before = self.work[height - 1] if height >= 1 else 0
-        block, own = block_from_raw(self.d, bytes.fromhex(self.rpc.getblock(hash_hex, 0)), height, before)
+        before = self.work[height - 1] if height >= 1 else (0, 0)
+        block, after = block_from_raw(self.d, bytes.fromhex(self.rpc.getblock(hash_hex, 0)), height, before)
         if block.hash[::-1].hex() != hash_hex:
             raise AssertionError(f"block {height}: the node calls it {hash_hex}, its header hashes to {block.hash[::-1].hex()}")
         if self.check_json:
             other, _ = block_from_json(self.d, self.rpc.getblock(hash_hex, 2), before)
             if other != block:
                 raise AssertionError(f"block {height}: the serialized block and the node's JSON describe different blocks")
-        return block, (own if height >= 1 else 0)
+        return block, after
 
     def sync(self) -> Tuple[int, int]:
         """Returns (blocks disconnected, blocks connected)."""
@@ -505,15 +604,16 @@ class Follower:
             self.work.pop()
             undone += 1
         for height in range(len(self.blocks), tip + 1):
-            block, own = self._read(height)
+            block, after = self._read(height)
             self.state.connect(block)
             self.blocks.append(block)
-            self.work.append((self.work[-1] if self.work else 0) + own)
+            self.work.append(after)
             done += 1
         return undone, done
 
     def rebuilt(self) -> State:
-        return State.replay(Params.from_launch(self.d), lambda: HeaderRelay.from_launch(self.d), self.blocks)
+        return State.replay(Params.from_launch(self.d), lambda: HeaderRelay.from_launch(self.d), self.blocks,
+                            lambda: HeaderRelay.qwen_from_launch(self.d, self.qwork))
 
 
 def differences(node: dict, model: dict) -> List[str]:

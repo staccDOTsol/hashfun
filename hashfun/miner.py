@@ -15,6 +15,8 @@ from .stratum import swap32_words, target_for_difficulty
 
 log = logging.getLogger("hashfun.miner")
 
+CONNECT_SECONDS = 20  # how long a refused connection is tried again before the miner gives up
+
 
 class StratumMiner:
     def __init__(self, host, port, username, password="x", batch=20000, max_shares=None, duty=1.0):
@@ -82,7 +84,17 @@ class StratumMiner:
         return found
 
     async def run(self, duration=None):
-        self.reader, self.writer = await asyncio.open_connection(self.host, self.port)
+        # A pool that was started a moment ago opens its port once its node has given it a first template,
+        # and how long that takes is a matter of the machine: a refused connection is tried again for a while.
+        t_connect = time.time()
+        while True:
+            try:
+                self.reader, self.writer = await asyncio.open_connection(self.host, self.port)
+                break
+            except ConnectionRefusedError:
+                if time.time() - t_connect > CONNECT_SECONDS:
+                    raise
+                await asyncio.sleep(0.2)
         rt = asyncio.get_running_loop().create_task(self._reader())
         sub = await (await self._send("mining.subscribe", ["hashfun-miner/0.1"]))
         _, en1, en2_size = sub["result"]

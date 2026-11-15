@@ -2,16 +2,21 @@
 
   hashfun launch new ...            create a coin (descriptor + genesis); `launch info` to inspect
   hashfun node add <descriptor>     register a launch on this machine (--peer host:port of a node to join;
-                                    --btc-rpc URL first asks your Bitcoin node whether the launch's Bitcoin
-                                    anchor is true, as `hashfun mine` does before its first block)
+                                    --btc-rpc URL / --qwen-rpc URL first ask your Bitcoin / Qwencoin node
+                                    whether the launch's anchor on that chain is true, as `hashfun mine`
+                                    does before its first block)
   hashfun node up [TICKER ...]      start a hashfund node per launch (all registered if none named);
                                     --first for the first node of a new launch (it has no peers yet)
-  hashfun node ls                   height, curve progress, graduation, peers
+  hashfun node ls                   height, both curves' progress, graduation, peers
   hashfun node rpc TICKER METHOD [ARGS ...]
   hashfun node down [TICKER ...]
   hashfun mine TICKER --payout ADDR start a pool for the launch and (optionally) a CPU miner on it;
                                     merge-mines every other registered launch that has graduated and
-                                    pays and proves the Bitcoin each block owes (needs --btc-rpc)
+                                    pays and proves what each block owes: sats on Bitcoin for the BTC
+                                    curve (--btc-rpc), qwen on Qwencoin for the QWEN curve (--qwen-rpc).
+                                    --curve btc|qwen says which one to mine
+  hashfun qwork fetch|check|path    Qwencoin's work table (528 MB, once per machine): a node of a launch
+                                    needs it to check the Qwencoin headers relayed into the launch
   hashfun web --btc-rpc URL         the site: board, coin pages, launch form, swaps signed in the browser
   hashfun wallet ... | swap ... | pool ... | proxy ... | electrum ... | board ... | miner ...
                                     the individual tools (same arguments as hashfun-<tool>)
@@ -39,10 +44,11 @@ import time
 from typing import Dict, List, Optional
 
 from . import descriptor as D
+from .btclight import connect as btc_light, is_light_url
 from .rpc import RPC, RPCError
 
 TOOLS = {"launch": "launch", "wallet": "wallet", "swap": "swap", "pool": "pool_cli", "proxy": "proxy",
-         "electrum": "electrum", "board": "board", "miner": "miner", "web": "web"}
+         "electrum": "electrum", "board": "board", "miner": "miner", "web": "web", "qwork": "qwork"}
 
 
 def home() -> str:
@@ -137,6 +143,23 @@ def free_port() -> int:
     raise RuntimeError("no free port between 20000 and 32767")
 
 
+def port_in_use(port: int) -> bool:
+    """Is something on this machine listening on that port now? Another program, or a node of the
+    same launch started from another folder: a launch's ports come from its id, so they are the
+    same numbers on every machine."""
+    for host in ("127.0.0.1", "0.0.0.0"):
+        s = socket.socket()
+        try:
+            # (reuse: a port whose last listener has just gone is free; one that is listened on is not)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind((host, port))
+        except OSError:
+            return True
+        finally:
+            s.close()
+    return False
+
+
 def check_btc_anchor(d: D.Launch, btc, what: str):
     """Stop (exit, with the reason) unless the Bitcoin node `btc` says the launch's Bitcoin anchor is
     true: the header of the block at that height on its chain, with the right difficulty-period start.
@@ -150,6 +173,38 @@ def check_btc_anchor(d: D.Launch, btc, what: str):
         D.check_anchor(d, btc)
     except D.DescriptorError as e:
         sys.exit(f"{what}: {e}")
+
+
+def check_qwen_anchor(d: D.Launch, qwen, what: str):
+    """The same for the launch's Qwencoin anchor and a Qwencoin node. Here the node's word is all
+    there is: a launch file cannot show that its Qwencoin anchor is a Qwencoin block at all (that
+    takes the chain's weights), so a file from someone else is a claim until a Qwencoin node, or the
+    launch's own hashfund at its start, has looked."""
+    try:
+        D.check_qwen_anchor(d, qwen)
+    except D.DescriptorError as e:
+        sys.exit(f"{what}: {e}")
+
+
+def qwork_args(d: D.Launch, what: str, fetch: bool = False) -> List[str]:
+    """What a hashfund of this launch needs on its command line for the Qwencoin relay: nothing on a
+    regtest Qwencoin, -qwork=<the table> on the real one. fetch: download the table (528 MB, once per
+    machine) if it is not there; otherwise stop and say how to get it."""
+    if d.qwen_regtest:
+        return []
+    from . import qwork
+    path = qwork.default_path()
+    why = qwork.quick_problem(path)
+    if why and fetch:
+        try:
+            qwork.fetch(path, say=lambda t: print(t, file=sys.stderr, flush=True))
+        except RuntimeError as e:
+            sys.exit(f"{what}: {e}")
+    elif why:
+        sys.exit(f"{what}: its QWEN leg follows the real Qwencoin, and a node needs that chain's work table to check the "
+                 f"Qwencoin headers relayed into the launch: {why}. Get it once with `hashfun qwork fetch` (528 MB), or copy "
+                 "qwork.bin from a Qwencoin node's folder there")
+    return [f"-qwork={path}"]
 
 
 class Registry:
@@ -168,10 +223,10 @@ class Registry:
             json.dump(self.data, f, indent=1)
         os.replace(tmp, self.path)
 
-    def add(self, descriptor_path: str, peers=(), p2p_port: Optional[int] = None, btc=None) -> str:
-        """Register a launch file. btc: a Bitcoin RPC of the network the launch follows; with it the
-        launch's Bitcoin anchor is checked against that node first (see check_btc_anchor), and a
-        launch that fails is not registered."""
+    def add(self, descriptor_path: str, peers=(), p2p_port: Optional[int] = None, btc=None, qwen=None) -> str:
+        """Register a launch file. btc / qwen: an RPC of the Bitcoin / the Qwencoin network the launch
+        follows; with it the launch's anchor on that chain is checked against that node first (see
+        check_btc_anchor, check_qwen_anchor), and a launch that fails is not registered."""
         d = D.load(descriptor_path)
         try:
             from .meta import MetaError, check
@@ -180,6 +235,8 @@ class Registry:
             sys.exit(f"{descriptor_path}: {e}")
         if btc is not None:
             check_btc_anchor(d, btc, descriptor_path)
+        if qwen is not None:
+            check_qwen_anchor(d, qwen, descriptor_path)
         base = os.path.join(home(), "launches", f"{d.ticker}-{d.id_hex[:8]}")
         os.makedirs(base, exist_ok=True)
         dst = os.path.join(base, "descriptor.json")
@@ -188,17 +245,24 @@ class Registry:
         if old and old["id"] != d.id_hex:
             sys.exit(f"{d.ticker} is already registered with a different launch id ({old['id'][:16]}...)")
         # The RPC port: the one already registered; else the launch's own (one under its P2P port),
-        # unless another registered launch has it; else any free one that is not this launch's P2P port.
+        # unless another registered launch has it or something on this machine listens there; else
+        # any free one that is not this launch's P2P port. The P2P port: the one asked for; else the
+        # one already registered; else the launch's own (not written down), unless something on this
+        # machine listens there, and then a free one. A node whose port is taken does not start, and
+        # nothing about a launch depends on which port its node has here.
+        p2pport = p2p_port or (old or {}).get("p2pport")
+        if not old and not p2pport and port_in_use(d.p2p):
+            p2pport = free_port()
         rpcport = (old or {}).get("rpcport")
-        taken = {e.get("rpcport") for t, e in self.data.items() if t != d.ticker} | {p2p_port or d.p2p}
+        taken = {e.get("rpcport") for t, e in self.data.items() if t != d.ticker} | {p2pport or d.p2p}
         if not rpcport:
             rpcport = d.rpc
-            while rpcport in taken:
+            while rpcport in taken or port_in_use(rpcport):
                 rpcport = free_port()
         self.data[d.ticker] = {"id": d.id_hex, "descriptor": dst, "datadir": os.path.join(base, "node"),
                                "rpcport": rpcport,
                                "peers": sorted(set((old or {}).get("peers", [])) | set(peers)),
-                               "p2pport": p2p_port or (old or {}).get("p2pport")}
+                               "p2pport": p2pport}
         self.save()
         return d.ticker
 
@@ -227,15 +291,18 @@ class Registry:
                 pass
         return None
 
-    def up(self, ticker: str, extra: List[str] = ()) -> bool:
-        """Start the node if it is not running. True if it was started now."""
+    def up(self, ticker: str, extra: List[str] = (), fetch_table: bool = False) -> bool:
+        """Start the node if it is not running. True if it was started now. A launch that follows the
+        real Qwencoin is started with that chain's work table (qwork_args); fetch_table: download it
+        if this machine does not have it yet."""
         if self.rpc(ticker, timeout=3):
             return False
         e = self.get(ticker)
         os.makedirs(e["datadir"], exist_ok=True)
+        table = [] if any(str(x).startswith("-qwork=") for x in extra) else qwork_args(self.desc(ticker), ticker, fetch_table)
         args = [hashfund_binary(), f"-datadir={e['datadir']}", f"-launch={e['descriptor']}", "-server=1",
                 f"-rpcport={e['rpcport']}", "-rpcbind=127.0.0.1", "-rpcallowip=127.0.0.1", "-txindex=1",
-                "-printtoconsole=0", *[f"-addnode={x}" for x in e.get("peers", [])],
+                "-printtoconsole=0", *table, *[f"-addnode={x}" for x in e.get("peers", [])],
                 *([f"-port={e['p2pport']}"] if e.get("p2pport") else []), *extra]
         with open(os.path.join(e["datadir"], "stderr.log"), "ab") as err:
             p = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=err, start_new_session=True)
@@ -277,9 +344,15 @@ class Registry:
             return row
         try:
             i = r.getlaunchinfo()
-            row.update(running=True, height=i["height"], graduated=i["graduated"],
-                       curve_pct=round(100 * i["curve_supply"] / d.graduation_tokens, 4),
-                       hashes_per_coin=i["hashes_per_coin"], peers=r.getconnectioncount())
+            curves = i.get("curves") or {}
+            q = D.quote_summary(i)
+            row.update(running=True, height=i["height"], graduated=i["graduated"], graduated_by=i.get("graduated_by"),
+                       # each curve on its own: how much of it is sold, and its price point (base units of
+                       # its quote per coin: sats on the BTC curve, qwen-sats on the QWEN curve)
+                       curves={c: {"pct": round(100 * curves[c]["supply"] / d.graduation_tokens, 4),
+                                   "price_per_coin": curves[c]["owed_per_coin"], "blocks": curves[c]["blocks"]}
+                               for c in D.QUOTES if c in curves},
+                       implied_qwen_sats=q["implied_qwen_sats"], implied_is=q["bound"], peers=r.getconnectioncount())
         except Exception as e:
             row.update(running=True, error=str(e))
         return row
@@ -287,20 +360,25 @@ class Registry:
 
 def cmd_node(a, reg: Registry):
     if a.node_cmd == "add":
-        btc = None
-        if a.btc_rpc:
-            try:
-                btc = RPC(a.btc_rpc, cookie_file=a.btc_cookie)
-            except Exception as e:  # noqa: BLE001  (a URL that is not one, a cookie file that is not there)
-                sys.exit(f"--btc-rpc: {e}")
-        else:
-            print("note: the launch's Bitcoin anchor was not checked (no --btc-rpc URL of a Bitcoin node). "
-                  "`hashfun mine` checks it before it mines.", file=sys.stderr)
-        t = reg.add(a.descriptor, a.peer, a.p2p_port, btc=btc)
+        nodes = {}
+        for quote, chain in (("btc", "Bitcoin"), ("qwen", "Qwencoin")):
+            url = getattr(a, f"{quote}_rpc")
+            if url:
+                try:
+                    # (Bitcoin may be electrums://HOST:PORT,HOST:PORT: Electrum servers, no node; hashfun.btclight)
+                    nodes[quote] = (btc_light(url) if quote == "btc" and is_light_url(url) else
+                                    RPC(url, cookie_file=getattr(a, f"{quote}_cookie")))
+                except Exception as e:  # noqa: BLE001  (a URL that is not one, a cookie file that is not there)
+                    sys.exit(f"--{quote}-rpc: {e}")
+            else:
+                print(f"note: the launch's {chain} anchor was not checked (no --{quote}-rpc URL of a {chain} node). "
+                      "`hashfun mine` checks it before it mines with a wallet of that chain.", file=sys.stderr)
+        t = reg.add(a.descriptor, a.peer, a.p2p_port, btc=nodes.get("btc"), qwen=nodes.get("qwen"))
         print(json.dumps({"registered": t, **{k: v for k, v in reg.get(t).items()}}, indent=2))
     elif a.node_cmd == "up":
         extra = list(a.arg) + (["-minewithoutpeers"] if a.first else [])
-        print(json.dumps({t: "started" if reg.up(t, extra) else "already running" for t in reg.pick(a.tickers)}, indent=2))
+        print(json.dumps({t: "started" if reg.up(t, extra, fetch_table=True) else "already running"
+                          for t in reg.pick(a.tickers)}, indent=2))
     elif a.node_cmd == "down":
         print(json.dumps({t: "stopped" if reg.down(t) else "not running" for t in reg.pick(a.tickers)}, indent=2))
     elif a.node_cmd == "ls":
@@ -382,23 +460,36 @@ def _test_launch(name: str, graduation_hashes: int):
     return d, spk
 
 
-def _check_mints(rpc: RPC, d, upto: int):
-    """The node's arithmetic against this CLI's own copy of the consensus rules, block by block."""
-    work = 0  # the curve counts work above the genesis block
+def _check_mints(rpc: RPC, d, upto: int) -> dict:
+    """The node's arithmetic against this CLI's own copy of the consensus rules, block by block: what
+    each block mints on the curve its header puts it on, and what it owes in that curve's quote.
+    Returns how many blocks were on each curve."""
+    from .yieldstate import works_after
+    works, on = (0, 0), {"btc": 0, "qwen": 0}  # (Wb, Wq): each curve counts its own work, above the genesis block
     for h in range(1, upto + 1):
         blk = rpc.getblock(rpc.getblockhash(h), 2)
-        bits = int(blk["bits"], 16)
+        bits, quote = int(blk["bits"], 16), D.curve_of_version(blk["version"])
+        curve = not d.graduated(*works)
         minted = sum(round(v["value"] * D.COIN) for v in blk["tx"][0]["vout"])
-        if minted != d.subsidy(work, bits, h):
-            raise RuntimeError(f"block {h} minted {minted} units; the rules say {d.subsidy(work, bits, h)}")
+        want = d.subsidy(*works, quote, bits, h)
+        if minted != want:
+            raise RuntimeError(f"block {h} minted {minted} units; the rules say {want}")
         if not blk["tx"][0]["vin"][0]["coinbase"].startswith(d.coinbase_prefix(h).hex()):
             raise RuntimeError(f"block {h}: its coinbase does not start with the height and this launch's id")
-        work += D.work_from_bits(bits)
+        ob = rpc.getmintobligation(h)
+        owes = d.owed(D.work_from_bits(bits), quote) if curve else 0
+        if (ob.get("curve"), ob.get("quote"), ob.get("owed")) != (curve, quote if curve else "btc", owes):
+            raise RuntimeError(f"block {h}: the node says curve={ob.get('curve')} quote={ob.get('quote')} owed={ob.get('owed')}; "
+                               f"the rules say curve={curve} quote={quote if curve else 'btc'} owed={owes}")
+        if curve:
+            on[quote] += 1
+        works = works_after(d, works, bits, blk["version"], h)
+    return on
 
 
 def self_test(binary: str) -> str:
-    """Start the node on a throwaway test launch, mine on its curve, read what a block owes, stop.
-    Returns one line on success; raises RuntimeError with what went wrong."""
+    """Start the node on a throwaway test launch, mine on both of its curves, read what each block
+    owes, stop. Returns one line on success; raises RuntimeError with what went wrong."""
     from .ser import script_to_address
     t0 = time.time()
     d, spk = _test_launch("doctor self-test", 2 * 10**6)
@@ -407,17 +498,22 @@ def self_test(binary: str) -> str:
             raise RuntimeError("the node's genesis block is not the one the launch file commits to")
         addr, mined = script_to_address(spk, d.hrp), 0
         for _ in range(200):
+            rpc.setminecurve("qwen" if mined % 2 else "btc")  # blocks 1, 3, 5 on the BTC curve, 2 and 4 on the QWEN curve
             mined += len(rpc.generatetoaddress(1, addr, 1_000_000))
             if mined >= 5:
                 break
-        info, owed = rpc.getlaunchinfo(), rpc.getmintobligation(1)
+        info = rpc.getlaunchinfo()
         if mined < 5 or info["height"] != mined:
             raise RuntimeError(f"mined {mined} blocks but the node is at height {info['height']}")
-        _check_mints(rpc, d, mined)
-        if owed.get("curve") is not True or not owed.get("owed", 0) > 0:
-            raise RuntimeError(f"block 1 should owe sats on the curve: {owed}")
-    return (f"node up on a test launch, {mined} blocks mined and every mint equal to the rules' own arithmetic, "
-            f"sats owed per block readable, clean stop ({time.time() - t0:.1f} s)")
+        on = _check_mints(rpc, d, mined)
+        if on != {"btc": 3, "qwen": 2}:
+            raise RuntimeError(f"3 blocks were mined on the BTC curve and 2 on the QWEN curve; the chain has {on}")
+        got = {c: (info["curves"][c]["blocks"], info["curves"][c]["supply"]) for c in D.QUOTES}
+        want = {"btc": (3, d.curve_supply(3 * 2)), "qwen": (2, d.curve_supply(2 * 2))}  # 2 hashes a block at this limit
+        if got != want:
+            raise RuntimeError(f"the node's two curves stand at {got}; the rules say {want}")
+    return (f"node up on a test launch, {mined} blocks mined on its two curves and every mint equal to the rules' own "
+            f"arithmetic, what each block owes (sats or qwen) readable, clean stop ({time.time() - t0:.1f} s)")
 
 
 # ---- one machine's chain, checked by another machine's node --------------------------------------
@@ -426,42 +522,57 @@ def self_test(binary: str) -> str:
 # graduation, into the tail) and writes it down with what this node concluded from it;
 # `doctor --replay FILE` feeds those blocks to this machine's node and requires the same conclusions.
 _UTXO_KEYS = ("height", "bestblock", "txouts", "total_amount", "hash_serialized_3")
-_INFO_KEYS = ("launch_id", "height", "work", "curve_supply", "tail_minted", "supply", "graduated", "graduation_height")
+_INFO_KEYS = ("launch_id", "height", "work", "curve_supply", "tail_minted", "supply", "graduated", "graduation_height",
+              "graduated_by")
+_CURVE_KEYS = ("work", "supply", "blocks", "last_height")  # of each curve: the whole numbers (no doubles: they may round apart)
+CHAIN_FORMAT = 2  # of the file `doctor --mine` writes: 2 = chains under rule set 3 (two curves)
 
 
 def _conclusions(rpc: RPC, height: int) -> dict:
     utxo, info = rpc.gettxoutsetinfo(), rpc.getlaunchinfo()
-    return {"tip": rpc.getbestblockhash(), "utxo": {k: utxo.get(k) for k in _UTXO_KEYS},
-            "state": {k: info.get(k) for k in _INFO_KEYS},
+    state = {k: info.get(k) for k in _INFO_KEYS}
+    state["curves"] = {c: {k: (info.get("curves") or {}).get(c, {}).get(k) for k in _CURVE_KEYS} for c in D.QUOTES}
+    return {"tip": rpc.getbestblockhash(), "utxo": {k: utxo.get(k) for k in _UTXO_KEYS}, "state": state,
             "owed": [rpc.getmintobligation(h) for h in range(1, height + 1)]}
 
 
 def mine_chain(binary: str, path: str, blocks: int = 120) -> str:
     from .ser import script_to_address
-    d, spk = _test_launch("doctor chain", 120)  # graduates after about 60 blocks at 2 hashes a block
+    # 2 hashes a block. Two blocks in three go to the BTC curve, which sells out after about 60 of its
+    # own: the launch graduates around block 90 with the QWEN curve a little over half sold, and the
+    # rest is tail. The miner keeps being told to change curve after that too: there is none left.
+    d, spk = _test_launch("doctor chain", 120)
     with _TestNode(binary, d.dumps()) as rpc:
         addr, t = script_to_address(spk, d.hrp), d.genesis_time
-        for _ in range(blocks):
+        for n in range(1, blocks + 1):
             t += d.target_spacing
             rpc.setmocktime(t)
+            rpc.setminecurve("qwen" if n % 3 == 0 else "btc")
             while not rpc.generatetoaddress(1, addr, 1_000_000):
                 pass
-        _check_mints(rpc, d, blocks)
-        out = {"hashfun_chain": 1, "by": {"target": platform_target(), "hashfund": _version_line(binary)},
+        on = _check_mints(rpc, d, blocks)
+        out = {"hashfun_chain": CHAIN_FORMAT, "by": {"target": platform_target(), "hashfund": _version_line(binary)},
                "launch": json.loads(d.dumps()), "blocks": [rpc.getblock(rpc.getblockhash(h), 0) for h in range(1, blocks + 1)],
                **_conclusions(rpc, blocks)}
-    if not out["state"]["graduated"] or not 0 < out["state"]["graduation_height"] < blocks:
-        raise RuntimeError(f"the test chain was meant to graduate on the way: {out['state']}")
+    state = out["state"]
+    if not state["graduated"] or not 0 < state["graduation_height"] < blocks or state["graduated_by"] != "btc":
+        raise RuntimeError(f"the test chain was meant to graduate by its BTC curve on the way: {state}")
+    if not on["qwen"] or not 0 < state["curves"]["qwen"]["supply"] < d.graduation_tokens:
+        raise RuntimeError(f"the test chain was meant to leave its QWEN curve part sold: {state}")
     with open(path, "w") as f:
         json.dump(out, f)
-    return (f"{blocks} blocks mined on a test launch (graduated at {out['state']['graduation_height']}), every mint equal to "
-            f"the rules' own arithmetic; written with this node's conclusions to {path}")
+    return (f"{blocks} blocks mined on a test launch ({on['btc']} on the BTC curve, {on['qwen']} on the QWEN curve, graduated "
+            f"by the BTC curve at {state['graduation_height']}), every mint and every debt equal to the rules' own "
+            f"arithmetic; written with this node's conclusions to {path}")
 
 
 def replay_chain(binary: str, path: str) -> str:
     with open(path) as f:
         data = json.load(f)
-    if data.get("hashfun_chain") != 1:
+    if data.get("hashfun_chain") == 1:
+        raise RuntimeError(f"{path} was written under the earlier rules (one curve): mine it again with this version's "
+                           "`hashfun doctor --mine`")
+    if data.get("hashfun_chain") != CHAIN_FORMAT:
         raise RuntimeError(f"{path} is not a chain written by `hashfun doctor --mine`")
     with _TestNode(binary, json.dumps(data["launch"])) as rpc:
         for h, raw in enumerate(data["blocks"], 1):
@@ -474,10 +585,10 @@ def replay_chain(binary: str, path: str) -> str:
             raise RuntimeError(f"same blocks, different {part}: here {json.dumps(mine[part])}, there {json.dumps(data[part])}")
     for h, (a, b) in enumerate(zip(mine["owed"], data["owed"]), 1):
         if a != b:
-            raise RuntimeError(f"same blocks, different sats owed for block {h}: here {json.dumps(a)}, there {json.dumps(b)}")
+            raise RuntimeError(f"same blocks, different debt for block {h}: here {json.dumps(a)}, there {json.dumps(b)}")
     by = data.get("by", {})
     return (f"{len(data['blocks'])} blocks mined by {by.get('target')} ({by.get('hashfund')}) accepted here; same tip, same UTXO set, "
-            f"same curve state (graduated at {mine['state'].get('graduation_height')}), same sats owed for every block")
+            f"same state of both curves (graduated at {mine['state'].get('graduation_height')}), the same owed for every block")
 
 
 def _version_line(binary: str) -> str:
@@ -538,28 +649,89 @@ def cmd_doctor(a) -> int:
     return 1 if bad else 0
 
 
+def loaded_wallets(node) -> Optional[List[str]]:
+    """The wallets a Bitcoin Core or Qwencoin node has loaded; [] for a node with none (or built
+    without a wallet); None when it could not be asked (then the node's URL is used as the wallet it
+    was given as, and a payment says what is wrong if there is none)."""
+    try:
+        names = node.listwallets()
+    except RPCError as e:
+        return [] if e.code == -32601 else None  # method not found: no wallet in this build
+    except Exception:  # noqa: BLE001  (not answering right now)
+        return None
+    return list(names) if isinstance(names, list) else None
+
+
 def build_source(reg: Registry, ticker: str, payout: Optional[str], btc_rpc: Optional[str], btc_hrp: str,
                  max_pay_sats: Optional[int] = None, btc_cookie: Optional[str] = None, btc_wallet: Optional[str] = None,
-                 pay_depth: int = 12):
+                 pay_depth: int = 12, curve: Optional[str] = None, qwen_rpc: Optional[str] = None,
+                 qwen_cookie: Optional[str] = None, qwen_wallet: Optional[str] = None, max_pay_qwen: Optional[int] = None):
     """LaunchSource for `ticker`, carrying every other registered, running launch as an aux chain
     (only graduated ones are merge-mined; the pool re-checks each round) and the Settler that pays
-    and proves the Bitcoin each curve block owes."""
+    and proves what each curve block owes, on Bitcoin and on Qwencoin.
+
+    curve: the curve to mine ("btc" / "qwen"). Left out, it is the one a wallet was given for; with
+    both wallets it has to be said."""
     from .settler import Settler
     from .stratum import LaunchSource
     d = reg.desc(ticker)
     rpc = reg.rpc(ticker)
     if not rpc:
         sys.exit(f"{ticker} is not running: hashfun node up {ticker}")
-    # Every curve block owes Bitcoin, so mining always needs a funded Bitcoin wallet.
-    if not btc_rpc:
-        sys.exit("pass --btc-rpc URL of a funded Bitcoin Core wallet (http://user:pass@host:port, plus "
-                 "--btc-wallet NAME): each block mined on the curve owes sats, paid and proven automatically")
-    btc = RPC(btc_rpc, cookie_file=btc_cookie)
-    if btc_wallet:
-        btc = btc.wallet(btc_wallet)
-    # Before the first block, and before anything else is touched: this is the Bitcoin node the
-    # sats will be paid through, so its chain must be the one the launch is anchored in.
-    check_btc_anchor(d, btc, ticker)
+    # Every curve block owes its curve's coin, so mining always needs a funded wallet of that chain.
+    if not btc_rpc and not qwen_rpc:
+        sys.exit("pass --btc-rpc URL of a funded Bitcoin Core wallet (http://user:pass@host:port, plus --btc-wallet NAME) "
+                 "to mine the BTC curve, or --qwen-rpc URL of a funded Qwencoin wallet (plus --qwen-wallet NAME) to mine the "
+                 "QWEN curve: each block mined on a curve owes that curve's coin, paid and proven automatically")
+    wallets, relay_only = {}, {}
+    for quote, chain, url, cookie, name, check in (("btc", "Bitcoin", btc_rpc, btc_cookie, btc_wallet, check_btc_anchor),
+                                                   ("qwen", "Qwencoin", qwen_rpc, qwen_cookie, qwen_wallet, check_qwen_anchor)):
+        if not url:
+            continue
+        # Bitcoin through Electrum servers (electrums://...): the wallet is a file with one private key
+        # (--btc-wallet FILE), and the header chain is fetched down to the launch's anchor at the start.
+        light = quote == "btc" and is_light_url(url)
+        node = btc_light(url, anchor=d.btc_anchor_height) if light else RPC(url, cookie_file=cookie)
+        w = node.wallet(name) if name else node
+        # Before the first block, and before anything else is touched: this is the node what blocks
+        # owe will be paid through, so its chain must be the one the launch is anchored in.
+        check(d, w, ticker)
+        if light and not name:
+            relay_only[quote] = node
+            print(f"no key file for Bitcoin (--btc-wallet FILE): its headers are relayed to {ticker} through the Electrum "
+                  "servers, and nothing is paid on Bitcoin from here", file=sys.stderr)
+            continue
+        if not name:
+            # No wallet named: the node's own, if it has exactly one loaded. A node with none still
+            # gives the launch its chain's headers (everybody's proofs on that chain need them), and
+            # pays nothing; with several, which one pays has to be said.
+            loaded = loaded_wallets(node)
+            if loaded is not None and len(loaded) > 1:
+                sys.exit(f"--{quote}-wallet NAME: the {chain} node has {len(loaded)} wallets loaded ({', '.join(loaded)}): "
+                         "say which one pays")
+            if loaded == []:
+                relay_only[quote] = node
+                print(f"the {chain} node has no wallet loaded: its headers are relayed to {ticker}, and nothing is paid on "
+                      f"{chain} from here (name one with --{quote}-wallet NAME to mine the {quote.upper()} curve)", file=sys.stderr)
+                continue
+            if loaded:  # exactly one: ask for it by name, so that a second one loaded later changes nothing
+                w = node.wallet(loaded[0])
+        wallets[quote] = w
+    if not wallets:
+        sys.exit("neither node has a wallet loaded, and each block mined on a curve owes that curve's coin: pass "
+                 "--btc-wallet NAME (with --btc-rpc) to mine the BTC curve, or --qwen-wallet NAME (with --qwen-rpc) to mine "
+                 "the QWEN curve")
+    if curve is None:
+        if len(wallets) == 2:
+            sys.exit("--curve btc|qwen: a Bitcoin and a Qwencoin wallet were both given, so say which curve to mine. (Both "
+                     "chains' headers are relayed either way, and a block of yours on the other curve is paid from its wallet.)")
+        curve = next(iter(wallets))
+    elif curve not in D.QUOTES:
+        sys.exit(f"--curve {curve}: btc or qwen")
+    elif curve not in wallets:
+        chain = "Bitcoin" if curve == "btc" else "Qwencoin"
+        sys.exit(f"--curve {curve}: a block on the {curve.upper()} curve owes {'sats' if curve == 'btc' else 'qwen'}, so mining "
+                 f"it needs a funded {chain} wallet: --{curve}-rpc URL [--{curve}-wallet NAME]")
     children = {}
     for other in sorted(reg.data):
         if other == ticker:
@@ -569,37 +741,44 @@ def build_source(reg: Registry, ticker: str, payout: Optional[str], btc_rpc: Opt
             continue
         od = reg.desc(other)
         try:
-            wallets = orpc.listwallets()
-            w = orpc.wallet(wallets[0]) if wallets else None
+            names = orpc.listwallets()
+            w = orpc.wallet(names[0]) if names else None
             addr = w.getnewaddress("", "bech32") if w else None
         except Exception:
             addr = None
         if addr:  # merge-mined rewards need somewhere to go on that chain
             children[other] = {"rpc": orpc, "hrp": od.hrp, "payout": addr}
-    settler = Settler(rpc, btc, os.path.join(os.path.dirname(reg.get(ticker)["descriptor"]), "settler.json"),
-                      max_pay_sats=max_pay_sats, pay_depth=pay_depth)
+    settler = Settler(rpc, wallets.get("btc"), os.path.join(os.path.dirname(reg.get(ticker)["descriptor"]), "settler.json"),
+                      max_pay_sats=max_pay_sats, pay_depth=pay_depth, qwen_wallet=wallets.get("qwen"),
+                      max_pay_qwen=max_pay_qwen, btc_node=relay_only.get("btc"), qwen_node=relay_only.get("qwen"))
     return LaunchSource(rpc, d.hrp, d.ticker, default_payout=payout, children=children, settler=settler,
-                        yield_hrp=btc_hrp), children, settler
+                        yield_hrp=btc_hrp, curve=curve), children, settler
 
 
 def cmd_mine(a, reg: Registry):
     from .miner import StratumMiner
     from .stratum import StratumServer
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO, format="%(asctime)s %(name)s %(message)s")
-    reg.up(a.ticker)
+    reg.up(a.ticker, fetch_table=True)
     src, children, settler = build_source(reg, a.ticker, a.payout, a.btc_rpc, a.btc_hrp,
                                           int(a.max_pay_btc * D.COIN) if a.max_pay_btc else None,
-                                          a.btc_cookie, a.btc_wallet, a.pay_depth)
+                                          a.btc_cookie, a.btc_wallet, a.pay_depth, curve=a.curve, qwen_rpc=a.qwen_rpc,
+                                          qwen_cookie=a.qwen_cookie, qwen_wallet=a.qwen_wallet,
+                                          max_pay_qwen=int(a.max_pay_qwen * D.COIN) if a.max_pay_qwen else None)
     host, port = a.listen.rsplit(":", 1)
     user = a.payout + (f",{a.btc_address}" if a.btc_address else "")
-    print(json.dumps({"stratum": f"stratum+tcp://{host}:{port}", "user": user, "launch": a.ticker,
-                      "merge_mining_candidates": sorted(children),
+    print(json.dumps({"stratum": f"stratum+tcp://{host}:{port}", "user": user, "launch": a.ticker, "curve": src.curve,
+                      "pays_from": settler.status()["wallets"], "merge_mining_candidates": sorted(children),
                       "cpu_miner": not a.no_cpu}), flush=True)
 
     async def run():
         srv = StratumServer(src, host, int(port), difficulty=a.difficulty, stats_path=a.stats)
         task = asyncio.ensure_future(srv.serve())
-        await asyncio.sleep(0.5)
+        # the pool opens its port once the node has given it a first template: at once on most machines, not on all
+        while not srv.listening and not task.done():
+            await asyncio.sleep(0.05)
+        if task.done():
+            task.result()  # the pool could not start (its port is taken, say): that error, not a miner's
         try:
             if a.no_cpu:
                 await (asyncio.wait_for(task, a.duration) if a.duration else task)
@@ -637,6 +816,10 @@ def main(argv=None):
     p.add_argument("--btc-rpc", help="Bitcoin Core RPC URL: before registering, check that the launch's Bitcoin anchor is "
                                      "the block at that height on this node's chain (do this for a launch file you were given)")
     p.add_argument("--btc-cookie", help="Bitcoin Core .cookie file, if the URL has no user:pass")
+    p.add_argument("--qwen-rpc", help="Qwencoin node RPC URL: before registering, check that the launch's Qwencoin anchor is "
+                                      "the block at that height on this node's chain (nothing but a Qwencoin node, or the "
+                                      "launch's own node at its start, can tell that it is a Qwencoin block at all)")
+    p.add_argument("--qwen-cookie", help="the Qwencoin node's .cookie file, if the URL has no user:pass")
     for name in ("up", "down", "ls"):
         p = n.add_parser(name)
         p.add_argument("tickers", nargs="*")
@@ -651,13 +834,25 @@ def main(argv=None):
     p = sub.add_parser("mine", help="pool + optional CPU miner for one launch")
     p.add_argument("ticker")
     p.add_argument("--payout", required=True, help="launch address that receives the coinbase")
-    p.add_argument("--btc-address", help="send this miner's BTC yield here instead of to its launch key")
-    p.add_argument("--btc-rpc", required=True, help="Bitcoin Core RPC URL of a funded wallet (pays the sats each block owes); "
-                                                    "mining does not start unless the launch's Bitcoin anchor is on its chain")
+    p.add_argument("--btc-address", help="send this miner's yield (BTC and QWEN) here instead of to its launch key")
+    p.add_argument("--curve", choices=("btc", "qwen"),
+                   help="the curve to mine: blocks on the BTC curve owe sats, blocks on the QWEN curve owe qwen. Default: "
+                        "the one a wallet was given for (with both wallets, it has to be said)")
+    p.add_argument("--btc-rpc", help="Bitcoin Core RPC URL of a funded wallet (pays the sats each block on the BTC curve owes), "
+                                     "or electrums://HOST:PORT,HOST:PORT with --btc-wallet KEYFILE (no node here); mining does "
+                                     "not start unless the launch's Bitcoin anchor is on its chain")
     p.add_argument("--btc-cookie", help="Bitcoin Core .cookie file, if the URL has no user:pass")
-    p.add_argument("--btc-wallet", help="Bitcoin Core wallet name")
+    p.add_argument("--btc-wallet", help="Bitcoin Core wallet name (with --btc-rpc electrums://...: a file holding the paying "
+                                        "key, 64 hex digits or WIF). Left out: the node's own wallet if it has exactly one "
+                                        "loaded; with none loaded the node only gives the launch Bitcoin's headers")
     p.add_argument("--btc-hrp", default="bc")
     p.add_argument("--max-pay-btc", type=float, help="never pay more than this for one block's sats")
+    p.add_argument("--qwen-rpc", help="Qwencoin node RPC URL of a funded wallet (pays the qwen each block on the QWEN curve "
+                                      "owes; qwencoind speaks bitcoin-cli's RPC); mining does not start unless the launch's "
+                                      "Qwencoin anchor is on its chain")
+    p.add_argument("--qwen-cookie", help="the Qwencoin node's .cookie file, if the URL has no user:pass")
+    p.add_argument("--qwen-wallet", help="Qwencoin wallet name")
+    p.add_argument("--max-pay-qwen", type=float, help="never pay more than this (in QWEN) for one block's qwen")
     p.add_argument("--pay-depth", type=int, default=12,
                    help="pay a block's sats once it is this many blocks deep (reorgs deeper than depth-6 can cost a payment)")
     p.add_argument("--listen", default="127.0.0.1:3333")

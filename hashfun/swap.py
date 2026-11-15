@@ -286,6 +286,11 @@ class Maker:
         """BTC sats per whole coin at the current curve price."""
         info = self.forks[ticker].rpc.getlaunchinfo()
         cc = self.chain_cfg(ticker)
+        # This maker quotes in sats, so its anchor is the BTC curve: what minting a coin there costs
+        # in hash and in the sats its block owes. (The QWEN curve is the coin's other price point.)
+        curve = (info.get("curves") or {}).get("btc")
+        if curve:
+            return curve["hashes_per_coin"] * float(cc["hashprice_sats_per_th"]) / 1e12 + curve["owed_per_coin"]
         d = info.get("descriptor") or {}
         sats_per_hash = int(d.get("sats_num", 0)) / 2 ** int(d.get("sats_shift", 0))
         return info["hashes_per_coin"] * (float(cc["hashprice_sats_per_th"]) / 1e12 + sats_per_hash)

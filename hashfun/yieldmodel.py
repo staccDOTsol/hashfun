@@ -1,13 +1,14 @@
-"""Python model of the sats leg's pure functions (mirrors src/launchyield.{h,cpp}; test_diff_cpp
+"""Python model of the two legs' pure functions (mirrors src/launchyield.{h,cpp}; test_diff_cpp
 compares them). The state machine built on them is hashfun/yieldstate.py.
 
-A curve block owes real BTC on top of its hash. Six blocks later the draw fixes how much is
-due and to whom: 80% a holder, drawn by value over the coins that are live at the draw, 10%
-the creator, 10% the dev. The miner pays on Bitcoin with a tagged transaction and proves it on
-the launch chain by SPV against Bitcoin headers relayed inside launch blocks."""
+A curve block owes its curve's asset on top of its hash: real BTC on the BTC curve, real QWEN on
+the QWEN curve. Six blocks later the draw fixes how much is due and to whom: 80% a holder, drawn
+by value over the coins that are live at the draw, 10% the creator, 10% the dev. The miner pays on
+that asset's own chain with a tagged transaction and proves it on the launch chain by SPV against
+that chain's headers, relayed inside launch blocks (contrib/hashfun/TWIN.md)."""
 import struct
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from .crypto import sha256, sha256d
 from .ser import Tx, bits_to_target, target_to_bits
@@ -134,6 +135,14 @@ def yield_tag_script(btc_script: bytes) -> bytes:
 
 
 # ------------------------------------------------------------ payment proofs
+# The two quote chains, by index (0: Bitcoin, 1: Qwencoin) and by name.
+BTC, QWEN = 0, 1
+QUOTE_NAMES = ("btc", "qwen")
+HEADER_TAG = {"btc": b"HFH1", "qwen": b"HFH2"}  # OP_RETURN <tag><n * 80-byte headers of that chain>
+PROOF_TAG = {"btc": b"HFP1", "qwen": b"HFP2"}   # OP_RETURN <tag><payment proof against that chain's relay>
+LAUNCH_VERSION_QWEN = 0x200                     # bit 9 of a launch block's version: the block is on the QWEN curve
+
+
 @dataclass
 class PaymentProof:
     mint_height: int
@@ -144,8 +153,10 @@ class PaymentProof:
     candidate: int
     raw_tx: bytes
 
-    def payload(self) -> bytes:
-        return (b"HFP1" + struct.pack("<I", self.mint_height) + self.btc_block + struct.pack("<I", self.tx_index) +
+    def payload(self, quote: str = "btc") -> bytes:
+        """The proof as it rides in OP_RETURN: "HFP1" for a payment on Bitcoin, "HFP2" for one on
+        Qwencoin, then the same fields."""
+        return (PROOF_TAG[quote] + struct.pack("<I", self.mint_height) + self.btc_block + struct.pack("<I", self.tx_index) +
                 bytes([len(self.branch)]) + b"".join(self.branch) + struct.pack("<I", self.pay_vout) +
                 bytes([self.candidate]) + self.raw_tx)
 
@@ -208,17 +219,47 @@ def verify_btc_payment(proof: PaymentProof, merkle_root: bytes, tag: bytes, reci
 
 
 def parse_btc_headers(payload: bytes) -> Optional[List[bytes]]:
-    """Payload of OP_RETURN "HFH1": the tag, then n >= 1 Bitcoin headers of 80 bytes."""
+    """Payload of OP_RETURN "HFH1" (Bitcoin) or "HFH2" (Qwencoin): the tag, then n >= 1 headers of 80 bytes."""
     if len(payload) < 4 + 80 or (len(payload) - 4) % 80:
         return None
     return [payload[i:i + 80] for i in range(4, len(payload), 80)]
 
 
-# ------------------------------------------------------------ Bitcoin headers
+parse_headers = parse_btc_headers
+
+
+# ------------------------------------------------------------ headers of the two quote chains
 BTC_POW_LIMIT_BITS = 0x1D00FFFF
 BTC_REGTEST_BITS = 0x207FFFFF
 BTC_TIMESPAN = 14 * 24 * 3600
 BTC_INTERVAL = 2016
+QWEN_POW_LIMIT_BITS = 0x2000FFFF  # 256 expected passes through the weights per block
+MAX_QWEN_PASSES = 8               # Qwencoin headers whose work one launch block may have evaluated
+QWEN_MAX_TIMEWARP = 600           # Qwencoin: how far before its parent the first block of a period may be stamped
+
+
+def muldiv(a: int, num: int, den: int) -> int:
+    """floor(a * num / den) the way qwencoin's pow.cpp computes a retarget: without forming a * num,
+    which near that chain's limit (2^248) does not fit in 256 bits. Exact, so the same number as
+    Bitcoin's `a *= num; a /= den` wherever that is defined."""
+    q, r = divmod(a, den)
+    return q * num + (r * num) // den
+
+
+def sha256d_work(header: bytes) -> int:
+    """A header's work value where it is its hash: Bitcoin, and a regtest Qwencoin."""
+    return int.from_bytes(sha256d(header), "little")
+
+
+def compact_target(bits: int) -> Optional[int]:
+    """The target a header's difficulty bits stand for, or None where the node (arith_uint256's
+    SetCompact) calls them negative, overflowing 256 bits, or zero: no header can meet such a target."""
+    exp, mant = bits >> 24, bits & 0x7FFFFF
+    if mant == 0 or bits & 0x800000:
+        return None
+    if exp > 34 or (mant > 0xFF and exp > 33) or (mant > 0xFFFF and exp > 32):
+        return None
+    return (mant >> (8 * (3 - exp)) if exp <= 3 else mant << (8 * (exp - 3))) or None
 
 
 @dataclass
@@ -229,23 +270,36 @@ class BtcNode:
     bits: int
     height: int
     work: int
+    period_time: int = 0  # the time of the first block of this block's difficulty period
 
 
 @dataclass
 class BtcChain:
-    """Bitcoin header tree from the anchor; best = most work, ties to the lowest hash."""
+    """Header tree of a quote chain from the launch's anchor; best = most work, ties to the lowest
+    hash. With the defaults it follows Bitcoin; QwenChain below follows Qwencoin with the same tree.
+
+    work_value: a header's proof-of-work value as a little-endian number, or None if it cannot be
+    told (then the header lacks proof of work). Unused on regtest, where the value is the hash.
+    period_edges: Qwencoin's two timestamp rules at the edges of a difficulty period (not on regtest)."""
     anchor_header: bytes
     anchor_height: int
     anchor_period_time: int
     regtest: bool
     nodes: Dict[bytes, BtcNode] = field(default_factory=dict)
     children: Dict[bytes, int] = field(default_factory=dict)
+    limit_bits: int = BTC_POW_LIMIT_BITS
+    label: str = "btc"
+    work_value: Callable[[bytes], Optional[int]] = sha256d_work
+    period_edges: bool = False
 
     def __post_init__(self):
         h = self.anchor_header
         self.anchor = sha256d(h)
-        self.nodes[self.anchor] = BtcNode(h[4:36], h[36:68], struct.unpack("<I", h[68:72])[0],
-                                          struct.unpack("<I", h[72:76])[0], self.anchor_height, 0)
+        time_ = struct.unpack("<I", h[68:72])[0]
+        # An anchor that opens a difficulty period is its own period start; otherwise the first block
+        # of its period is below it and the launch file supplies that block's time.
+        self.nodes[self.anchor] = BtcNode(h[4:36], h[36:68], time_, struct.unpack("<I", h[72:76])[0], self.anchor_height, 0,
+                                          time_ if self.anchor_height % BTC_INTERVAL == 0 else self.anchor_period_time)
         self.best = self.anchor
 
     @staticmethod
@@ -258,41 +312,57 @@ class BtcChain:
         height = prev.height + 1
         if height % BTC_INTERVAL:
             return prev.bits
-        first_height, first_time, n = height - BTC_INTERVAL, self.anchor_period_time, prev
-        while n.height > first_height:
-            p = self.nodes.get(n.prev)
-            if p is None:
-                break
-            n = p
-        if n.height == first_height:
-            first_time = n.time
-        span = min(max(prev.time - first_time, BTC_TIMESPAN // 4), BTC_TIMESPAN * 4)
-        target = min(bits_to_target(prev.bits) * span // BTC_TIMESPAN, bits_to_target(BTC_POW_LIMIT_BITS))
+        # prev closes its period, and every header carries the time of its period's first block
+        span = min(max(prev.time - prev.period_time, BTC_TIMESPAN // 4), BTC_TIMESPAN * 4)
+        target = min(muldiv(bits_to_target(prev.bits), span, BTC_TIMESPAN), bits_to_target(self.limit_bits))
         return target_to_bits(target)
 
-    def accept(self, header: bytes) -> Tuple[bool, str]:
+    def accept(self, header: bytes, budget: Optional[List[int]] = None) -> Tuple[bool, str]:
+        """Add a header. budget: [work evaluations left in this launch block] where they are limited
+        (Qwencoin); a header that would need one when none is left is skipped as if it were absent."""
+        L = self.label
         hash_ = sha256d(header)
         if hash_ in self.nodes:
-            return False, "btc header already known"
+            return False, f"{L} header already known"
         prev = self.nodes.get(header[4:36])
         if prev is None:
-            return False, "btc header does not connect"
+            return False, f"{L} header does not connect"
         time_, bits = struct.unpack("<II", header[68:76])
         if bits != self.expected_bits(prev):
-            return False, "btc header has wrong difficulty"
-        target = bits_to_target(bits)
-        if target == 0 or self._key(hash_) > target:
-            return False, "btc header lacks proof of work"
+            return False, f"{L} header has wrong difficulty"
+        target = compact_target(bits)
+        if target is None:  # bits no header can meet: refused before any work is looked at
+            return False, f"{L} header lacks proof of work"
+        # From here on the header costs its work check.
+        if budget is not None:
+            if budget[0] <= 0:
+                return False, f"{L} header not looked at: this block has had its share of work checks"
+            budget[0] -= 1
+        if not self.regtest and self.work_value is no_qwork:
+            return False, f"{L} header cannot be checked: Qwencoin's work table is not loaded"
+        value = sha256d_work(header) if self.regtest else self.work_value(header)
+        if value is None or value > target:
+            return False, f"{L} header lacks proof of work"
         times, n = [], prev
         while n is not None and len(times) < 11:
             times.append(n.time)
             n = self.nodes.get(n.prev)
         if len(times) == 11 and time_ <= sorted(times)[5]:  # unknowable within 11 blocks of the anchor
-            return False, "btc header time is not past the median"
+            return False, f"{L} header time is not past the median"
+        height = prev.height + 1
+        if self.period_edges and not self.regtest:
+            # Qwencoin's two rules at the edges of a difficulty period (Bitcoin Inquisition's consensus
+            # cleanup, with BIP94's limit): the first block of a period is not stamped more than ten
+            # minutes before its parent, and the last one is not stamped before the period's first.
+            if height % BTC_INTERVAL == 0 and time_ < prev.time - QWEN_MAX_TIMEWARP:
+                return False, f"{L} header opens a difficulty period too long before its parent's time"
+            if height % BTC_INTERVAL == BTC_INTERVAL - 1 and time_ < prev.period_time:
+                return False, f"{L} header closes a difficulty period before the time the period opened"
         work = prev.work + 2**256 // (target + 1)
         b = self.nodes[self.best]
         better = work > b.work or (work == b.work and self._key(hash_) < self._key(self.best))
-        self.nodes[hash_] = BtcNode(header[4:36], header[36:68], time_, bits, prev.height + 1, work)
+        self.nodes[hash_] = BtcNode(header[4:36], header[36:68], time_, bits, height, work,
+                                    time_ if height % BTC_INTERVAL == 0 else prev.period_time)
         self.children[header[4:36]] = self.children.get(header[4:36], 0) + 1
         if better:
             self.best = hash_
@@ -319,3 +389,19 @@ class BtcChain:
         if n is None or cur != hash_:
             return 0
         return self.nodes[self.best].height - t.height + 1
+
+
+def no_qwork(_header: bytes) -> Optional[int]:
+    """The work function of a model that has none: on a real Qwencoin a header's work is a pass
+    through the chain's table (hashfun/qwork.py can evaluate it with numpy), and without it no
+    header can be shown to have any."""
+    return None
+
+
+def QwenChain(anchor_header: bytes, anchor_height: int, anchor_period_time: int, regtest: bool,
+              work_value: Callable[[bytes], Optional[int]] = no_qwork) -> BtcChain:
+    """The Qwencoin header tree (TWIN.md section 5): the same tree with Qwencoin's limit, its exact
+    retarget, its work function, and its two timestamp rules at the edges of a difficulty period. On
+    regtest it is a Bitcoin regtest in everything."""
+    return BtcChain(anchor_header, anchor_height, anchor_period_time, regtest, limit_bits=QWEN_POW_LIMIT_BITS,
+                    label="qwen", work_value=work_value, period_edges=True)
