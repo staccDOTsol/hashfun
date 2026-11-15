@@ -1,0 +1,1463 @@
+From 1cac825ace7c2bd0668c3df3ee4c72d1fe2a09a1 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 14 Nov 2026 17:26:24 -0400
+Subject: [PATCH 1/6] fun.py: a node follows the launches of a hashfun site and
+ mines their QWEN curve
+
+hashfun (https://github.com/staccDOTsol/hashfun) issues each coin on a chain
+of its own along two curves; a block on the QWEN curve owes qwen on this
+chain, proven inside the coin's chain against a relay of this chain's
+headers. tools/fun.py is what a node does with that, and nothing of it runs
+unless the folder names a site (HASHFUN) and a release (HASHFUNPKG, by
+sha256): the package fetched and checked, the site's launches taken on with
+their Qwencoin anchor checked against this node, a wallet fun whose keys
+each launch's node holds, qwen moved into it through ord's wallet within
+MIND_STEP and FUN_LIMIT (else MIND_LIMIT), a pool per launch on its QWEN
+curve and a share of one core to mine with. A node that cannot dial the
+site's node of a launch reaches it through the site's pages. A follower
+reads Bitcoin only from a source its owner names (FUN_BTC); the file FUNBTC
+is the site's.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_014XWxCQ3HRkxqr38zmdadwu
+---
+ .gitignore   |    3 +
+ tools/fun.py | 1412 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 1415 insertions(+)
+ create mode 100644 tools/fun.py
+
+diff --git a/.gitignore b/.gitignore
+index 04fa2b8..2b67199 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -14,6 +14,9 @@ local.env
+ seed-pod*.json
+ __pycache__/
+ *.pyc
++# the hashfun package a node fetches, and launch files its owner puts in by hand (tools/fun.py)
++/fun/
++/launches/
+ # node binaries and the work table come from the releases or the Hugging Face repository
+ /bin/
+ /libexec/
+diff --git a/tools/fun.py b/tools/fun.py
+new file mode 100644
+index 0000000..ef576e0
+--- /dev/null
++++ b/tools/fun.py
+@@ -0,0 +1,1412 @@
++"""hashfun on a qwencoin node: the launches of a hashfun site, their chains, their QWEN curve.
++
++    python3 tools/fun.py status              a line per launch this node follows
++    python3 tools/fun.py pin REPO VERSION    (the publisher) name the hashfun release the nodes run, in the file HASHFUNPKG
++    python3 tools/fun.py up | down           what tools/chain.py up and down do with it
++    python3 tools/fun.py site                (a public node) the hashfun site itself, on this machine
++
++A hashfun launch (https://github.com/staccDOTsol/hashfun) is a coin on a chain of its own, mined into existence along
++two curves: a block on the BTC curve owes sats on Bitcoin, a block on the QWEN curve owes qwen on this chain, each to
++a holder of the coin drawn by what it holds. A launch needs machines that run its chain and mine it. The nodes of this
++chain are such machines: each has the work table, a wallet with qwen in it, and a model that can decide.
++
++Nothing of this runs until the folder names a site: the file HASHFUN (one line, the site's address; HASHFUN=.. in
++local.env stands over it), and the file HASHFUNPKG names the hashfun release (repository, version, sha256 of its
++package). FUN=0 in local.env: never, whatever the files say. With both, the node's helper (tools/chain.py up starts
++it as `fun`, for node FUN_NODE, 1 unless set):
++
++  the package   fetched once from the release into fun/VERSION/, its sha256 compared with HASHFUNPKG before anything of
++                it is unpacked: the Python command line (standard library only: it runs on this folder's Python) and
++                the node program for this machine. Nothing is installed outside the folder.
++  the launches  the site's coins that are still on their curves, the newest first, FUN_COINS of them at most (2), or
++                the ones FUN_FOLLOW names; and every launch file put into the folder launches/. Each gets one hashfund
++                (hashfun's node), on the table this node already has. A launch file's Qwencoin anchor is checked against
++                this node's own chain before the launch is taken on.
++  the wallet    a second wallet in this node's qwencoind, named fun. hashfun pays from it and from nothing else: it
++                never sees the node's own wallet (ord's, which knows which sats carry inscriptions). The node moves qwen
++                into it as blocks need paying for, MIND_STEP at once at most and FUN_LIMIT in all (see limit()). The
++                same keys are given to each launch's node, so that what the node mines there, and what holding it
++                earns on this chain, belong to one wallet.
++  mining        FUN_CPU of one core (0.1; 0: none) on the QWEN curve of the launches it follows, one at a time, while
++                the fun wallet can pay for the next block. hashfun's pool pays each block's qwen to the holder the
++                launch drew, relays this chain's headers into the launch and proves the payment there.
++  reaching it   a launch's node dials the site's node of that launch. Where that port cannot be reached (a site
++                behind a tunnel that carries only HTTP), the bytes go through the site's pages: a WebSocket at
++                SITE/p2p/TICKER, carried by tools/web.py on the other side to the site's own node of that launch and to
++                nothing else.
++
++A public node can be the site (FUN_SERVE=1, which tools/seed.sh sets on a rented pod): `site` runs hashfun's pages
++on FUN_WEB_PORT of this machine, and tools/web.py serves them as /fun under the node's own name.
++"""
++import base64, fcntl, glob, hashlib, json, os, re, select, shlex, shutil, signal, socket, ssl, struct, subprocess, sys, tarfile, threading, time
++import urllib.error, urllib.parse, urllib.request
++from contextlib import contextmanager
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parent.parent
++sys.path.insert(0, str(ROOT))
++sys.path.insert(0, str(ROOT / "tools"))
++import net  # noqa: E402
++
++HOME = net.RUN / "fun"  # hashfun's own state (its HASHFUN_HOME): the launches, their chains, this node's book
++PKGS = ROOT / "fun"  # the hashfun package as fetched, a folder per version
++DROP = ROOT / "launches"  # launch files put here by hand are followed whatever the site lists
++WALLET = "fun"  # the wallet hashfun pays from, in this node's qwencoind and in each launch's node
++FEE_RATE = "2"  # sat/vB for what the node moves into that wallet
++COIN = 100_000_000
++TICKER = r"[A-Z0-9]{2,10}"
++# hashfun's names for the machines it ships a node program for
++TARGETS = {("linux", "x86_64"): "linux-x64", ("linux", "amd64"): "linux-x64", ("linux", "aarch64"): "linux-arm64", ("linux", "arm64"): "linux-arm64",
++           ("darwin", "x86_64"): "darwin-x64", ("darwin", "arm64"): "darwin-arm64"}
++
++
++def node() -> int:
++    return int(os.environ.get("FUN_NODE", "1"))
++
++
++def note(*x) -> None:
++    print(time.strftime("%H:%M:%S"), *x, flush=True)
++
++
++# ------------------------------------------------------------------ what the folder says
++def site() -> str:
++    """The hashfun site this node follows, without a trailing slash, or "": HASHFUN in the environment (local.env),
++    else the first word of the file HASHFUN. Only an https address is taken (http for this machine itself): the
++    address is where launch files come from."""
++    text = os.environ.get("HASHFUN")
++    if text is None:
++        try:
++            text = (ROOT / "HASHFUN").read_text()
++        except OSError:
++            text = ""
++    words = [w for line in text.splitlines() for w in line.split("#")[0].split()]
++    url = words[0].rstrip("/") if words else ""
++    ok = re.fullmatch(r"(?:https://(?:[A-Za-z0-9-]+\.)+[A-Za-z0-9-]+|http://(?:127\.0\.0\.1|localhost))(?::[0-9]{2,5})?(?:/[A-Za-z0-9._~-]+)*", url)
++    return url if ok else ""
++
++
++def pin():
++    """The hashfun release the nodes run: (repository, version, sha256 of hashfun-VERSION.tgz), from the one line of the
++    file HASHFUNPKG. None: none is named (or the line is not one)."""
++    try:
++        w = (ROOT / "HASHFUNPKG").read_text().split("#")[0].split()
++    except OSError:
++        return None
++    if (len(w) == 3 and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,59}/[A-Za-z0-9][A-Za-z0-9_.-]{0,59}", w[0]) and re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", w[1])
++            and re.fullmatch(r"[0-9a-f]{64}", w[2])):
++        return w[0], w[1], w[2]
++    return None
++
++
++def refresh(timeout: int = 15) -> None:
++    """An installed copy of the project asks the project what HASHFUN, HASHFUNPKG and FUNBTC are now, as it asks for
++    SEEDS (tools/net.py refresh_seeds): the site may move, and a new rule set of hashfun is a new release. Nothing is
++    asked in the folder the project is published from (it has no file ORIGIN: its files are the ones that get
++    published), nor for a file the folder's local.env stands over. A line that is not what its file holds is not
++    written; a file the project no longer has stays as it is here."""
++    if not (ROOT / "ORIGIN").exists() or os.environ.get("FUN", "1") == "0":
++        return
++    origin = (ROOT / "ORIGIN").read_text().strip()
++    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,96}", origin):
++        return
++    shapes = {"HASHFUN": r"https://(?:[A-Za-z0-9-]+\.)+[A-Za-z0-9-]+(?::[0-9]{2,5})?(?:/[A-Za-z0-9._~-]+)*",
++              "HASHFUNPKG": r"[A-Za-z0-9][A-Za-z0-9_.-]{0,59}/[A-Za-z0-9][A-Za-z0-9_.-]{0,59} v[0-9]+\.[0-9]+\.[0-9]+ [0-9a-f]{64}",
++              "FUNBTC": r"(?:https?|electrums?)://[A-Za-z0-9@:._,/~%-]+"}
++    for name, shape in shapes.items():
++        if name == "HASHFUN" and os.environ.get("HASHFUN") is not None:
++            continue
++        try:
++            req = urllib.request.Request(f"https://huggingface.co/{origin}/qwencoin/resolve/main/{name}", headers={"User-Agent": "qwencoin-node/1"})
++            with urllib.request.urlopen(req, timeout=timeout) as r:
++                line = " ".join(r.read(600).decode("utf-8", "replace").split("#")[0].split())
++            if re.fullmatch(shape, line) and (not (ROOT / name).exists() or (ROOT / name).read_text().strip() != line):
++                (ROOT / name).write_text(line + "\n")
++        except Exception:  # noqa: BLE001  (no way out, or the project names none: the file stays as it is)
++            pass
++
++
++def serving() -> bool:
++    """This node is a site: it runs hashfun's pages itself (FUN_SERVE=1)."""
++    return os.environ.get("FUN_SERVE", "0") not in ("", "0")
++
++
++def web_port() -> int:
++    return int(os.environ.get("FUN_WEB_PORT") or 18090)
++
++
++def wanted() -> bool:
++    """Is there anything for the helper to do in this folder? No: the node is exactly what it is without this file."""
++    if os.environ.get("FUN", "1") == "0":
++        return False
++    if not (os.environ.get("FUN_CMD") or os.environ.get("FUN_PACKAGE") or pin()):
++        return False
++    return bool(site() or serving() or (DROP.is_dir() and any(DROP.glob("*.json"))))
++
++
++def limit() -> float:
++    """Sats of qwen this node may put behind hashfun in all. FUN_LIMIT if the folder gives one, else MIND_LIMIT: the
++    number its owner has already set for what the node spends by itself (tools/pipeline.sh join writes 100000000, one
++    coin, into local.env; unset, as on the publisher's own nodes, there is none). It is counted here, on disk, over the
++    life of the folder (book: "moved"), and it is the same count whoever asked: the helper for a block it is about to
++    mine, or the node's model through fun_mine (whose call is also held to MIND_LIMIT by the model's own loop, which
++    counts what the model has spent since that loop started)."""
++    v = os.environ.get("FUN_LIMIT") or os.environ.get("MIND_LIMIT") or "inf"
++    return float("inf") if v == "inf" else float(int(v))
++
++
++def step() -> float:
++    """The most one move into the fun wallet may be: MIND_STEP (1 coin unless the folder says otherwise)."""
++    v = os.environ.get("MIND_STEP") or "100000000"
++    return float("inf") if v == "inf" else float(int(v))
++
++
++# ------------------------------------------------------------------ the node's book
++@contextmanager
++def book():
++    """This node's record of what it does with hashfun (run/fun/node.json), read and written under a lock: the
++    helper, the node's model and a person at the keyboard are three processes.
++      moved     sats of qwen moved from the node's wallet into the fun wallet, in all
++      moves     the last of them: [time, sats, txid, why]
++      address   the one address everything of hashfun's is paid at, on this chain and on every launch (same key)
++      follow    ticker -> what the helper keeps for a launch (id, peer, port of its relay, stratum port, whence)
++      orders    ticker -> blocks the node's model has asked for and paid in for, not yet mined
++      launched  when this node made a coin (times)"""
++    HOME.mkdir(parents=True, exist_ok=True)
++    with open(HOME / "node.lock", "w") as lk:
++        fcntl.flock(lk, fcntl.LOCK_EX)
++        f = HOME / "node.json"
++        try:
++            st = json.loads(f.read_text())
++        except (OSError, ValueError):
++            st = {}
++        for k, v in (("moved", 0), ("moves", []), ("address", ""), ("follow", {}), ("orders", {}), ("launched", [])):
++            st.setdefault(k, v)
++        before = json.dumps(st, sort_keys=True)
++        try:
++            yield st
++        finally:
++            if json.dumps(st, sort_keys=True) != before:
++                tmp = f.with_suffix(".tmp")
++                tmp.write_text(json.dumps(st, indent=1))
++                os.replace(tmp, f)
++            fcntl.flock(lk, fcntl.LOCK_UN)
++
++
++def read_book() -> dict:
++    with book() as st:
++        return json.loads(json.dumps(st))
++
++
++# ------------------------------------------------------------------ the package
++def target() -> str:
++    return TARGETS.get((sys.platform if sys.platform != "linux2" else "linux", os.uname().machine.lower()), "")
++
++
++def sha256_of(path) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        for chunk in iter(lambda: f.read(1 << 20), b""):
++            h.update(chunk)
++    return h.hexdigest()
++
++
++def fetch(url: str, out: Path, limit_bytes: int = 400 << 20) -> None:
++    """A file from an https address (or a path on this machine) into `out`, whole or not at all."""
++    part = out.with_name(out.name + ".part")
++    if "://" not in url:
++        part.write_bytes(Path(url).read_bytes())
++    else:
++        if not url.startswith("https://") and not re.match(r"http://(127\.0\.0\.1|localhost)[:/]", url):
++            raise RuntimeError(f"not an https address: {url}")
++        req = urllib.request.Request(url, headers={"User-Agent": "qwencoin-node/1"})
++        n = 0
++        with urllib.request.urlopen(req, timeout=120) as r, open(part, "wb") as f:
++            for chunk in iter(lambda: r.read(1 << 16), b""):
++                n += len(chunk)
++                if n > limit_bytes:
++                    raise RuntimeError(f"{url} is larger than {limit_bytes >> 20} MB: not a hashfun package")
++                f.write(chunk)
++    os.replace(part, out)
++
++
++def unpack(tgz: Path, into: Path) -> None:
++    """Of an npm package of hashfun: its Python (package/py/) and the node program of this machine
++    (package/prebuilt/TARGET/hashfund), and nothing else. Names that would leave the folder, links and devices are
++    not written."""
++    t = target()
++    if not t:
++        raise RuntimeError(f"hashfun ships no node program for this machine ({sys.platform} {os.uname().machine})")
++    tmp = into.with_name(into.name + ".unpacking")
++    shutil.rmtree(tmp, ignore_errors=True)
++    got = False
++    with tarfile.open(tgz, "r:gz") as tar:
++        for m in tar:
++            name = m.name
++            if not m.isfile() or name.startswith("/") or ".." in name.split("/"):
++                continue
++            keep = name.startswith("package/py/") or name == f"package/prebuilt/{t}/hashfund" or name == "package/package.json"
++            if not keep or len(name) > 300:
++                continue
++            dest = tmp / name[len("package/"):]
++            dest.parent.mkdir(parents=True, exist_ok=True)
++            with tar.extractfile(m) as src, open(dest, "wb") as dst:
++                for chunk in iter(lambda: src.read(1 << 20), b""):
++                    dst.write(chunk)
++            if name.endswith("/hashfund"):
++                os.chmod(dest, 0o755)
++                got = True
++    if not got or not (tmp / "py" / "hashfun" / "cli.py").is_file():
++        shutil.rmtree(tmp, ignore_errors=True)
++        raise RuntimeError(f"that package has no hashfun for {t} in it (py/hashfun/cli.py and prebuilt/{t}/hashfund)")
++    shutil.rmtree(into, ignore_errors=True)
++    os.replace(tmp, into)
++
++
++def package(say=note):
++    """The folder of the hashfun this node runs (py/ and prebuilt/TARGET/hashfund in it), fetched and unpacked if it
++    is not there yet. The release named in HASHFUNPKG: its package's sha256 must be the one the file gives, or nothing
++    is unpacked. FUN_PACKAGE=path-or-address instead: a build being tried, whose sha256 is said and not compared. None:
++    no release is named."""
++    PKGS.mkdir(exist_ok=True)
++    trial = os.environ.get("FUN_PACKAGE")
++    if trial:
++        tgz = PKGS / "trial.tgz"
++        mark = PKGS / "trial.from"
++        if not (PKGS / "trial" / "py").is_dir() or not mark.exists() or mark.read_text() != trial:
++            fetch(trial, tgz)
++            say(f"fun: the package being tried, {trial}: sha256 {sha256_of(tgz)} (not compared with anything)")
++            unpack(tgz, PKGS / "trial")
++            mark.write_text(trial)
++        return PKGS / "trial"
++    p = pin()
++    if not p:
++        return None
++    repo, version, want = p
++    here = PKGS / version
++    if (here / "py" / "hashfun" / "cli.py").is_file() and (here / "SHA256").is_file() and (here / "SHA256").read_text().strip() == want:
++        return here
++    tgz = PKGS / f"hashfun-{version[1:]}.tgz"
++    url = f"{releases(repo)}/{version}/hashfun-{version[1:]}.tgz"
++    if not tgz.exists() or sha256_of(tgz) != want:
++        say(f"fun: hashfun {version} from {url}")
++        fetch(url, tgz)
++    got = sha256_of(tgz)
++    if got != want:
++        tgz.rename(tgz.with_name(tgz.name + ".refused"))
++        raise RuntimeError(f"the package of hashfun {version} has sha256 {got}; the file HASHFUNPKG says {want}. Nothing of it was unpacked.")
++    unpack(tgz, here)
++    (here / "SHA256").write_text(want + "\n")
++    say(f"fun: hashfun {version} is in {here} (sha256 {want[:16]}.. as HASHFUNPKG names it)")
++    return here
++
++
++def releases(repo: str) -> str:
++    """Where a repository's releases are downloaded from (FUN_RELEASES: another place that serves the same files, a
++    mirror or a test's)."""
++    return os.environ.get("FUN_RELEASES", "").rstrip("/") or f"https://github.com/{repo}/releases/download"
++
++
++def version_here(pkg) -> str:
++    try:
++        return str(json.loads((pkg / "package.json").read_text()).get("version", "?"))
++    except (OSError, ValueError):
++        return "?"
++
++
++def environment(pkg=None) -> dict:
++    """What a hashfun process is started with: its state inside this folder, this machine's node program, and the
++    table this node already has (hashfun looks for qwork.bin in its home: a link there, never a second copy)."""
++    HOME.mkdir(parents=True, exist_ok=True)
++    link = HOME / "qwork.bin"
++    if not link.exists() and net.QWORK.exists():
++        if link.is_symlink():
++            link.unlink()
++        link.symlink_to(net.QWORK.resolve())
++    env = {**os.environ, "HASHFUN_HOME": str(HOME), "HASHFUN_QWORK": str(net.QWORK), "QWORK_TABLE": str(net.QWORK), "PYTHONSAFEPATH": "1"}
++    env.pop("HASHFUN", None)
++    if pkg:
++        env["PYTHONPATH"] = str(pkg / "py")
++        env["HASHFUND"] = str(pkg / "prebuilt" / target() / "hashfund")
++    return env
++
++
++def command(say=note):
++    """(argv prefix, environment) of the hashfun command line here. FUN_CMD (a command line) stands over the package:
++    a hashfun installed by other means, or the stand-in of tests/check_fun.py."""
++    if os.environ.get("FUN_CMD"):
++        return shlex.split(os.environ["FUN_CMD"]), environment()
++    pkg = package(say)
++    if pkg is None:
++        raise RuntimeError("no hashfun release is named in this folder (the file HASHFUNPKG: repository, version, sha256)")
++    return [sys.executable, "-m", "hashfun.cli"], environment(pkg)
++
++
++def hf(*args, timeout: int = 180, check: bool = True, say=note):
++    """One hashfun command; its output as JSON if it is JSON, else as text."""
++    argv, env = command(say)
++    try:
++        r = subprocess.run(argv + [str(a) for a in args], capture_output=True, text=True, timeout=timeout, env=env, cwd=HOME)
++    except subprocess.TimeoutExpired:
++        if check:
++            raise RuntimeError(f"hashfun {' '.join(map(str, args[:3]))}: no answer in {timeout}s")
++        return ""
++    if r.returncode and check:
++        said = (r.stderr.strip() or r.stdout.strip()).splitlines()
++        raise RuntimeError(f"hashfun {' '.join(map(str, args[:3]))}: {said[-1][:300] if said else 'exit ' + str(r.returncode)}")
++    try:
++        return json.loads(r.stdout)
++    except ValueError:
++        return r.stdout.strip()
++
++
++def knows(*words) -> bool:
++    """Does this hashfun's command line know these options (of `hashfun WORDS[:-1]`)? Asked of its own help, once."""
++    key = " ".join(words)
++    if key not in _knows:
++        argv, env = command(lambda *x: None)
++        try:
++            r = subprocess.run(argv + list(words[:-1]) + ["--help"], capture_output=True, text=True, timeout=60, env=env, cwd=HOME)
++            _knows[key] = words[-1] in (r.stdout + r.stderr)
++        except (OSError, subprocess.SubprocessError):
++            _knows[key] = False
++    return _knows[key]
++
++
++_knows = {}
++
++
++# ------------------------------------------------------------------ a launch's node, spoken to directly
++class Refusal(RuntimeError):
++    """Something this node will not do, said in words a person or a model can act on."""
++
++
++def registry() -> dict:
++    """hashfun's own list of the launches registered in this folder: ticker -> {id, descriptor, datadir, rpcport, ..}."""
++    try:
++        return json.loads((HOME / "launches.json").read_text())
++    except (OSError, ValueError):
++        return {}
++
++
++def rpc(ticker: str, method: str, *params, wallet: str | None = None, timeout: int = 60):
++    """One call to the node of a launch (hashfund speaks bitcoind's JSON-RPC), over this machine's loopback with the
++    node's own cookie. Nothing of a call is ever in a command line: one of them carries the fun wallet's keys."""
++    e = registry().get(ticker)
++    if not e:
++        raise Refusal(f"this node does not follow a coin {ticker}")
++    cookies = glob.glob(os.path.join(e["datadir"], "*", ".cookie")) + glob.glob(os.path.join(e["datadir"], ".cookie"))
++    if not cookies:
++        raise RuntimeError(f"the node of {ticker} is not running")
++    auth = base64.b64encode(Path(cookies[0]).read_bytes().strip()).decode()
++    url = f"http://127.0.0.1:{int(e['rpcport'])}/" + (f"wallet/{urllib.parse.quote(wallet)}" if wallet else "")
++    req = urllib.request.Request(url, data=json.dumps({"jsonrpc": "1.0", "id": "fun", "method": method, "params": list(params)}).encode(),
++                                 headers={"Authorization": "Basic " + auth, "Content-Type": "application/json"})
++    try:
++        with urllib.request.urlopen(req, timeout=timeout) as r:
++            body = json.loads(r.read())
++    except urllib.error.HTTPError as err:  # the node answers an error with a status and a body
++        try:
++            body = json.loads(err.read() or b"{}")
++        except ValueError:
++            body = {}
++        if not body.get("error"):
++            raise RuntimeError(f"the node of {ticker}: HTTP {err.code}")
++    except (OSError, ValueError) as err:
++        raise RuntimeError(f"the node of {ticker} does not answer ({type(err).__name__})")
++    if body.get("error"):
++        raise RuntimeError(f"the node of {ticker}: {str(body['error'].get('message', body['error']))[:300]}")
++    return body.get("result")
++
++
++# ------------------------------------------------------------------ keys: one wallet on this chain and on every launch
++B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
++EXT = {"xprv": "0488ade4", "tprv": "04358394", "xpub": "0488b21e", "tpub": "043587cf"}  # an extended key's first four bytes, by how it reads
++
++
++def b58check_decode(s: str) -> bytes:
++    n = 0
++    for c in s:
++        n = n * 58 + B58.index(c)
++    raw = n.to_bytes(max(1, (n.bit_length() + 7) // 8), "big")
++    raw = b"\0" * (len(s) - len(s.lstrip("1"))) + raw.lstrip(b"\0")
++    data, check = raw[:-4], raw[-4:]
++    if hashlib.sha256(hashlib.sha256(data).digest()).digest()[:4] != check:
++        raise ValueError("not a base58check string")
++    return data
++
++
++def b58check_encode(data: bytes) -> str:
++    raw = data + hashlib.sha256(hashlib.sha256(data).digest()).digest()[:4]
++    n, out = int.from_bytes(raw, "big"), ""
++    while n:
++        n, r = divmod(n, 58)
++        out = B58[r] + out
++    return "1" * (len(raw) - len(raw.lstrip(b"\0"))) + out
++
++
++_DESC_IN = "0123456789()[],'/*abcdefgh@:$%{}IJKLMNOPQRSTUVWXYZ&+-.;<=>?!^_|~ijklmnopqrstuvwxyzABCDEFGH`#\"\\ "
++_DESC_OUT = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
++
++
++def descsum(desc: str) -> str:
++    """The checksum bitcoind puts after a descriptor's # (its doc/descriptors.md)."""
++    def polymod(symbols):
++        chk = 1
++        for v in symbols:
++            top = chk >> 35
++            chk = (chk & 0x7FFFFFFFF) << 5 ^ v
++            for i, g in enumerate((0xF5DEE51989, 0xA9FDCA3312, 0x1BAB10E32D, 0x3706B1677A, 0x644D626FFD)):
++                chk ^= g if (top >> i) & 1 else 0
++        return chk
++
++    symbols, groups = [], []
++    for c in desc:
++        v = _DESC_IN.index(c)
++        symbols.append(v & 31)
++        groups.append(v >> 5)
++        if len(groups) == 3:
++            symbols.append(groups[0] * 9 + groups[1] * 3 + groups[2])
++            groups = []
++    if groups:
++        symbols.append(groups[0] if len(groups) == 1 else groups[0] * 3 + groups[1])
++    chk = polymod(symbols + [0] * 8) ^ 1
++    return "".join(_DESC_OUT[(chk >> (5 * (7 - i))) & 31] for i in range(8))
++
++
++def rekey(desc: str, test: bool) -> str:
++    """A wallet descriptor as the node of a launch reads it: the same keys, written the way that chain writes extended
++    keys (a launch made for tests writes them as Bitcoin's test networks do, every other one as this chain and
++    Bitcoin do), with the checksum of the new text."""
++    body = desc.split("#")[0]
++
++    def turn(m):
++        raw = b58check_decode(m.group(0))
++        kind = {v: k for k, v in EXT.items()}.get(raw[:4].hex())
++        if kind is None or len(raw) != 78:
++            return m.group(0)
++        want = ("t" if test else "x") + kind[1:]
++        return b58check_encode(bytes.fromhex(EXT[want]) + raw[4:])
++
++    body = re.sub(r"[xt](?:prv|pub)[1-9A-HJ-NP-Za-km-z]{100,112}", turn, body)
++    return body + "#" + descsum(body)
++
++
++def qwallet(i: int) -> None:
++    """The fun wallet of node i's qwencoind is there and loaded: an ordinary wallet of the node, made here once."""
++    if WALLET in net.cli(i, "listwallets"):
++        return
++    if WALLET in [w["name"] for w in net.cli(i, "listwalletdir")["wallets"]]:
++        net.cli(i, "loadwallet", WALLET, "true")
++    else:  # name, with private keys, not blank, no passphrase, no avoid_reuse, descriptors, loaded when the node starts
++        net.cli(i, "createwallet", WALLET, "false", "false", "", "false", "true", "true")
++
++
++def address(i: int) -> str:
++    """The one address of the fun wallet: what the node moves in arrives here, a block's coins on a launch are paid
++    to the same key there, and what those coins earn on this chain arrives here again."""
++    with book() as st:
++        if not st["address"]:
++            qwallet(i)
++            st["address"] = net.cli(i, "getnewaddress", "fun", "bech32", wallet=WALLET)
++        return st["address"]
++
++
++def script_of(i: int) -> str:
++    return net.cli(i, "getaddressinfo", address(i), wallet=WALLET)["scriptPubKey"]
++
++
++def balance(i: int) -> int:
++    """Sats of qwen in the fun wallet that can be spent now."""
++    qwallet(i)
++    return round(float(net.cli(i, "getbalances", wallet=WALLET)["mine"]["trusted"]) * COIN)
++
++
++def share_keys(i: int, ticker: str, test: bool) -> str:
++    """The node of a launch holds the fun wallet's keys (its two descriptors for bech32 addresses), in a wallet of its
++    own named fun, and nothing else of this node's. Returns the launch's address of the one key everything is paid at."""
++    spk = script_of(i)
++    if WALLET not in rpc(ticker, "listwallets"):
++        if any(w["name"] == WALLET for w in rpc(ticker, "listwalletdir")["wallets"]):
++            rpc(ticker, "loadwallet", WALLET, True)
++        else:
++            rpc(ticker, "createwallet", WALLET, False, True, "", False, True, True)  # blank: its keys are the ones given below
++    if not rpc(ticker, "listdescriptors", wallet=WALLET)["descriptors"]:
++        ds = [d for d in net.cli(i, "listdescriptors", "true", wallet=WALLET)["descriptors"] if d["desc"].startswith("wpkh(")]
++        if len(ds) != 2:
++            raise RuntimeError("the fun wallet does not have the two descriptors a wallet of this node has for bech32 addresses")
++        req = [{"desc": rekey(d["desc"], test), "active": True, "internal": bool(d.get("internal")), "timestamp": 0,
++                "range": [0, max(20, int(d.get("next", d.get("next_index", 0))) + 20)]} for d in ds]
++        done = rpc(ticker, "importdescriptors", req, wallet=WALLET, timeout=600)
++        del ds, req
++        if not all(x.get("success") for x in done):
++            raise RuntimeError(f"the node of {ticker} did not take the fun wallet's keys: " + "; ".join(str((x.get('error') or {}).get('message', ''))[:120] for x in done))
++    out = rpc(ticker, "decodescript", spk)
++    addr = out.get("address") or (out.get("segwit") or {}).get("address")
++    if not addr or not rpc(ticker, "getaddressinfo", addr, wallet=WALLET).get("ismine"):
++        raise RuntimeError(f"the node of {ticker} does not hold the key of {address(i)}")
++    return addr
++
++
++# ------------------------------------------------------------------ the limit, and moving qwen in
++def allowed(sats: int, moved: int) -> str:
++    """Why this many sats may not be moved into the fun wallet now ("" if they may)."""
++    if sats > step():
++        return f"{sats:,d} sats at once is more than one move may be (MIND_STEP, {int(step()):,d})"
++    if moved + sats > limit():
++        return f"that would make {moved + sats:,d} sats behind hashfun in all, and this node's limit is {int(limit()):,d} (FUN_LIMIT, else MIND_LIMIT)"
++    return ""
++
++
++def move_in(i: int, sats: int, why: str) -> str:
++    """Sats of qwen from the node's own wallet into the fun wallet (ord's wallet sends: it never spends a sat that
++    carries an inscription). Counted in the book before anything else can go wrong with it. Returns the txid."""
++    from graph.identity import node_lock
++
++    with book() as st:
++        no = allowed(sats, st["moved"])
++        if no:
++            raise Refusal(no)
++        to = st["address"] or None
++    to = to or address(i)
++    with node_lock(i):
++        r = net.ord_wallet(i, "send", "--fee-rate", FEE_RATE, to, f"{sats}sat")
++    txid = r["txid"] if isinstance(r, dict) else str(r)
++    with book() as st:
++        st["moved"] += sats
++        st["moves"] = (st["moves"] + [[int(time.time()), sats, txid, why]])[-60:]
++    return txid
++
++
++# ------------------------------------------------------------------ what a launch is, as its node tells it
++def view(i: int, ticker: str) -> dict:
++    """A launch as this node's hashfund has it: where it is on each curve, what a coin costs on each, what that makes
++    a qwen worth in sats, what the node holds and owes there. Prices are what a block's miner owes for a whole coin at
++    the margin, in sats of the curve's own money; the work itself is left out."""
++    info = rpc(ticker, "getlaunchinfo")
++    curves = info.get("curves") or {}
++    out = {"coin": ticker, "name": info.get("name", ""), "height": info["height"], "graduated": bool(info.get("graduated")),
++           "peers": rpc(ticker, "getconnectioncount")}
++    for q in ("btc", "qwen"):
++        c = curves.get(q)
++        if c:
++            out[f"{q}_curve_percent"] = round(100 * float(c.get("progress", 0)), 2)
++            out[f"price_sats_of_{q}"] = round(float(c.get("owed_per_coin", 0)))
++            out[f"{q}_curve_blocks"] = int(c.get("blocks", 0))
++    b, q = out.get("price_sats_of_btc"), out.get("price_sats_of_qwen")
++    if b and q:
++        out["one_qwen_in_sats_of_btc"] = round(b / q * COIN)
++        mined = [k for k in ("btc", "qwen") if curves[k].get("last_height", 0) > info["height"] - 100 and curves[k].get("blocks", 0)]
++        out["that_price_is"] = ("what both curves agree on" if len(mined) == 2 else "a bound: only the BTC curve is being mined" if mined == ["btc"]
++                                else "a bound: only the QWEN curve is being mined" if mined == ["qwen"] else "the creator's starting ratio: no block yet")
++    if not curves:
++        out["note"] = "this coin was made under an earlier rule set and has no QWEN curve"
++    try:
++        w = rpc(ticker, "getbalances", wallet=WALLET)["mine"]
++        out["holds_sats"] = round((float(w["trusted"]) + float(w.get("untrusted_pending", 0))) * COIN)
++        out["mined_not_yet_spendable_sats"] = round(float(w.get("immature", 0)) * COIN)
++    except RuntimeError:
++        out["holds_sats"] = 0
++    owes = owed(ticker, info["height"])
++    out["owes_sats_of_qwen"] = sum(x["pay"] for x in owes)
++    out["blocks_owed_for"] = len(owes)
++    return out
++
++
++def owed(ticker: str, tip: int, look: int = 40) -> list:
++    """The blocks this node mined on the launch that still wait for their qwen: among the last `look` blocks its wallet
++    was paid by, those on a curve whose draw is made, that owe something and are not settled."""
++    out = []
++    try:
++        txs = rpc(ticker, "listtransactions", "*", look, 0, True, wallet=WALLET)
++    except RuntimeError:
++        return out
++    seen = set()
++    for t in txs:
++        h = t.get("blockheight")
++        if t.get("category") not in ("immature", "generate") or h is None or h in seen or h > tip:
++            continue
++        seen.add(h)
++        try:
++            ob = rpc(ticker, "getmintobligation", h)
++        except RuntimeError:
++            continue
++        if ob.get("curve") and ob.get("quote", "btc") == "qwen" and not ob.get("settled") and (not ob.get("draw_known") or ob.get("pay", 0) > 0):
++            out.append({"height": h, "pay": int(ob.get("pay") or ob.get("owed") or 0), "deadline": ob.get("deadline_height")})
++    return out
++
++
++def block_cost(ticker: str) -> int:
++    """About what the next block on the launch's QWEN curve owes, in sats of qwen: the work of a block at the tip's
++    difficulty times the curve's rate, and never less than the least payment (a debt under it is paid in full with
++    the odds of its size)."""
++    c = (rpc(ticker, "getlaunchinfo").get("curves") or {}).get("qwen")
++    if not c:
++        raise Refusal(f"{ticker} has no QWEN curve")
++    bits = int(rpc(ticker, "getblockheader", rpc(ticker, "getbestblockhash"))["bits"], 16)
++    tgt = (bits & 0xFFFFFF) << 8 * ((bits >> 24) - 3)
++    work = (1 << 256) // (tgt + 1)
++    return max((work * int(c["owed_num"])) >> int(c["owed_shift"]), int(c.get("min_payment", 0)))
++
++
++# ------------------------------------------------------------------ the site
++def site_get(path: str, base: str | None = None, timeout: int = 30):
++    """JSON from the site (2 MB at most). What comes back was written by whoever runs the site and whoever made a
++    coin there: data."""
++    base = base or site()
++    if not base:
++        raise Refusal("this node follows no hashfun site (the file HASHFUN names none)")
++    req = urllib.request.Request(base + path, headers={"User-Agent": "qwencoin-node/1", "Accept": "application/json"})
++    with urllib.request.urlopen(req, timeout=timeout) as r:
++        return json.loads(r.read(2_000_001)[:2_000_000])
++
++
++def site_post(path: str, body: dict, timeout: int = 180):
++    base = site()
++    if not base:
++        raise Refusal("this node follows no hashfun site (the file HASHFUN names none)")
++    req = urllib.request.Request(base + path, data=json.dumps(body).encode(), headers={"User-Agent": "qwencoin-node/1", "Content-Type": "application/json"})
++    try:
++        with urllib.request.urlopen(req, timeout=timeout) as r:
++            return json.loads(r.read(2_000_001)[:2_000_000])
++    except urllib.error.HTTPError as e:
++        try:
++            said = json.loads(e.read(4000)).get("error", "")
++        except ValueError:
++            said = ""
++        raise Refusal(f"the site said no: {str(said)[:200] or 'HTTP ' + str(e.code)}")
++
++
++def listed() -> list:
++    """The site's coins this node should follow: FUN_FOLLOW's if it names some, else the ones still on their curves,
++    the newest first; FUN_COINS of them at most."""
++    most = max(0, int(os.environ.get("FUN_COINS") or 2))
++    rows = [r for r in site_get("/api/board") if isinstance(r, dict) and re.fullmatch(TICKER, str(r.get("ticker", ""))) and "height" in r]
++    named = [t.strip().upper() for t in os.environ.get("FUN_FOLLOW", "").split(",") if t.strip()]
++    if named:
++        rows = [r for r in rows if r["ticker"] in named]
++    else:
++        rows = sorted((r for r in rows if not r.get("graduated")), key=lambda r: -int(r.get("genesis_time", 0)))
++    return [r["ticker"] for r in rows[:most]]
++
++
++def reach(host: str, port: int, timeout: float = 4.0) -> bool:
++    try:
++        with socket.create_connection((host, port), timeout=timeout):
++            return True
++    except OSError:
++        return False
++
++
++def free_port() -> int:
++    s = socket.socket()
++    s.bind(("127.0.0.1", 0))
++    p = s.getsockname()[1]
++    s.close()
++    return p
++
++
++def take_on(i: int, ticker: str, launch: dict, peer: str, whence: str, say=note) -> None:
++    """Register a launch in this folder: its file is written, hashfun reads it (its own parser decides whether it is a
++    launch at all) and asks this node's qwencoind whether the Qwencoin block it is anchored in is on this chain."""
++    files = HOME / "files"
++    files.mkdir(parents=True, exist_ok=True)
++    f = files / f"{ticker}.json"
++    f.write_text(json.dumps(launch))
++    args = ["node", "add", f] + (["--peer", peer] if peer else [])
++    if knows("node", "add", "--qwen-rpc"):
++        args += ["--qwen-rpc", f"http://127.0.0.1:{net.rpcport(i)}", "--qwen-cookie", net.datadir(i) / ".cookie"]
++    hf(*args, say=say)
++    with book() as st:
++        st["follow"].setdefault(ticker, {}).update(id=registry().get(ticker, {}).get("id", ""), peer=peer, whence=whence, since=int(time.time()),
++                                                    test=bool(launch.get("test")))
++    say(f"fun: following {ticker} ({whence}); its node dials {peer or 'the seeds in its file'}")
++
++
++def follow(i: int, say=note) -> list:
++    """Bring what this node follows up to what it should follow. Returns the tickers it follows now."""
++    reg, base = registry(), site()
++    want = []
++    if base:
++        try:
++            want = listed()
++        except Refusal:
++            raise
++        except Exception as e:  # noqa: BLE001  (the site is away: what is followed stays followed)
++            say(f"fun: the site does not answer ({type(e).__name__}: {str(e)[:100]}); following what is followed")
++    u = urllib.parse.urlsplit(base) if base else None
++    for t in want:
++        if t in reg:
++            continue
++        try:
++            d = site_get(f"/api/coin/{t}")
++            launch, port = d["descriptor"], int(d.get("p2p_port") or 0)
++            if not isinstance(launch, dict) or launch.get("ticker") != t or not 1024 <= port <= 65535:
++                raise ValueError("not a launch as the site gives them")
++            if reach(u.hostname, port):
++                peer, relay = f"{u.hostname}:{port}", 0
++            else:  # its node cannot be dialed from here: through the site's pages
++                relay = free_port()
++                peer = f"127.0.0.1:{relay}"
++            take_on(i, t, launch, peer, "the site", say)
++            with book() as st:
++                st["follow"][t]["relay"] = relay
++        except Exception as e:  # noqa: BLE001
++            say(f"fun: {t} was not taken on: {str(e)[:200]}")
++    for f in sorted(DROP.glob("*.json")) if DROP.is_dir() else []:
++        try:
++            launch = json.loads(f.read_text())
++            t = str(launch.get("ticker", ""))
++            if re.fullmatch(TICKER, t) and t not in registry():
++                take_on(i, t, launch, "", f"launches/{f.name}", say)
++        except Exception as e:  # noqa: BLE001
++            say(f"fun: launches/{f.name} was not taken on: {str(e)[:200]}")
++    return sorted(set(registry()) & set(read_book()["follow"]))
++
++
++# ------------------------------------------------------------------ bytes through the site's pages (a WebSocket, RFC 6455)
++WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
++WS_MAX = 1 << 20  # the largest frame taken
++CHUNK = 16384  # bytes carried at a time: a slow side holds the other back by this much, never by more
++
++
++def ws_accept(key: str) -> str:
++    return base64.b64encode(hashlib.sha1((key + WS_GUID).encode()).digest()).decode()
++
++
++def ws_send(sock, opcode: int, payload: bytes = b"", mask: bool = False, lock=None) -> None:
++    n = len(payload)
++    head = bytes([0x80 | opcode]) + (bytes([(0x80 if mask else 0) | n]) if n < 126 else
++                                     bytes([(0x80 if mask else 0) | 126]) + struct.pack(">H", n) if n < 65536 else
++                                     bytes([(0x80 if mask else 0) | 127]) + struct.pack(">Q", n))
++    if mask:
++        key = os.urandom(4)
++        payload = (int.from_bytes(payload, "big") ^ int.from_bytes((key * (n // 4 + 1))[:n], "big")).to_bytes(n, "big") if n else b""
++        head += key
++    if lock:
++        with lock:
++            sock.sendall(head + payload)
++    else:
++        sock.sendall(head + payload)
++
++
++def _exactly(sock, n: int) -> bytes:
++    buf = b""
++    while len(buf) < n:
++        got = sock.recv(n - len(buf))
++        if not got:
++            raise EOFError
++        buf += got
++    return buf
++
++
++def ws_recv(sock):
++    """The next frame: (opcode, payload, final). EOFError when the other side is gone; ValueError for a frame larger
++    than WS_MAX."""
++    b0, b1 = _exactly(sock, 2)
++    n = b1 & 0x7F
++    if n == 126:
++        n = struct.unpack(">H", _exactly(sock, 2))[0]
++    elif n == 127:
++        n = struct.unpack(">Q", _exactly(sock, 8))[0]
++    if n > WS_MAX:
++        raise ValueError("frame too large")
++    key = _exactly(sock, 4) if b1 & 0x80 else None
++    data = _exactly(sock, n) if n else b""
++    if key and n:
++        data = (int.from_bytes(data, "big") ^ int.from_bytes((key * (n // 4 + 1))[:n], "big")).to_bytes(n, "big")
++    return b0 & 0x0F, data, bool(b0 & 0x80)
++
++
++def carry(ws, tcp, client: bool, idle: float, first: bytes = b"") -> tuple:
++    """Carry bytes between a WebSocket (`ws`: a connected socket after the handshake) and a plain connection (`tcp`)
++    until one side ends or nothing has moved for `idle` seconds. client: this end masks its frames (the dialing end of
++    a WebSocket does) and sends a ping every 25 seconds, which keeps a tunnel in between from closing a quiet line.
++    Each direction reads a piece only after the piece before it has been written: a slow side holds the other back,
++    and nothing is kept in memory but the piece in hand. When the plain side ends its sending, the WebSocket is closed
++    after what it sent has gone out; when the WebSocket side closes, the plain side's sending is ended and what the
++    plain side still sends is given 5 seconds to arrive. Returns (bytes to the plain side, bytes to the WebSocket)."""
++    lock, done, moved, count = threading.Lock(), threading.Event(), [time.time()], [0, 0]
++    for s in (ws, tcp):
++        s.settimeout(idle)  # a side that takes nothing for that long ends the line (a write would otherwise wait for good)
++
++    def down():  # plain -> WebSocket
++        try:
++            if first:
++                ws_send(ws, 2, first, client, lock)
++            while not done.is_set():
++                r, _, _ = select.select([tcp], [], [], 25.0)
++                if not r:
++                    if client:
++                        ws_send(ws, 9, b"", True, lock)
++                    continue
++                piece = tcp.recv(CHUNK)
++                if not piece:
++                    break
++                ws_send(ws, 2, piece, client, lock)
++                count[1] += len(piece)
++                moved[0] = time.time()
++        except (OSError, ValueError):
++            pass
++        try:  # the plain side has said all it has to say: the WebSocket closes, both ways
++            ws_send(ws, 8, struct.pack(">H", 1000), client, lock)
++        except OSError:
++            pass
++        done.set()
++
++    t = threading.Thread(target=down, daemon=True)
++    t.start()
++    try:
++        while True:
++            r, _, _ = select.select([ws], [], [], 5.0)
++            if done.is_set() and not r:
++                break
++            if not r:
++                if time.time() - moved[0] > idle:
++                    break
++                continue
++            op, data, _fin = ws_recv(ws)
++            if op == 8:  # the other end closed: no more will come for the plain side
++                try:
++                    tcp.shutdown(socket.SHUT_WR)
++                except OSError:
++                    pass
++                t.join(5.0)
++                break
++            if op == 9:
++                ws_send(ws, 10, data, client, lock)
++            elif op in (0, 2):
++                tcp.sendall(data)
++                count[0] += len(data)
++                moved[0] = time.time()
++            elif op == 1:
++                break  # text: not what this line carries
++    except (OSError, EOFError, ValueError):
++        pass
++    done.set()
++    for s in (tcp, ws):
++        try:
++            s.shutdown(socket.SHUT_RDWR)
++        except OSError:
++            pass
++        try:
++            s.close()
++        except OSError:
++            pass
++    t.join(2.0)
++    return count[0], count[1]
++
++
++def ws_dial(url: str, timeout: float = 20.0):
++    """Open a WebSocket: the connected socket, ready for frames. url: ws:// or wss://."""
++    u = urllib.parse.urlsplit(url)
++    tls = u.scheme == "wss"
++    s = socket.create_connection((u.hostname, u.port or (443 if tls else 80)), timeout=timeout)
++    if tls:
++        s = ssl.create_default_context().wrap_socket(s, server_hostname=u.hostname)
++    key = base64.b64encode(os.urandom(16)).decode()
++    host = u.hostname + (f":{u.port}" if u.port else "")
++    s.sendall((f"GET {u.path or '/'} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
++               f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\nUser-Agent: qwencoin-node/1\r\n\r\n").encode())
++    head = b""
++    while b"\r\n\r\n" not in head:
++        got = s.recv(1)
++        if not got or len(head) > 8192:
++            s.close()
++            raise RuntimeError("the site closed the line before answering")
++        head += got
++    lines = head.decode("latin-1").split("\r\n")
++    heads = {k.strip().lower(): v.strip() for k, v in (l.split(":", 1) for l in lines[1:] if ":" in l)}
++    if " 101" not in lines[0] or heads.get("sec-websocket-accept") != ws_accept(key):
++        s.close()
++        raise RuntimeError(f"the site did not open a line for this launch ({lines[0][:80]})")
++    s.settimeout(None)
++    return s
++
++
++def relay_url(base: str, ticker: str) -> str:
++    return ("wss://" if base.startswith("https://") else "ws://") + base.split("://", 1)[1] + f"/p2p/{ticker}"
++
++
++def relay(ticker: str, port: int, base: str, stop: threading.Event, say=note) -> None:
++    """Listen on a port of this machine for the launch's own node and carry each of its connections to the site's node
++    of that launch, through the site's pages. Runs until `stop`."""
++    srv = socket.socket()
++    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
++    try:
++        srv.bind(("127.0.0.1", port))
++    except OSError as e:
++        say(f"fun: the port {port} for {ticker}'s line to the site is taken ({e})")
++        return
++    srv.listen(8)
++    srv.settimeout(2.0)
++    idle = float(os.environ.get("FUN_RELAY_IDLE") or 900)
++
++    def one(conn):
++        try:
++            ws = ws_dial(relay_url(base, ticker))
++        except Exception as e:  # noqa: BLE001
++            say(f"fun: {ticker}: no line through the site ({str(e)[:120]})")
++            conn.close()
++            return
++        carry(ws, conn, True, idle)
++
++    while not stop.is_set():
++        try:
++            conn, _ = srv.accept()
++        except socket.timeout:
++            continue
++        except OSError:
++            break
++        threading.Thread(target=one, args=(conn,), daemon=True).start()
++    srv.close()
++
++
++# ------------------------------------------------------------------ the helper: nodes up, a pool each, a share of one core
++def cpu(host: str, port: int, user: str, duty: float) -> None:
++    """hashfun's own stratum miner on a share of one core (a process of its own: `tools/fun.py cpu ..`)."""
++    import asyncio
++
++    pkg = package(lambda *x: None)
++    if pkg is None:
++        raise SystemExit("no hashfun package in this folder")
++    sys.path.insert(0, str(pkg / "py"))
++    from hashfun.miner import StratumMiner  # noqa: E402
++    signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
++    while True:
++        try:
++            asyncio.run(StratumMiner(host, port, user, duty=duty).run())
++        except Exception as e:  # noqa: BLE001  (the pool is starting, or was started again)
++            note(f"cpu: {type(e).__name__}: {str(e)[:120]}")
++        time.sleep(5)
++
++
++class Helper:
++    """What `tools/chain.py up` starts as `fun`, for one node of the machine."""
++
++    def __init__(self, i: int) -> None:
++        self.i, self.kids, self.relays, self.stop = i, {}, {}, threading.Event()
++        self.mining, self.duty, self.turn, self.looked, self.said = None, 0.0, 0.0, 0.0, {}
++
++    def say(self, *x) -> None:
++        note(f"n{self.i}", *x)
++
++    def once(self, key: str, text: str) -> None:
++        if self.said.get(key) != text:
++            self.said[key] = text
++            self.say(text)
++
++    def spawn(self, name: str, argv: list, env: dict) -> None:
++        p = self.kids.get(name)
++        if p is not None and p.poll() is None:
++            return
++        log = open(HOME / f"{name}.log", "a")
++        self.kids[name] = subprocess.Popen([str(a) for a in argv], stdout=log, stderr=log, stdin=subprocess.DEVNULL, env=env, cwd=HOME)
++
++    def end(self, name: str) -> None:
++        p = self.kids.pop(name, None)
++        if p is not None and p.poll() is None:
++            p.terminate()
++            try:
++                p.wait(20)
++            except subprocess.TimeoutExpired:
++                p.kill()
++
++    def ready(self, t: str) -> dict | None:
++        """The launch's node is up, holds the fun wallet's keys, and has its line to the site if it needs one. Returns
++        what the book has for it, or None if it is not ready yet."""
++        with book() as st:
++            f = dict(st["follow"].get(t, {}))
++        try:
++            rpc(t, "getblockcount", timeout=10)
++        except RuntimeError:
++            hf("node", "up", t, timeout=240, say=self.say)
++            self.say(f"fun: the node of {t} is started")
++        if f.get("relay") and t not in self.relays and site():
++            th = threading.Thread(target=relay, args=(t, int(f["relay"]), site(), self.stop, self.say), daemon=True)
++            th.start()
++            self.relays[t] = th
++        if not f.get("payout"):
++            f["payout"] = share_keys(self.i, t, bool(f.get("test")))
++            f["stratum"] = free_port()
++            with book() as st:
++                st["follow"][t].update(payout=f["payout"], stratum=f["stratum"])
++            self.say(f"fun: {t}: its node holds the fun wallet's keys; what this node mines there is paid to {f['payout']}")
++        return f
++
++    def pool(self, t: str, f: dict) -> None:
++        argv, env = command(self.say)
++        args = ["mine", t, "--payout", f["payout"], "--curve", "qwen", "--qwen-rpc", f"http://127.0.0.1:{net.rpcport(self.i)}",
++                "--qwen-cookie", net.datadir(self.i) / ".cookie", "--qwen-wallet", WALLET, "--no-cpu", "--listen", f"127.0.0.1:{f['stratum']}"]
++        # The site's box relays Bitcoin's headers into the launch too, from where it reads Bitcoin. Another node does that
++        # only when its owner names a source of its own (FUN_BTC): the file FUNBTC is the site's, and its default is
++        # public Electrum servers that every follower should not lean on.
++        btc = bitcoin_source() if serving() or os.environ.get("FUN_BTC") else ""
++        if btc:
++            args += ["--btc-rpc", btc]
++        self.spawn(f"pool-{t}", argv + args, env)
++
++    def funded(self, t: str) -> bool:
++        """The fun wallet can pay for the next blocks of this launch; if not, the node moves qwen in, within its limit."""
++        cost = block_cost(t)
++        have = balance(self.i)
++        if have >= 3 * cost:
++            return True
++        want = max(int(os.environ.get("FUN_FLOAT") or 1_000_000), 6 * cost)
++        with book() as st:
++            moved = st["moved"]
++        want = int(min(want, step(), limit() - moved))
++        if want < cost or allowed(want, moved):
++            self.once(f"limit-{t}", f"fun: {t}: a block owes about {cost:,d} sats of qwen and the fun wallet holds {have:,d}; this node has moved {moved:,d} in "
++                                    f"and its limit is {'none' if limit() == float('inf') else format(int(limit()), ',d')} (FUN_LIMIT, else MIND_LIMIT): not mining")
++            return have >= cost
++        try:
++            if round(float(net.cli(self.i, "getbalances", wallet="ord")["mine"]["trusted"]) * COIN) < want + 100_000:
++                self.once(f"poor-{t}", "fun: the node's own wallet has no coins to spare yet (a node's first coins mature 100 blocks after it mines them)")
++                return have >= cost
++            txid = move_in(self.i, want, f"blocks of {t}")
++            self.say(f"fun: moved {want:,d} sats of qwen into the fun wallet for blocks of {t} ({txid}); {moved + want:,d} in all")
++        except Refusal as e:
++            self.once(f"limit-{t}", f"fun: {t}: {e}")
++        return have >= cost
++
++    def choose(self, live: list) -> tuple:
++        """(launch to mine now, share of a core): a launch the node's model has asked blocks of comes first, at half
++        a core at least; else the launches take turns, five minutes each, at FUN_CPU."""
++        duty = float(os.environ.get("FUN_CPU") or 0.1)
++        with book() as st:
++            orders = {t: n for t, n in st["orders"].items() if n > 0 and t in live}
++        if orders:
++            return sorted(orders)[0], max(duty, 0.5)
++        if duty <= 0 or not live:
++            return None, 0.0
++        if self.mining not in live or time.time() - self.turn > 300:
++            k = (live.index(self.mining) + 1) % len(live) if self.mining in live else 0
++            return live[k], duty
++        return self.mining, duty
++
++    def settle_orders(self, t: str) -> None:
++        """Blocks the model asked for are taken off its order as the launch's wallet is paid by new blocks."""
++        try:
++            hs = {x["blockheight"] for x in rpc(t, "listtransactions", "*", 60, 0, True, wallet=WALLET)
++                  if x.get("category") in ("immature", "generate") and x.get("blockheight") is not None}
++        except RuntimeError:
++            return
++        with book() as st:
++            f = st["follow"].get(t, {})
++            seen = f.get("seen", max(hs, default=0))
++            new = len([h for h in hs if h > seen])
++            f["seen"] = max(hs | {seen})
++            if new and st["orders"].get(t, 0) > 0:
++                st["orders"][t] = max(0, st["orders"][t] - new)
++
++    def round(self) -> None:
++        if time.time() - self.looked > 600 or not self.looked:
++            self.looked = time.time()
++            follow(self.i, self.say)
++        live = []
++        for t in sorted(set(registry()) & set(read_book()["follow"])):
++            try:
++                f = self.ready(t)
++                info = rpc(t, "getlaunchinfo")
++                if info.get("graduated") or not (info.get("curves") or {}).get("qwen"):
++                    self.end(f"pool-{t}")
++                    self.once(f"over-{t}", f"fun: {t} is off its curves" if info.get("graduated") else f"fun: {t} has no QWEN curve (an earlier rule set): its node runs, nothing is mined")
++                    continue
++                self.pool(t, f)
++                self.settle_orders(t)
++                if net.cli(self.i, "getblockchaininfo").get("initialblockdownload"):
++                    self.once("sync", "fun: this node is still fetching its own chain: no launch is mined until it has it")
++                    continue
++                if self.funded(t):
++                    live.append(t)
++            except Refusal as e:
++                self.once(f"no-{t}", f"fun: {t}: {e}")
++            except Exception as e:  # noqa: BLE001
++                self.once(f"err-{t}", f"fun: {t}: {type(e).__name__}: {str(e)[:200]}")
++        t, duty = self.choose(live)
++        dead = t and not os.environ.get("FUN_CMD") and (self.kids.get("cpu") is None or self.kids["cpu"].poll() is not None)
++        if (t, duty) != (self.mining, self.duty) or dead:
++            self.end("cpu")
++            if t != self.mining:
++                self.turn = time.time()
++            self.mining, self.duty = t, duty
++            if t and not os.environ.get("FUN_CMD"):
++                f = read_book()["follow"][t]
++                self.spawn("cpu", [sys.executable, str(Path(__file__).resolve()), "cpu", "127.0.0.1", f["stratum"], f["payout"], duty], environment())
++                self.say(f"fun: mining {t} on its QWEN curve with {duty:g} of one core")
++            elif not t:
++                self.once("idle", "fun: nothing to mine now")
++
++    def run(self) -> None:
++        signal.signal(signal.SIGTERM, lambda *_: self.stop.set())
++        self.say(f"fun: the site {site() or '(none)'}; limit {'none' if limit() == float('inf') else format(int(limit()), ',d') + ' sats'}; "
++                 f"{float(os.environ.get('FUN_CPU') or 0.1):g} of one core")
++        if serving():
++            self.say(f"fun: this node is the site: hashfun's pages on 127.0.0.1:{web_port()}, served as /fun by tools/web.py")
++        stopfile = net.RUN / "STOP"
++        while not self.stop.is_set() and not stopfile.exists():
++            try:
++                if serving():
++                    argv, env = site_command(self.i, self.say)
++                    self.spawn("site", argv, env)
++                self.round()
++            except Refusal as e:
++                self.once("refusal", f"fun: {e}")
++            except Exception as e:  # noqa: BLE001
++                self.once("error", f"fun: {type(e).__name__}: {str(e)[:240]}")
++            self.stop.wait(20)
++        for name in list(self.kids):
++            self.end(name)
++        self.say("fun: the pools and the miner are stopped; the launches' nodes go on (`down` stops them)")
++
++
++def bitcoin_source() -> str:
++    """Where this node reads Bitcoin, if anywhere: FUN_BTC, else the first word of the file FUNBTC. What hashfun takes
++    as --btc-rpc: a Bitcoin node's RPC address, or electrums://HOST:PORT,HOST:PORT (Electrum servers over TLS)."""
++    text = os.environ.get("FUN_BTC")
++    if text is None:
++        try:
++            text = (ROOT / "FUNBTC").read_text()
++        except OSError:
++            text = ""
++    w = [x for line in text.splitlines() for x in line.split("#")[0].split()]
++    return w[0] if w and re.fullmatch(r"(?:https?|electrums?)://[A-Za-z0-9@:._,/~%-]+", w[0]) else ""
++
++
++def site_command(i: int, say=note) -> tuple:
++    """hashfun's pages on this machine, for tools/web.py to serve as /fun: reading this node's own chain for the QWEN
++    side, Bitcoin from where the folder says (bitcoin_source), launches made from its form, blocks mined for its
++    visitors with FUN_POOL_CPU of one core (0.25)."""
++    argv, env = command(say)
++    btc = bitcoin_source()
++    if not btc:
++        raise Refusal("this node is to be the site (FUN_SERVE=1) and the folder names no way to read Bitcoin: the file FUNBTC, "
++                      "one line, a Bitcoin node's RPC address or electrums://HOST:PORT,HOST:PORT")
++    args = ["web", "--listen", f"127.0.0.1:{web_port()}", "--base-path", "/fun", "--btc-rpc", btc,
++            "--qwen-rpc", f"http://127.0.0.1:{net.rpcport(i)}", "--qwen-cookie", net.datadir(i) / ".cookie",
++            "--allow-launch", "--pool", "--pool-host", "127.0.0.1", "--pool-cpu", os.environ.get("FUN_POOL_CPU") or "0.25"]
++    pages = os.environ.get("QWEN_WEB_PORT", "0")
++    if pages not in ("", "0") and knows("web", "--qwen-pages"):
++        # this node's own pages: the site reads from them how many nodes with a model there are (/graph/status.json)
++        args += ["--qwen-pages", f"http://127.0.0.1:{int(pages)}"]
++    return argv + [str(a) for a in args] + shlex.split(os.environ.get("FUN_WEB_ARGS", "")), env
++
++
++def up(i: int | None = None) -> None:
++    """Before the helper starts: the package is in place and says its version. A folder that cannot have it says why,
++    once, and the node goes on without."""
++    i = i or node()
++    if not wanted():
++        return
++    try:
++        argv, env = command()
++        v = version_here(Path(env["PYTHONPATH"]).parent) if env.get("PYTHONPATH") and not os.environ.get("FUN_CMD") else ""
++        note(f"fun: hashfun{' ' + v if v else ''} for node {i}; the site {site() or '(none)'}" + ("; this node is the site" if serving() else ""))
++    except Exception as e:  # noqa: BLE001
++        note(f"fun: not started: {str(e)[:300]}")
++
++
++def down() -> None:
++    """Stop the launches' nodes of this folder (their chains and wallets stay in run/fun)."""
++    if not registry():
++        return
++    try:
++        hf("node", "down", timeout=300, check=False)
++        note("fun: the launches' nodes are stopped")
++    except Exception as e:  # noqa: BLE001
++        note(f"fun: the launches' nodes were not stopped: {str(e)[:200]}")
++
++
++# ------------------------------------------------------------------ what a person, and the node's model, can ask and do
++def coins_text(sats: int) -> str:
++    c = f"{sats / COIN:,.4f}".rstrip("0").rstrip(".")
++    return c or "0"
++
++
++def status_lines(i: int | None = None) -> list:
++    i = i or node()
++    if os.environ.get("FUN", "1") == "0" or not (registry() or wanted()):
++        return []
++    out = []
++    try:
++        st = read_book()
++        head = f"  hashfun: the site {site() or '(none)'}; {coins_text(st['moved'])} qwen moved into the fun wallet in all"
++        lim = limit()
++        head += f" (limit {'none' if lim == float('inf') else coins_text(int(lim))})"
++        try:
++            head += f", {coins_text(balance(i))} in it now"
++        except Exception:  # noqa: BLE001
++            pass
++        out.append(head)
++        for t in sorted(registry()):
++            try:
++                v = view(i, t)
++                line = f"    {t:6s} height {v['height']:6d}  peers {v['peers']}"
++                if v["graduated"]:
++                    line += "  off its curves"
++                for q in ("btc", "qwen"):
++                    if f"price_sats_of_{q}" in v:
++                        line += f"  {q.upper()} curve {v[f'{q}_curve_percent']:.1f}%: {v[f'price_sats_of_{q}']:,d} sats a coin"
++                if "one_qwen_in_sats_of_btc" in v:
++                    line += f"  (1 qwen = {v['one_qwen_in_sats_of_btc']:,d} sats; {v['that_price_is']})"
++                line += f"  holds {coins_text(v['holds_sats'] + v.get('mined_not_yet_spendable_sats', 0))} {t}"
++                if v["blocks_owed_for"]:
++                    line += f"  owes {v['owes_sats_of_qwen']:,d} sats of qwen for {v['blocks_owed_for']} block{'s' if v['blocks_owed_for'] != 1 else ''}"
++                if st["orders"].get(t):
++                    line += f"  ({st['orders'][t]} asked for by the model)"
++                out.append(line)
++            except Exception as e:  # noqa: BLE001
++                out.append(f"    {t:6s} its node is not answering ({str(e)[:70]})")
++    except Exception as e:  # noqa: BLE001
++        out.append(f"  hashfun: not readable ({str(e)[:80]})")
++    return out
++
++
++def coins(i: int) -> list:
++    """Every launch this node follows (rails.tools: fun_coins)."""
++    out = []
++    for t in sorted(registry()):
++        try:
++            out.append(view(i, t))
++        except RuntimeError as e:
++            out.append({"coin": t, "error": str(e)[:120]})
++    return out
++
++
++def quote(i: int, ticker: str) -> dict:
++    """One coin's two prices (rails.tools: fun_quote): from this node's own hashfund if it follows the coin, else what
++    the site says of it."""
++    t = ticker.strip().upper().lstrip("$")
++    if not re.fullmatch(TICKER, t):
++        raise Refusal("a coin is named by its ticker, 2 to 10 letters or digits")
++    if t in registry():
++        v = view(i, t)
++        try:
++            v["a_block_on_the_qwen_curve_owes_about_sats"] = block_cost(t)
++        except (Refusal, RuntimeError):
++            pass
++        return v
++    try:
++        d = site_get(f"/api/coin/{t}")
++    except urllib.error.HTTPError:
++        raise Refusal(f"the site has no coin {t}")
++    keep = {k: d[k] for k in ("ticker", "name", "height", "progress", "graduated", "curves", "implied", "holders") if k in d}
++    return {"from": "the site (this node does not follow this coin)", **keep}
++
++
++def order(i: int, ticker: str, blocks: int, spending) -> dict:
++    """The node's model asks for blocks of a coin on its QWEN curve (rails.tools: fun_mine). spending: the node's rail
++    around anything that moves coins (rails.tools.Node._spending): the qwen the blocks will owe is moved into the fun
++    wallet under it, and the helper then mines until that many blocks have paid this node."""
++    t = ticker.strip().upper().lstrip("$")
++    if t not in registry():
++        raise Refusal(f"this node does not follow a coin {t!r}; the coins it follows: {', '.join(sorted(registry())) or 'none'}")
++    if not 1 <= blocks <= 5:
++        raise Refusal("blocks: from 1 to 5 at a time")
++    info = rpc(t, "getlaunchinfo")
++    if info.get("graduated"):
++        raise Refusal(f"{t} is off its curves: its coins are no longer mined this way")
++    cost = block_cost(t) * blocks
++    with book() as st:
++        no = allowed(cost, st["moved"])
++    if no:
++        raise Refusal(no)
++    with spending("fun_mine", f"mine {blocks} block{'s' if blocks != 1 else ''} of {t} on its QWEN curve and pay about {cost:,d} sats of qwen for "
++                              f"{'them' if blocks != 1 else 'it'}", cost, False):  # (False: the move below takes the node's lock itself)
++        txid = move_in(i, cost, f"{blocks} block(s) of {t}, asked for by the model")
++    with book() as st:
++        st["orders"][t] = st["orders"].get(t, 0) + blocks
++        waiting = st["orders"][t]
++    return {"coin": t, "blocks_asked_for": blocks, "blocks_waiting_to_be_mined": waiting, "sats_of_qwen_set_aside": cost, "txid": txid,
++            "what_happens": "the node mines them; each pays its coins to this node and its qwen to a holder the launch draws"}
++
++
++def send(i: int, ticker: str, to: str, sats: int, spending) -> dict:
++    """Give coins of a launch to an address of that launch (rails.tools: fun_send)."""
++    t = ticker.strip().upper().lstrip("$")
++    if t not in registry():
++        raise Refusal(f"this node does not follow a coin {t!r}")
++    if sats <= 0:
++        raise Refusal("sats must be positive")
++    if not rpc(t, "validateaddress", to).get("isvalid"):
++        raise Refusal(f"{to!r} is not an address of {t}")
++    have = round(float(rpc(t, "getbalances", wallet=WALLET)["mine"]["trusted"]) * COIN)
++    if sats > have:
++        raise Refusal(f"this node can spend {have:,d} sats of {t} now (a mined block's coins wait for its qwen to be paid and for 100 blocks)")
++    with spending("fun_send", f"give {sats:,d} sats of {t} to {to}", None, False):
++        # the fee rate and the change's kind are said: a launch's node has seen too few blocks to estimate a fee and has
++        # no fallback, and its wallet makes legacy change by default, for which the fun wallet has no keys
++        txid = rpc(t, "send", [{to: f"{sats / COIN:.8f}"}], None, "unset", int(FEE_RATE), {"change_type": "bech32"}, wallet=WALLET)["txid"]
++    return {"txid": txid, "coin": t, "sats": sats, "to": to}
++
++
++def launch(i: int, name: str, ticker: str, description: str, spending) -> dict:
++    """Make a new coin through the site (rails.tools: fun_launch). The site anchors it in Bitcoin and in this chain,
++    mines its first block and runs its first node; this node then follows it. Its creator's share, on the launch and of
++    what its blocks owe on both curves, is paid at the fun wallet's key. One a day at most (FUN_LAUNCH_EVERY hours)."""
++    t = ticker.strip().upper().lstrip("$")
++    name, description = " ".join(name.split())[:40], " ".join(description.split())[:280]
++    if not re.fullmatch(TICKER, t) or t in ("BTC", "QWEN"):
++        raise Refusal("ticker: 2 to 10 capital letters or digits, and not BTC or QWEN")
++    if not name:
++        raise Refusal("a coin needs a name")
++    every = float(os.environ.get("FUN_LAUNCH_EVERY") or 24) * 3600
++    with book() as st:
++        last = max(st["launched"], default=0)
++    if time.time() - last < every:
++        raise Refusal(f"this node made a coin {int((time.time() - last) / 3600)} hours ago; one in {every / 3600:g} hours")
++    cfg = site_get("/api/config")
++    if not cfg.get("allow_launch"):
++        raise Refusal("the site this node follows does not make coins")
++    if t in (cfg.get("launches") or {}):
++        raise Refusal(f"the site has a coin {t} already")
++    spk, addr = script_of(i), address(i)
++    body = {"name": name, "ticker": t, "creator_script": spk, "creator_btc_address": addr, "creator_qwen_address": addr,
++            "graduation_hashes": int(float(os.environ.get("FUN_LAUNCH_HASHES") or 2e11)),
++            "sats_total": int(os.environ.get("FUN_LAUNCH_SATS") or 10_000_000), "qwen_total": int(os.environ.get("FUN_LAUNCH_QWEN") or 100 * COIN),
++            **({"metadata": {"description": description}} if description else {})}
++    with spending("fun_launch", f"make a coin {t} ({name}) on {site()}", None, False):
++        r = site_post("/api/launch", body)
++    with book() as st:
++        st["launched"] = (st["launched"] + [int(time.time())])[-20:]
++    return {"coin": r.get("ticker", t), "id": r.get("id"), "made_on": site(), "what_happens": "this node follows it from its next look at the site and mines it"}
++
++
++def write_pin(repo: str, version: str) -> None:
++    """(the publisher) Name a published hashfun release in HASHFUNPKG: its package is fetched, its sha256 taken here
++    and set beside the one the release's own SHA256SUMS gives; the file is written only if the two are the same."""
++    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,59}/[A-Za-z0-9][A-Za-z0-9_.-]{0,59}", repo) or not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", version):
++        raise SystemExit("usage: tools/fun.py pin OWNER/REPOSITORY vX.Y.Z")
++    PKGS.mkdir(exist_ok=True)
++    base = f"{releases(repo)}/{version}"
++    name = f"hashfun-{version[1:]}.tgz"
++    fetch(f"{base}/{name}", PKGS / name)
++    fetch(f"{base}/SHA256SUMS", PKGS / "SHA256SUMS")
++    got = sha256_of(PKGS / name)
++    theirs = next((l.split()[0] for l in (PKGS / "SHA256SUMS").read_text().splitlines() if l.split()[1:] and l.split()[1].lstrip("*") == name), "")
++    print(f"{name}: sha256 here {got}\n{' ' * len(name)}  the release's {theirs or '(not listed in its SHA256SUMS)'}")
++    if got != theirs:
++        raise SystemExit("not the same: HASHFUNPKG is left as it is")
++    (ROOT / "HASHFUNPKG").write_text(f"{repo} {version} {got}\n")
++    print(f"HASHFUNPKG: {repo} {version} {got}")
++
++
++if __name__ == "__main__":
++    cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
++    if cmd == "status":
++        print("\n".join(status_lines()) or "hashfun: nothing runs in this folder (the files HASHFUN and HASHFUNPKG name nothing, or FUN=0)")
++    elif cmd == "pin":
++        write_pin(*sys.argv[2:4])
++    elif cmd == "up":
++        up()
++    elif cmd == "down":
++        down()
++    elif cmd == "run":
++        Helper(int(sys.argv[2]) if len(sys.argv) > 2 else node()).run()
++    elif cmd == "cpu":
++        cpu(sys.argv[2], int(sys.argv[3]), sys.argv[4], float(sys.argv[5]))
++    elif cmd == "site":
++        argv, env = site_command(node())
++        os.execvpe(argv[0], argv, env)
++    else:
++        sys.exit(__doc__)
+-- 
+2.43.0
+

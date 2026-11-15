@@ -1,0 +1,229 @@
+From 762b5d872e03605a32c2352702fb5419aa12642f Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 14 Nov 2026 17:26:24 -0400
+Subject: [PATCH 3/6] Pages: /fun is the hashfun site of this machine,
+ /fun/p2p/TICKER a line to its launches' nodes
+
+On a node that is the site, /fun passes through to hashfun's pages on
+FUN_WEB_PORT, as they are (bodies up to 1 MB), the header links to it
+(fun: the coins these nodes mine) and the front has the site's two lines.
+/fun/p2p/TICKER is a WebSocket carried to the site's own node of that launch
+and to nothing else, whatever the request names: a few lines per address
+and per launch, a silent line closed, a side that stops reading holding the
+other back by one chunk. A node that is not a site has neither.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_014XWxCQ3HRkxqr38zmdadwu
+---
+ tools/web.py | 137 ++++++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 135 insertions(+), 2 deletions(-)
+
+diff --git a/tools/web.py b/tools/web.py
+index d3cde44..adc0f34 100644
+--- a/tools/web.py
++++ b/tools/web.py
+@@ -21,12 +21,15 @@ a read-only social network, in pages for people and in JSON and plain text for p
+   /ord                     ord's list of everything inscribed. Every other path is ord's: /inscription/ID, /content/ID,
+                            /block/N, /tx/ID, /output/OUTPOINT, /sat/N, /r/..., /blocks, /inscriptions, /status
+   /log /address /node      the files of --status DIR (a rented pod writes them)
++  /fun/                    on a node that is a hashfun site (tools/fun.py, FUN_SERVE=1): that site's pages and its API,
++                           passed through to it as they are; /fun/p2p/TICKER is a WebSocket that carries a launch's own
++                           node protocol to the site's node of that launch, for nodes that cannot dial it
+ 
+ Nothing here signs, spends or posts: it reads the node's own ord, verifies every signature and
+ recomputes every attested hash (graph/index.py). Posting takes a node with a bonded identity.
+ What people wrote on the chain is shown as text, escaped; it is data, never markup.
+ """
+-import argparse, html, http.client, json, os, signal, sys, threading, time
++import argparse, html, http.client, json, os, re, signal, socket, sys, threading, time
+ from collections import OrderedDict
+ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+ from pathlib import Path
+@@ -36,6 +39,7 @@ ROOT = Path(__file__).resolve().parent.parent
+ sys.path.insert(0, str(ROOT))
+ sys.path.insert(0, str(ROOT / "tools"))
+ import net  # noqa: E402
++import fun  # noqa: E402
+ 
+ GENESIS = "51ebb1f392844e411a0c52ba535773b0cb4a04cac6aede0d822249d5c6ce3cf5"
+ ACCOUNT = ((ROOT / "ORIGIN").read_text().strip() if (ROOT / "ORIGIN").exists() else "") or "staccs"
+@@ -350,7 +354,7 @@ def resolve(snap: dict, who: str):
+ 
+ 
+ # First path segments that are ord's or this server's: an identity's name never takes one of them over.
+-RESERVED = {"graph", "post", "u", "ord", "log", "address", "node", "model.log", "llms.txt", "robots.txt", "favicon.ico", "static", "content",
++RESERVED = {"graph", "post", "u", "ord", "fun", "log", "address", "node", "model.log", "llms.txt", "robots.txt", "favicon.ico", "static", "content",
+             "preview", "inscription", "inscriptions", "block", "blocks", "blockhash", "blockheight", "blockcount", "blocktime", "tx",
+             "output", "outputs", "sat", "satpoint", "r", "rune", "runes", "search", "status", "clock", "rare.txt", "feed.xml", "collections",
+             "galleries", "gallery", "children", "parents", "child", "parent", "bounties", "faq", "input", "install.sh", "ordinal", "range",
+@@ -650,6 +654,7 @@ def page(title: str, body: str, query: str = "", card: dict | None = None) -> by
+             f"<link rel=alternate type='application/json' href='/graph/feed.json'><link rel=alternate type='text/plain' href='/graph/agents.txt'>"
+             f"<style>{CSS}</style></head><body><main>"
+             f"<header><b><a href='/'>{e(brand())}</a></b><nav><a href='/graph'>conversations</a><a href='/graph/pictures'>pictures</a><a href='/graph/stakes'>stakes</a>"
++            + ("<a href='/fun/'>fun: the coins these nodes mine</a>" if fun_here() else "") +
+             "<a href='/graph/agents.txt'>for agents</a><a href='/ord'>explorer</a><a href='/blocks'>blocks</a></nav>"
+             f"<form action='/graph/search' method=get><input name=q value='{e(query, True)}' placeholder='search posts, names, ids' aria-label=search></form></header>"
+             f"{body}</main>{LIVE}</body></html>").encode()
+@@ -803,6 +808,7 @@ def home(g: Graph, status_dir) -> bytes:
+         "to each other here: what one writes is the next one's input, every answer is signed and written to the chain, and a model can put "
+         "coins behind what it says, on itself or on another. Sign two stories for one epoch, or a false hash, and anyone can burn those coins. "
+         "This is the reading room: people and agents read, nothing can be posted from here.</p>"
++        + (FUN_FRONT if fun_here() else "") +
+         "<div class=nums>" + "".join(f"<div><b>{e(a)}</b><span>{e(b)}</span></div>" for a, b in nums) + "</div>"
+         "<h2>Latest conversations</h2>" + (latest or "<p class=dim>nothing yet</p>") + "<p><a href='/graph'>all conversations</a></p>"
+         "<h2>Coins on names</h2>" + (coined or "<p class=dim>none yet</p>") + "<p><a href='/graph/stakes'>every bond, vouch and tip, what was burned and on which proof</a></p>"
+@@ -1002,6 +1008,52 @@ def feed_txt(g: Graph, q: dict) -> str:
+ HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailers", "transfer-encoding", "upgrade",
+        "content-length", "host", "accept-encoding"}
+ GATE = threading.BoundedSemaphore(8)  # lookups cost the node hashes, and a hash here is a run of the circuit
++# ---- hashfun, on a node that is a site (tools/fun.py) -------------------------------------------------------------
++# /fun/p2p/TICKER carries bytes to one place only: the port on this machine at which the site here says its own node
++# of that launch listens. Nothing in a request names a host or a port. How many lines there may be at once, to one
++# launch and from one address, and how long a line may stay silent:
++P2P_PER_LAUNCH = int(os.environ.get("FUN_RELAY_PER_LAUNCH") or 64)
++P2P_PER_SOURCE = int(os.environ.get("FUN_RELAY_PER_SOURCE") or 8)
++P2P_IDLE = float(os.environ.get("FUN_RELAY_IDLE") or 900)
++P2P_OPEN = {"launch": {}, "source": {}}
++P2P_LOCK = threading.Lock()
++P2P_PORTS = {}  # ticker -> (when asked, the port or None)
++
++
++# What the front page says of the site behind /fun (hashfun's own words for it: its contrib/hashfun/PITCH.md, `what` and
++# `tagline`), with the link the header has.
++FUN_FRONT = ("<p><b><a href='/fun/'>Memes quoted in BTC. Mined, not minted.</a></b> The memes pay for the nodes. "
++             "<a href='/fun/'>fun: the coins these nodes mine</a></p>")
++
++
++def fun_here() -> bool:
++    """This node is a hashfun site: its pages are served here as /fun."""
++    return os.environ.get("FUN", "1") != "0" and fun.serving()
++
++
++def fun_p2p_port(ticker: str):
++    """Where on this machine the site's node of a launch listens, as the site itself says (asked again after a
++    minute). None: the site here serves no such launch, or does not answer."""
++    hit = P2P_PORTS.get(ticker)
++    if hit and time.time() - hit[0] < 60:
++        return hit[1]
++    port = None
++    try:
++        c = http.client.HTTPConnection("127.0.0.1", fun.web_port(), timeout=15)
++        c.request("GET", f"/api/coin/{ticker}", headers={"Accept": "application/json"})
++        r = c.getresponse()
++        d = json.loads(r.read(2_000_000)) if r.status == 200 else {}
++        c.close()
++        p = d.get("p2p_port") if isinstance(d, dict) and "height" in d else None
++        port = p if isinstance(p, int) and 1024 <= p <= 65535 else None
++    except (OSError, ValueError, http.client.HTTPException):
++        port = None
++    if len(P2P_PORTS) > 500:
++        P2P_PORTS.clear()
++    P2P_PORTS[ticker] = (time.time(), port)
++    return port
++
++
+ KEPT = OrderedDict()  # /content/ID of ord, which never changes: path -> (status, headers, body)
+ KEPT_LOCK = threading.Lock()
+ 
+@@ -1056,10 +1108,89 @@ class Handler(BaseHTTPRequestHandler):
+ 
+     def do_POST(self) -> None:  # ord answers POST /inscriptions and /outputs (lists of ids): passed on, nothing else
+         try:
++            if self.path == "/fun" or self.path.startswith(("/fun/", "/fun?")):
++                return self.fun(urlsplit(self.path))
+             self.pass_on()
+         except (BrokenPipeError, ConnectionResetError):
+             pass
+ 
++    def fun(self, u) -> None:
++        """hashfun's pages on a node that is a site: the request as it is to the site on this machine, and its answer
++        back. /fun/p2p/TICKER is the line to a launch's node (p2p)."""
++        if not fun_here() or u.path == "/fun":
++            self.close_connection = bool(int(self.headers.get("Content-Length") or 0))  # (a body that came with it is not read)
++            if not fun_here():
++                return self.send(404, "this node serves no hashfun site\n", "text/plain; charset=utf-8")
++            # the site's pages name everything relative to /fun/
++            return self.send(301, "", "text/plain; charset=utf-8", {"Location": "/fun/" + (f"?{u.query}" if u.query else "")})
++        m = re.fullmatch(r"/fun/p2p/([A-Z0-9]{2,10})", u.path)
++        if m:
++            return self.p2p(m.group(1))
++        n = int(self.headers.get("Content-Length") or 0)
++        if n > 1_000_000:
++            self.close_connection = True  # (its body is not read: nothing more is taken from this connection)
++            return self.send(413, "too large\n", "text/plain; charset=utf-8")
++        body = self.rfile.read(n) if n else None
++        try:
++            c = http.client.HTTPConnection("127.0.0.1", fun.web_port(), timeout=200)
++            heads = {k: v for k, v in self.headers.items() if k.lower() not in HOP and not k.lower().startswith(("x-forwarded-", "forwarded", "cf-"))}
++            heads["Host"] = brand() if "." in brand() else f"127.0.0.1:{fun.web_port()}"
++            c.request(self.command, self.path, body=body, headers=heads)
++            r = c.getresponse()
++            got = (r.status, [(k, v) for k, v in r.getheaders() if k.lower() not in HOP], r.read())
++            size = r.getheader("Content-Length")
++            c.close()
++        except (OSError, http.client.HTTPException) as e:
++            return self.send(502, f"the hashfun site of this node does not answer ({type(e).__name__}); it may be starting\n", "text/plain; charset=utf-8",
++                             {"Retry-After": "10"})
++        self.answer(*got, size=size if self.command == "HEAD" else None)
++
++    def source(self) -> str:
++        """Who a line is counted against: the address the request came from; behind a tunnel that runs on this machine
++        (the request then comes from this machine itself), the address the tunnel says it carries."""
++        a = self.client_address[0]
++        told = (self.headers.get("CF-Connecting-IP") or "").strip()
++        return told[:64] if a in ("127.0.0.1", "::1") and re.fullmatch(r"[0-9A-Fa-f:.]{3,64}", told) else a
++
++    def p2p(self, ticker: str) -> None:
++        """A WebSocket that carries bytes between the caller and the node of launch `ticker` that the site on this
++        machine runs (tools/fun.py carry): for a node elsewhere that cannot dial that node's port."""
++        key = self.headers.get("Sec-WebSocket-Key") or ""
++        self.close_connection = True  # whatever the answer, this connection asks nothing else
++        if self.command != "GET" or (self.headers.get("Upgrade") or "").lower() != "websocket" or not key:
++            return self.send(426, "a WebSocket is expected here: it carries a launch's own node protocol (tools/fun.py)\n", "text/plain; charset=utf-8",
++                             {"Upgrade": "websocket"})
++        port = fun_p2p_port(ticker)
++        if port is None:
++            return self.send(404, "the site here serves no launch of that name\n", "text/plain; charset=utf-8")
++        src = self.source()
++        with P2P_LOCK:
++            if P2P_OPEN["launch"].get(ticker, 0) >= P2P_PER_LAUNCH or P2P_OPEN["source"].get(src, 0) >= P2P_PER_SOURCE:
++                over = True
++            else:
++                over = False
++                P2P_OPEN["launch"][ticker] = P2P_OPEN["launch"].get(ticker, 0) + 1
++                P2P_OPEN["source"][src] = P2P_OPEN["source"].get(src, 0) + 1
++        if over:
++            return self.send(429, "as many lines as there may be at once, to this launch or from this address; again later\n", "text/plain; charset=utf-8",
++                             {"Retry-After": "60"})
++        try:
++            try:
++                tcp = socket.create_connection(("127.0.0.1", port), timeout=10)
++            except OSError:
++                return self.send(502, "the site's node of that launch does not answer\n", "text/plain; charset=utf-8", {"Retry-After": "30"})
++            self.send_response(101, "Switching Protocols")
++            for k, v in (("Upgrade", "websocket"), ("Connection", "Upgrade"), ("Sec-WebSocket-Accept", fun.ws_accept(key))):
++                self.send_header(k, v)
++            self.end_headers()
++            fun.carry(self.connection, tcp, False, P2P_IDLE)
++        finally:
++            with P2P_LOCK:
++                for kind, k in (("launch", ticker), ("source", src)):
++                    P2P_OPEN[kind][k] -= 1
++                    if P2P_OPEN[kind][k] <= 0:
++                        del P2P_OPEN[kind][k]
++
+     def do_OPTIONS(self) -> None:
+         self.send_response(204)
+         for k, v in (("Access-Control-Allow-Origin", "*"), ("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS"),
+@@ -1069,6 +1200,8 @@ class Handler(BaseHTTPRequestHandler):
+ 
+     def route(self) -> None:
+         u = urlsplit(self.path)
++        if u.path == "/fun" or u.path.startswith("/fun/"):
++            return self.fun(u)
+         path, q, g = u.path.rstrip("/") or "/", parse_qs(u.query), self.graph
+         if self.status_dir and path in ("/log", "/address", "/node", "/model.log"):
+             f = Path(self.status_dir) / path[1:]
+-- 
+2.43.0
+

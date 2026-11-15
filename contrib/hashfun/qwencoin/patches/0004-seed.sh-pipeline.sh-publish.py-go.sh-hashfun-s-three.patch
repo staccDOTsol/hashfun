@@ -1,0 +1,109 @@
+From 8387e40689ae4d6e094b86f043741d4d2c0a235e Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 14 Nov 2026 17:26:24 -0400
+Subject: [PATCH 4/6] seed.sh, pipeline.sh, publish.py, go.sh: hashfun's three
+ files and its command
+
+A public node with HASHFUNPKG and FUNBTC in its folder is the site
+(FUN_SERVE=1, FUN_CPU=0). publish.py sends HASHFUN, HASHFUNPKG and FUNBTC
+with SEEDS and removes them there when they are gone here; an installed node
+asks for them at every start. go.cmd update takes them with the code.
+pipeline.sh fun: the coins this node follows.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_014XWxCQ3HRkxqr38zmdadwu
+---
+ tools/pipeline.sh | 4 ++++
+ tools/publish.py  | 7 +++++--
+ tools/seed.sh     | 7 +++++++
+ win/go.sh         | 3 +++
+ 4 files changed, 19 insertions(+), 2 deletions(-)
+
+diff --git a/tools/pipeline.sh b/tools/pipeline.sh
+index 2ca6c9a..df566a7 100644
+--- a/tools/pipeline.sh
++++ b/tools/pipeline.sh
+@@ -20,6 +20,9 @@
+ #   bash tools/pipeline.sh minds [SIZE]     which merged model the nodes here run as their own (minds 2B: the merged 2B for each
+ #                                           node, if that many fit in this machine's memory); without SIZE: what they run now
+ #   bash tools/pipeline.sh recheck SIZE     a merged model's functions on the running chain once more; its card and logs again
++#   bash tools/pipeline.sh fun [status|pin REPO VERSION]   hashfun on this node (tools/fun.py): the coins of the site the folder
++#                                           follows (the file HASHFUN), a line each; pin: (the publisher) name a hashfun release
++#                                           in the file HASHFUNPKG. FUN=0 in local.env: this node takes no part
+ #
+ #   NODES=4   MODELS="0.8B 2B 4B 9B 27B"   TORCH=auto|cpu|cuda   BACKEND="cpu float32"   QUICK=1   FORCE=1
+ #   LOGS=dir   NO_NET=1   NO_PUBLISH=1   NO_TOOLS=1   HF_TOKEN=... (or a token file, see tools/publish.py)
+@@ -139,6 +142,7 @@ fi
+ case "${1:-}" in
+   up)   env_stage; table_here; exec "$PY" tools/chain.py "$@" ;;  # also on a fresh copy of the repository
+   status|watch|down|mine|agent) [ -x "$PY" ] || { echo "$NOTHING"; exit 1; }; exec "$PY" tools/chain.py "$@" ;;
++  fun)  shift; [ -x "$PY" ] || { echo "$NOTHING"; exit 1; }; exec "$PY" tools/fun.py "${@:-status}" ;;
+   ask|chat)
+         CMD=$1; shift
+         [ -x "$PY" ] || { echo "$NOTHING"; exit 1; }
+diff --git a/tools/publish.py b/tools/publish.py
+index 98cbf98..d23bd13 100644
+--- a/tools/publish.py
++++ b/tools/publish.py
+@@ -249,7 +249,9 @@ def hub(logs, full: bool = True) -> bool:
+     repo = f"{who}/qwencoin"
+     stage = Path(tempfile.mkdtemp(prefix="qwhub"))
+     (stage / "README.md").write_text(cards.hub_card(who, logs, [r for r in published(logs) if r != repo]))
+-    for f in ("RESULTS.md", "MODELS", "SEEDS", "WEB"):
++    # (HASHFUN, HASHFUNPKG, FUNBTC: the hashfun site the nodes follow, the hashfun release they run, where a node that is
++    # that site reads Bitcoin: tools/fun.py. An installed node asks for them again at every start, as it does for SEEDS.)
++    for f in ("RESULTS.md", "MODELS", "SEEDS", "WEB", "HASHFUN", "HASHFUNPKG", "FUNBTC"):
+         if (ROOT / f).exists() and (ROOT / f).read_text().strip():
+             shutil.copy(ROOT / f, stage / f)
+     (stage / "ORIGIN").write_text(who + "\n")  # the account the checkpoints are under: `pipeline.sh join` fetches from it
+@@ -273,7 +275,8 @@ def hub(logs, full: bool = True) -> bool:
+         a.delete_folder("win", repo_id=repo, repo_type="model", commit_message="the kit's launcher is not part of the repository")
+     except Exception:  # noqa: BLE001  (not there)
+         pass
+-    for f, why in (("SEEDS", "no public node at the moment"), ("WEB", "no public pages at the moment")):  # gone here: not named there either
++    for f, why in (("SEEDS", "no public node at the moment"), ("WEB", "no public pages at the moment"), ("HASHFUN", "no hashfun site at the moment"),
++                   ("HASHFUNPKG", "no hashfun release named at the moment"), ("FUNBTC", "no way to read Bitcoin named at the moment")):  # gone here: not named there either
+         if not ((ROOT / f).exists() and (ROOT / f).read_text().strip()):
+             try:
+                 a.delete_file(f, repo_id=repo, repo_type="model", commit_message=why)
+diff --git a/tools/seed.sh b/tools/seed.sh
+index 5112fa3..7578684 100755
+--- a/tools/seed.sh
++++ b/tools/seed.sh
+@@ -6,6 +6,8 @@
+ #                                 public pages on 0.0.0.0:8080: ord's explorer and the graph, read-only
+ #                                 (tools/web.py; QWEN_WEB_PORT=0 for none, or another port)
+ #   bash tools/seed.sh status | down
++#                                 with the files HASHFUNPKG and FUNBTC in the folder: a hashfun site as well, served
++#                                 by the same pages as /fun (tools/fun.py; FUN_SERVE=0 for none)
+ #
+ # Needs python3 with numpy and, once, the chain's work table: qwork.bin from the project's
+ # Hugging Face repository (it is in a clone of it), or built here from Qwen3.5-0.8B.
+@@ -28,5 +30,10 @@ PYTHONPATH=. python3 -m hashformer.work info dist/qwork.bin | grep -q "(the chai
+ chmod +x bin/* libexec/* lib/ld-linux-*.so.* 2>/dev/null || true
+ export QWEN_WEB_PORT="${QWEN_WEB_PORT-8080}" QWEN_WEB_BIND="${QWEN_WEB_BIND:-0.0.0.0}"
+ [ -f /status/log ] && export QWEN_WEB_STATUS="${QWEN_WEB_STATUS:-/status}"  # a rented pod's own status files go on being served
++# A public node is where a hashfun site belongs (tools/fun.py): with the files HASHFUNPKG (the hashfun release) and FUNBTC
++# (where Bitcoin is read: electrums://HOST:PORT,HOST:PORT needs no Bitcoin node) in this folder, this node runs the site
++# and the pages above serve it as /fun, lines to its launches' nodes included. FUN_SERVE=0: not here. FUN_CPU=0: the
++# node itself mines no launch (what a rented pod mines is not kept there).
++export FUN_SERVE="${FUN_SERVE-1}" FUN_CPU="${FUN_CPU-0}"
+ QWEN_BIND=0.0.0.0 MINDS=0 PYTHONPATH=. python3 tools/chain.py up 1
+ echo "this node listens on port 8733. Others reach it with a file named SEEDS holding  $(hostname -I 2>/dev/null | awk '{print $1}'):8733  (use the public address)"
+diff --git a/win/go.sh b/win/go.sh
+index 5eddda0..d059a48 100644
+--- a/win/go.sh
++++ b/win/go.sh
+@@ -18,6 +18,9 @@ if [ "${1:-}" = update ]; then
+     [ -d "$T/$d" ] && mkdir -p "$WIN/kit/$d" && cp -r "$T/$d/." "$WIN/kit/$d/"
+   done
+   cp "$T/GITHUB" "$WIN/kit/GITHUB"; cp "$T/BUILD.md" "$WIN/kit/README.md"; cp "$T/RESULTS.md" "$WIN/kit/RESULTS.md"
++  # the hashfun site the nodes follow, the hashfun release they run, where the site reads Bitcoin (tools/fun.py): published
++  # with the project from here, so they come with the code
++  for f in HASHFUN HASHFUNPKG FUNBTC; do [ -f "$T/$f" ] && cp "$T/$f" "$WIN/kit/$f"; done
+   cp "$T/win/go.sh" "$WIN/kit/go.sh.new" && mv "$WIN/kit/go.sh.new" "$WIN/kit/go.sh"
+   echo "kit updated ($(cd "$T" && find tools graph rails hashformer tests exec -type f | wc -l) files of code)"
+   rm -rf "$T"
+-- 
+2.43.0
+

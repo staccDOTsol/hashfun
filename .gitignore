@@ -15,6 +15,7 @@
 !ci/test/*.patch
 !contrib/guix/patches/*.patch
 !depends/patches/**/*.patch
+!contrib/hashfun/qwencoin/patches/*.patch
 
 /CMakeUserPresets.json
 
