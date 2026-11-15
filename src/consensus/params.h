@@ -211,6 +211,20 @@ struct Params {
     int launch_btc_anchor_height{0};
     uint32_t launch_btc_anchor_period_time{0};
     bool launch_btc_regtest{false};
+    // QWEN leg (rule set 3, contrib/hashfun/TWIN.md). A launch has two curves of the same shape:
+    // a block before graduation is on one of them (bit LAUNCH_VERSION_QWEN of its version, see
+    // launchcurve.h) and owes that curve's asset: sats on Bitcoin, or qwen on Qwencoin. These
+    // mirror the sats-leg parameters above for the Qwencoin side; the dev's script is the same
+    // bytes on both chains.
+    uint64_t launch_qwen_num{0};
+    uint32_t launch_qwen_shift{0};
+    int64_t launch_qwen_min_payment{0};
+    int launch_qwen_confs{6};
+    std::vector<unsigned char> launch_creator_qwen_script;
+    std::vector<unsigned char> launch_qwen_anchor_header; //!< 80 bytes
+    int launch_qwen_anchor_height{0};
+    uint32_t launch_qwen_anchor_period_time{0};
+    bool launch_qwen_regtest{false};
     /** LWMA averaging window (0 = legacy Bitcoin retargeting). */
     int lwma_window{0};
     /** Max seconds a block timestamp may be ahead of local time (0 = default 2h). */

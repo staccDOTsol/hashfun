@@ -892,6 +892,16 @@ public:
         consensus.launch_btc_anchor_height = LaunchInt(d.btc_anchor_height, "btc_anchor_height");
         consensus.launch_btc_anchor_period_time = d.btc_anchor_period_time;
         consensus.launch_btc_regtest = d.btc_regtest;
+        // The QWEN leg: the second curve (contrib/hashfun/TWIN.md).
+        consensus.launch_qwen_num = d.qwen_num;
+        consensus.launch_qwen_shift = d.qwen_shift;
+        consensus.launch_qwen_min_payment = d.qwen_min_payment;
+        consensus.launch_qwen_confs = LaunchInt(d.qwen_confs, "qwen_confs");
+        consensus.launch_creator_qwen_script = d.creator_qwen_script;
+        consensus.launch_qwen_anchor_header.assign(d.qwen_anchor_header.begin(), d.qwen_anchor_header.end());
+        consensus.launch_qwen_anchor_height = LaunchInt(d.qwen_anchor_height, "qwen_anchor_height");
+        consensus.launch_qwen_anchor_period_time = d.qwen_anchor_period_time;
+        consensus.launch_qwen_regtest = d.qwen_regtest;
 
         const auto magic = LaunchMessageStart(d);
         std::copy(magic.begin(), magic.end(), pchMessageStart.begin());

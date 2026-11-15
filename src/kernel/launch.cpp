@@ -264,14 +264,19 @@ bool EarningScript(const std::vector<unsigned char>& s)
 }
 
 /**
- * What can be said about a Bitcoin anchor without a Bitcoin chain to look at. Enough to refuse a
- * made-up header (anyone could extend a difficulty-1-or-easier fake chain cheaply and "prove"
- * payments on it) and a period start that would make the relay compute a wrong difficulty at the
- * first retarget, after which no real Bitcoin header connects and nothing settles again.
+ * What can be said about an anchor without its chain to look at. Enough to refuse a made-up
+ * header (anyone could extend a difficulty-1-or-easier fake chain cheaply and "prove" payments on
+ * it) and a period start that would make the relay compute a wrong difficulty at the first
+ * retarget, after which no real header connects and nothing settles again.
+ *
+ * `key` is "btc" or "qwen", `chain` the chain's name in the messages, `limit_bits` its
+ * proof-of-work limit. A Bitcoin header's work is its hash, so `hash_is_work` checks it here; a
+ * Qwencoin header's work is a pass through the weights (src/launchyield.h), which a parser does
+ * not have: the node checks that when it starts.
  */
-bool CheckBtcAnchor(const LaunchDescriptor& d, std::string& error)
+bool CheckAnchor(const std::array<unsigned char, 80>& h, uint32_t height, uint32_t period_time, const char* key, const char* chain,
+                 uint32_t limit_bits, bool hash_is_work, std::string& error)
 {
-    const auto& h = d.btc_anchor_header;
     const auto le32 = [&](size_t at) {
         return uint32_t{h[at]} | (uint32_t{h[at + 1]} << 8) | (uint32_t{h[at + 2]} << 16) | (uint32_t{h[at + 3]} << 24);
     };
@@ -280,34 +285,48 @@ bool CheckBtcAnchor(const LaunchDescriptor& d, std::string& error)
     bool neg, ovf;
     target.SetCompact(bits, &neg, &ovf);
     if (neg || ovf || target == 0) {
-        error = "btc_anchor_header: its difficulty bits are not a valid target";
+        error = strprintf("%s_anchor_header: its difficulty bits are not a valid target", key);
         return false;
     }
-    limit.SetCompact(0x1d00ffff); // Bitcoin's proof-of-work limit
+    limit.SetCompact(limit_bits); // the chain's proof-of-work limit
     if (target > limit) {
-        error = "btc_anchor_header: easier than Bitcoin's minimum difficulty (not a Bitcoin mainnet header; a regtest anchor needs btc_regtest)";
+        error = strprintf("%s_anchor_header: easier than %s's minimum difficulty (not a %s mainnet header; a regtest anchor needs %s_regtest)", key, chain, chain, key);
         return false;
     }
-    std::array<unsigned char, 32> hash;
-    CSHA256().Write(h.data(), h.size()).Finalize(hash.data());
-    CSHA256().Write(hash.data(), hash.size()).Finalize(hash.data());
-    if (UintToArith256(uint256{std::span<const unsigned char>{hash.data(), hash.size()}}) > target) {
-        error = "btc_anchor_header: its hash does not meet its own difficulty (not a Bitcoin block header)";
-        return false;
-    }
-    if (d.btc_anchor_period_time == 0) {
-        error = "btc_anchor_period_time: required (the time of the first block of the anchor's 2016-block difficulty period)";
-        return false;
-    }
-    if (d.btc_anchor_height % 2016 == 0) {
-        if (d.btc_anchor_period_time != anchor_time) {
-            error = "btc_anchor_period_time: the anchor opens a difficulty period (height is a multiple of 2016), so it must be the anchor header's own time";
+    if (hash_is_work) {
+        std::array<unsigned char, 32> hash;
+        CSHA256().Write(h.data(), h.size()).Finalize(hash.data());
+        CSHA256().Write(hash.data(), hash.size()).Finalize(hash.data());
+        if (UintToArith256(uint256{std::span<const unsigned char>{hash.data(), hash.size()}}) > target) {
+            error = strprintf("%s_anchor_header: its hash does not meet its own difficulty (not a %s block header)", key, chain);
             return false;
         }
-    } else if (uint64_t{d.btc_anchor_period_time} > uint64_t{anchor_time} + 7200) {
-        error = "btc_anchor_period_time: later than the anchor block itself";
+    }
+    if (period_time == 0) {
+        error = strprintf("%s_anchor_period_time: required (the time of the first block of the anchor's 2016-block difficulty period)", key);
         return false;
     }
+    if (height % 2016 == 0) {
+        if (period_time != anchor_time) {
+            error = strprintf("%s_anchor_period_time: the anchor opens a difficulty period (height is a multiple of 2016), so it must be the anchor header's own time", key);
+            return false;
+        }
+    } else if (uint64_t{period_time} > uint64_t{anchor_time} + 7200) {
+        error = strprintf("%s_anchor_period_time: later than the anchor block itself", key);
+        return false;
+    }
+    return true;
+}
+
+bool GetBool(const UniValue& o, const std::string& key, bool& out, std::string& error)
+{
+    const UniValue& t = o.find_value(key);
+    if (t.isNull()) return true;
+    if (!t.isBool()) {
+        error = strprintf("%s: expected bool", key);
+        return false;
+    }
+    out = t.get_bool();
     return true;
 }
 
@@ -381,6 +400,15 @@ std::vector<unsigned char> LaunchCanonicalBytes(const LaunchDescriptor& d)
     PutU32(v, d.btc_confs);
     PutBytes(v, d.creator_btc_script.data(), d.creator_btc_script.size());
     PutU8(v, d.btc_regtest ? 1 : 0);
+    PutU32(v, d.qwen_anchor_height);
+    v.insert(v.end(), d.qwen_anchor_header.begin(), d.qwen_anchor_header.end());
+    PutU32(v, d.qwen_anchor_period_time);
+    PutI64(v, static_cast<int64_t>(d.qwen_num));
+    PutU32(v, d.qwen_shift);
+    PutI64(v, d.qwen_min_payment);
+    PutU32(v, d.qwen_confs);
+    PutBytes(v, d.creator_qwen_script.data(), d.creator_qwen_script.size());
+    PutU8(v, d.qwen_regtest ? 1 : 0);
     if (std::any_of(d.meta.begin(), d.meta.end(), [](unsigned char c) { return c != 0; })) {
         v.insert(v.end(), d.meta.begin(), d.meta.end());
     }
@@ -417,6 +445,10 @@ std::optional<LaunchDescriptor> ParseLaunchDescriptor(const std::string& json, s
     if (!GetUInt(o, "version", d.version, error, 0xffffffff)) return std::nullopt;
     if (d.version == 1) {
         error = "version: 1 is the earlier, pre-release rule set. This launch file must be created again (hashfun launch new)";
+        return std::nullopt;
+    }
+    if (d.version == 2) {
+        error = "version: 2 is the earlier rule set with one curve, quoted in BTC only. This launch file must be created again (hashfun launch new)";
         return std::nullopt;
     }
     if (d.version != LAUNCH_DESCRIPTOR_VERSION) {
@@ -492,16 +524,24 @@ std::optional<LaunchDescriptor> ParseLaunchDescriptor(const std::string& json, s
     if (!GetUInt(o, "settle_deadline", d.settle_deadline, error, 1000000)) return std::nullopt;
     if (!GetUInt(o, "btc_confs", d.btc_confs, error, 100)) return std::nullopt;
     if (!GetHexBytes(o, "creator_btc_script", d.creator_btc_script, error, 1, 80)) return std::nullopt;
+    if (!GetBool(o, "btc_regtest", d.btc_regtest, error)) return std::nullopt;
+    // The QWEN leg (rule set 3): the keys of the sats leg again, for the Qwencoin side.
+    if (!GetUInt(o, "qwen_anchor_height", d.qwen_anchor_height, error, 0x7fffffff)) return std::nullopt; // an int in the chain parameters
     {
-        const UniValue& t = o.find_value("btc_regtest");
-        if (!t.isNull()) {
-            if (!t.isBool()) {
-                error = "btc_regtest: expected bool";
-                return std::nullopt;
-            }
-            d.btc_regtest = t.get_bool();
-        }
+        std::vector<unsigned char> hdr;
+        if (!GetHexBytes(o, "qwen_anchor_header", hdr, error, 80, 80)) return std::nullopt;
+        if (!hdr.empty()) std::copy(hdr.begin(), hdr.end(), d.qwen_anchor_header.begin());
     }
+    if (!GetUInt(o, "qwen_anchor_period_time", d.qwen_anchor_period_time, error, 0xffffffff)) return std::nullopt;
+    if (!GetUInt(o, "qwen_num", d.qwen_num, error, uint64_t{1} << 62)) return std::nullopt;
+    if (!GetUInt(o, "qwen_shift", d.qwen_shift, error, 128)) return std::nullopt;
+    if (!GetUInt(o, "qwen_min_payment", d.qwen_min_payment, error, MAX_MONEY)) return std::nullopt;
+    // Up to 1008 (a week of Qwencoin), where btc_confs stops at 100: a payment proof is as hard to
+    // fake as that many Qwencoin blocks are to mine, Qwencoin's work is small, and a large leg
+    // needs more blocks of it than a hundred.
+    if (!GetUInt(o, "qwen_confs", d.qwen_confs, error, 1008)) return std::nullopt;
+    if (!GetHexBytes(o, "creator_qwen_script", d.creator_qwen_script, error, 1, 80)) return std::nullopt;
+    if (!GetBool(o, "qwen_regtest", d.qwen_regtest, error)) return std::nullopt;
     {
         std::vector<unsigned char> meta;
         if (!GetHexBytes(o, "meta", meta, error, 32, 32)) return std::nullopt;
@@ -523,7 +563,7 @@ std::optional<LaunchDescriptor> ParseLaunchDescriptor(const std::string& json, s
                 error = "btc_anchor_header: required";
                 return std::nullopt;
             }
-            if (!d.btc_regtest && !CheckBtcAnchor(d, error)) return std::nullopt;
+            if (!d.btc_regtest && !CheckAnchor(d.btc_anchor_header, d.btc_anchor_height, d.btc_anchor_period_time, "btc", "Bitcoin", 0x1d00ffff, /*hash_is_work=*/true, error)) return std::nullopt;
             if (d.creator_btc_script.empty()) {
                 error = "creator_btc_script: required";
                 return std::nullopt;
@@ -544,6 +584,54 @@ std::optional<LaunchDescriptor> ParseLaunchDescriptor(const std::string& json, s
                 error = "btc_confs: at least 1";
                 return std::nullopt;
             }
+        }
+    }
+    {
+        // Every launch has a QWEN leg too: the same checks, in the same order, for the Qwencoin side.
+        const bool has_anchor = std::any_of(d.qwen_anchor_header.begin(), d.qwen_anchor_header.end(), [](unsigned char c) { return c != 0; });
+        if ((d.qwen_anchor_height != 0 || d.qwen_anchor_period_time != 0) && !has_anchor) {
+            error = "qwen_anchor_header: required with qwen_anchor_height / qwen_anchor_period_time";
+            return std::nullopt;
+        }
+        if (d.qwen_num == 0) {
+            error = "qwen_num: required (every launch has a QWEN leg)";
+            return std::nullopt;
+        }
+        if (!has_anchor) {
+            error = "qwen_anchor_header: required";
+            return std::nullopt;
+        }
+        // 0x2000ffff: Qwencoin's proof-of-work limit (256 expected passes through the weights).
+        if (!d.qwen_regtest && !CheckAnchor(d.qwen_anchor_header, d.qwen_anchor_height, d.qwen_anchor_period_time, "qwen", "Qwencoin", 0x2000ffff, /*hash_is_work=*/false, error)) return std::nullopt;
+        if (d.creator_qwen_script.empty()) {
+            error = "creator_qwen_script: required";
+            return std::nullopt;
+        }
+        if (!EarningScript(d.creator_qwen_script)) {
+            error = "creator_qwen_script: must be a P2PKH, P2SH or witness-program script (one a Qwencoin node relays a payment to)";
+            return std::nullopt;
+        }
+        if (d.qwen_min_payment < 546) {
+            error = "qwen_min_payment: at least 546";
+            return std::nullopt;
+        }
+        if (d.qwen_confs < 1) {
+            error = "qwen_confs: at least 1";
+            return std::nullopt;
+        }
+        // A payment has to reach its confirmations before the deadline, or every block that owes
+        // one loses its coins whatever its miner does. A confirmation is ten minutes on either
+        // chain and the deadline is counted in this launch's own blocks, so the deadline must
+        // last, at the target spacing, at least twice as long as the confirmations take. A leg
+        // on regtest is not held to it: its blocks come when a test makes them.
+        const uint64_t deadline_seconds{uint64_t{d.settle_deadline} * d.target_spacing};
+        if (!d.btc_regtest && deadline_seconds < uint64_t{1200} * d.btc_confs) {
+            error = "settle_deadline: too short for btc_confs: the deadline must last at least twice as long as the confirmations take (ten minutes each)";
+            return std::nullopt;
+        }
+        if (!d.qwen_regtest && deadline_seconds < uint64_t{1200} * d.qwen_confs) {
+            error = "settle_deadline: too short for qwen_confs: the deadline must last at least twice as long as the confirmations take (ten minutes each)";
+            return std::nullopt;
         }
     }
     {
@@ -628,10 +716,12 @@ std::optional<LaunchDescriptor> ParseLaunchDescriptor(const std::string& json, s
         return std::nullopt;
     }
     {
-        // Max total = G + tail_reward * interval * 2 (geometric halvings). 256-bit, no overflow, portable (no __int128 on MSVC).
+        // Max total = 2 * G + tail_reward * interval * 2: the curve that graduates the launch mints G
+        // and the other one less than G (TWIN.md section 3), then geometric halvings. 256-bit, no
+        // overflow, portable (no __int128 on MSVC).
         const arith_uint256 tail_total = arith_uint256{static_cast<uint64_t>(d.tail_reward)} * arith_uint256{d.tail_halving_interval} * 2;
-        if (arith_uint256{static_cast<uint64_t>(d.graduation_tokens)} + tail_total > arith_uint256{static_cast<uint64_t>(MAX_MONEY)}) {
-            error = "graduation_tokens + total tail emission exceeds MAX_MONEY";
+        if (arith_uint256{static_cast<uint64_t>(d.graduation_tokens)} * 2 + tail_total > arith_uint256{static_cast<uint64_t>(MAX_MONEY)}) {
+            error = "2 * graduation_tokens + total tail emission exceeds MAX_MONEY (each of the two curves can mint graduation_tokens)";
             return std::nullopt;
         }
     }
@@ -697,6 +787,15 @@ std::string LaunchDescriptorToJSON(const LaunchDescriptor& d)
     o.pushKV("btc_confs", static_cast<int64_t>(d.btc_confs));
     if (!d.creator_btc_script.empty()) o.pushKV("creator_btc_script", HexStr(d.creator_btc_script));
     o.pushKV("btc_regtest", d.btc_regtest);
+    o.pushKV("qwen_anchor_height", static_cast<int64_t>(d.qwen_anchor_height));
+    o.pushKV("qwen_anchor_header", HexStr(d.qwen_anchor_header));
+    o.pushKV("qwen_anchor_period_time", static_cast<int64_t>(d.qwen_anchor_period_time));
+    o.pushKV("qwen_num", static_cast<int64_t>(d.qwen_num));
+    o.pushKV("qwen_shift", static_cast<int64_t>(d.qwen_shift));
+    o.pushKV("qwen_min_payment", d.qwen_min_payment);
+    o.pushKV("qwen_confs", static_cast<int64_t>(d.qwen_confs));
+    if (!d.creator_qwen_script.empty()) o.pushKV("creator_qwen_script", HexStr(d.creator_qwen_script));
+    o.pushKV("qwen_regtest", d.qwen_regtest);
     if (std::any_of(d.meta.begin(), d.meta.end(), [](unsigned char c) { return c != 0; })) o.pushKV("meta", HexStr(d.meta));
     o.pushKV("p2p_port", static_cast<int64_t>(LaunchP2PPort(d)));
     o.pushKV("rpc_port", static_cast<int64_t>(LaunchRPCPort(d)));

@@ -27,7 +27,17 @@ class ChainstateManager;
 namespace Consensus {
 struct Params;
 } // namespace Consensus
+enum class LaunchCurve;
+
 namespace node {
+
+/**
+ * hashfun: the curve this node's own blocks and block templates are on before graduation
+ * (launchcurve.h). Set once from -minecurve at start and changed with the setminecurve RPC; it is
+ * a choice of the miner, not consensus state.
+ */
+LaunchCurve GetMineCurve();
+void SetMineCurve(LaunchCurve curve);
 
 struct CBlockTemplate
 {

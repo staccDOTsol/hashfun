@@ -745,6 +745,30 @@ static RPCMethod getblocktemplate()
                     {RPCResult::Type::STR_HEX, "script", "creator scriptPubKey"},
                     {RPCResult::Type::NUM, "amount", "minimum amount in satoshis"},
                 }},
+                {RPCResult::Type::STR, "launchcurve", /*optional=*/true, "hashfun launch chains, before graduation: the curve this template is on (\"btc\" or \"qwen\": this node's mining curve, see setminecurve)"},
+                {RPCResult::Type::OBJ, "launchcurves", /*optional=*/true, "hashfun launch chains, before graduation: what differs when the same template is mined on either curve",
+                {
+                    {RPCResult::Type::OBJ, "btc", "on the BTC curve (the block owes sats on Bitcoin)",
+                    {
+                        {RPCResult::Type::NUM, "version", "the block version"},
+                        {RPCResult::Type::NUM, "coinbasevalue", "maximum allowable input to the coinbase transaction, without the creator's cut"},
+                        {RPCResult::Type::OBJ, "creatorfee", /*optional=*/true, "the mandatory creator output",
+                        {
+                            {RPCResult::Type::STR_HEX, "script", "creator scriptPubKey"},
+                            {RPCResult::Type::NUM, "amount", "minimum amount in satoshis"},
+                        }},
+                    }},
+                    {RPCResult::Type::OBJ, "qwen", "on the QWEN curve (the block owes qwen on Qwencoin)",
+                    {
+                        {RPCResult::Type::NUM, "version", "the block version"},
+                        {RPCResult::Type::NUM, "coinbasevalue", "maximum allowable input to the coinbase transaction, without the creator's cut"},
+                        {RPCResult::Type::OBJ, "creatorfee", /*optional=*/true, "the mandatory creator output",
+                        {
+                            {RPCResult::Type::STR_HEX, "script", "creator scriptPubKey"},
+                            {RPCResult::Type::NUM, "amount", "minimum amount in satoshis"},
+                        }},
+                    }},
+                }},
             }},
         },
         RPCExamples{
@@ -913,7 +937,10 @@ static RPCMethod getblocktemplate()
     if (!pindexPrev || pindexPrev->GetBlockHash() != tip ||
         (mempool.GetTransactionsUpdated() != nTransactionsUpdatedLast && GetTime() - time_start > 5) ||
         // hashfun: nBits and the subsidy follow the clock on launch chains (stall relief).
-        (block_template && LaunchTemplateStale(pindexPrev, block_template->block, GetTime(), consensusParams)))
+        (block_template && LaunchTemplateStale(pindexPrev, block_template->block, GetTime(), consensusParams)) ||
+        // hashfun: and the template is on the curve this node mines (setminecurve may have changed it).
+        (block_template && consensusParams.launch_enabled && !LaunchGraduatedAt(pindexPrev, consensusParams) &&
+         LaunchCurveOf(block_template->block.nVersion) != node::GetMineCurve()))
     {
         // Clear pindexPrev so future calls make a new block, despite any failures from here on
         pindexPrev = nullptr;
@@ -1076,6 +1103,34 @@ static RPCMethod getblocktemplate()
         const CScript prefix = CScript() << (pindexPrev->nHeight + 1) << LaunchCoinbaseTag(consensusParams);
         result.pushKV("launchcoinbase", HexStr(prefix));
     }
+    if (consensusParams.launch_enabled && !LaunchGraduatedAt(pindexPrev, consensusParams)) {
+        // hashfun: before graduation the same template can be mined on either curve. The curve
+        // changes three things: one bit of the version, what the block mints and with it the
+        // creator's cut. Everything above is for this node's own mining curve; this gives both,
+        // so a pool can serve miners on either curve from one template.
+        const int height{pindexPrev->nHeight + 1};
+        const CAmount own_subsidy{LaunchSubsidy(pindexPrev, block_header.nBits, block_header.nVersion, height, consensusParams)};
+        const CAmount fees{block_template->block.vtx[0]->GetValueOut() - own_subsidy};
+        const auto& creator_bytes{consensusParams.launch_creator_script};
+        UniValue curves(UniValue::VOBJ);
+        for (const LaunchCurve curve : {LaunchCurve::BTC, LaunchCurve::QWEN}) {
+            const int32_t version{curve == LaunchCurve::QWEN ? (block_header.nVersion | LAUNCH_VERSION_QWEN) : (block_header.nVersion & ~LAUNCH_VERSION_QWEN)};
+            const CAmount subsidy{LaunchSubsidy(pindexPrev, block_header.nBits, version, height, consensusParams)};
+            const CAmount creator_fee{LaunchCreatorFee(subsidy, consensusParams)};
+            UniValue c(UniValue::VOBJ);
+            c.pushKV("version", version);
+            c.pushKV("coinbasevalue", fees + subsidy - creator_fee);
+            if (creator_fee > 0) {
+                UniValue cf(UniValue::VOBJ);
+                cf.pushKV("script", HexStr(creator_bytes));
+                cf.pushKV("amount", creator_fee);
+                c.pushKV("creatorfee", std::move(cf));
+            }
+            curves.pushKV(LaunchCurveName(curve), std::move(c));
+        }
+        result.pushKV("launchcurve", LaunchCurveName(LaunchCurveOf(block_header.nVersion)));
+        result.pushKV("launchcurves", std::move(curves));
+    }
 
     if (consensusParams.signet_blocks) {
         result.pushKV("signet_challenge", HexStr(consensusParams.signet_challenge));
@@ -1100,6 +1155,40 @@ static RPCMethod getblocktemplate()
     }
 
     return result;
+},
+    };
+}
+
+static RPCMethod setminecurve()
+{
+    return RPCMethod{
+        "setminecurve",
+        "Choose which of the launch's two curves this node's own blocks and block templates are on\n"
+        "before graduation: \"btc\" (a block owes sats on Bitcoin) or \"qwen\" (it owes qwen on Qwencoin).\n"
+        "getblocktemplate gives both under \"launchcurves\" whatever is set here. Also -minecurve at start.\n",
+        {
+            {"curve", RPCArg::Type::STR, RPCArg::Optional::OMITTED, "\"btc\" or \"qwen\". Omitted: nothing changes."},
+        },
+        RPCResult{RPCResult::Type::STR, "", "the curve that was set before this call"},
+        RPCExamples{
+            HelpExampleCli("setminecurve", "qwen")
+            + HelpExampleRpc("setminecurve", "\"qwen\"")
+        },
+        [](const RPCMethod& self, const JSONRPCRequest& request) -> UniValue
+{
+    ChainstateManager& chainman = EnsureAnyChainman(request.context);
+    if (!chainman.GetConsensus().launch_enabled) {
+        throw JSONRPCError(RPC_MISC_ERROR, "not a hashfun launch chain");
+    }
+    const std::string before{LaunchCurveName(node::GetMineCurve())};
+    if (!request.params[0].isNull()) {
+        const std::string& curve{request.params[0].get_str()};
+        if (curve != "btc" && curve != "qwen") {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "curve must be \"btc\" or \"qwen\"");
+        }
+        node::SetMineCurve(curve == "qwen" ? LaunchCurve::QWEN : LaunchCurve::BTC);
+    }
+    return before;
 },
     };
 }
@@ -1276,6 +1365,7 @@ void RegisterMiningRPCCommands(CRPCTable& t)
         {"mining", &prioritisetransaction},
         {"mining", &getprioritisedtransactions},
         {"mining", &getblocktemplate},
+        {"mining", &setminecurve},
         {"mining", &submitblock},
         {"mining", &submitheader},
 

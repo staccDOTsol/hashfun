@@ -90,19 +90,24 @@ void LaunchYieldState::Release(int mint_height, Info& cur)
 
 // ---- settling ----------------------------------------------------------------------------------
 
-bool LaunchYieldState::TrySettle(const launchyield::PaymentProof& proof, int height, const Consensus::Params& params)
+bool LaunchYieldState::TrySettle(const launchyield::PaymentProof& proof, int height, LaunchCurve quote, const Consensus::Params& params)
 {
     const int64_t m = proof.mint_height;
     if (m < 1 || m + DRAW_DELAY >= height || m >= static_cast<int64_t>(m_info.size())) return false;
     Info& info = m_info[m];
     if (!info.curve || !info.draw_known || info.settled || info.pay == 0) return false;
+    // A block is paid on the chain of its own curve and nowhere else: sats do not settle a block
+    // that owes qwen, and qwen does not settle one that owes sats.
+    if (info.quote != quote) return false;
     if (height > m + params.launch_settle_deadline) return false;
     if (proof.candidate != 0) return false; // the payee is fixed by the draw: there is nothing to choose
-    const auto* btc = m_btc.Find(proof.btc_block);
-    if (!btc || m_btc.Confirmations(proof.btc_block) < params.launch_btc_confs) return false;
+    const launchyield::HeaderChain& chain = quote == LaunchCurve::QWEN ? m_qwen : m_btc;
+    const int confs = quote == LaunchCurve::QWEN ? params.launch_qwen_confs : params.launch_btc_confs;
+    const auto* block = chain.Find(proof.btc_block);
+    if (!block || chain.Confirmations(proof.btc_block) < confs) return false;
     std::string err;
-    if (!launchyield::VerifyBtcPayment(proof, btc->merkle_root, launchyield::PayTag(params.launch_id, info.hash), info.pay_script, info.pay, err)) {
-        LogDebug(BCLog::VALIDATION, "hashfun: payment proof for block %d ignored: %s\n", m, err);
+    if (!launchyield::VerifyBtcPayment(proof, block->merkle_root, launchyield::PayTag(params.launch_id, info.hash), info.pay_script, info.pay, err)) {
+        LogDebug(BCLog::VALIDATION, "hashfun: %s payment proof for block %d ignored: %s\n", LaunchCurveName(quote), m, err);
         return false;
     }
     info.settled = true;
@@ -117,18 +122,34 @@ void LaunchYieldState::Connect(const CBlock& block, const CBlockIndex* pindex, c
     if (height != static_cast<int>(m_info.size())) return;
     if (Closed(params)) return; // nothing after this block can change what any coinbase may do
     if (height == 0) {
+        using launchyield::HeaderChain;
         CPureBlockHeader anchor;
         DataStream ss{params.launch_btc_anchor_header};
         ss >> anchor;
-        m_btc.Init(anchor, params.launch_btc_anchor_height, params.launch_btc_anchor_period_time, params.launch_btc_regtest);
+        m_btc.Init(anchor, params.launch_btc_anchor_height, params.launch_btc_anchor_period_time, HeaderChain::Rules::BITCOIN, params.launch_btc_regtest);
+        CPureBlockHeader qwen_anchor;
+        DataStream qs{params.launch_qwen_anchor_header};
+        qs >> qwen_anchor;
+        m_qwen.Init(qwen_anchor, params.launch_qwen_anchor_height, params.launch_qwen_anchor_period_time, HeaderChain::Rules::QWENCOIN, params.launch_qwen_regtest);
+        m_count[0] = m_count[1] = CurveCount{};
     }
     {
         Info info;
         info.hash = pindex->GetBlockHash();
         info.curve = height >= 1 && !LaunchGraduatedAt(pindex->pprev, params);
-        info.owed = info.curve ? launchyield::Owed(GetBlockProof(*pindex), params.launch_sats_num, params.launch_sats_shift) : 0;
+        if (info.curve) {
+            // The block's curve decides what it owes: sats at the sats rate, or qwen at the qwen rate.
+            info.quote = LaunchCurveOf(pindex->nVersion);
+            const bool qwen = info.quote == LaunchCurve::QWEN;
+            info.owed = launchyield::Owed(GetBlockProof(*pindex), qwen ? params.launch_qwen_num : params.launch_sats_num,
+                                          qwen ? params.launch_qwen_shift : params.launch_sats_shift);
+            CurveCount& count = m_count[static_cast<int>(info.quote)];
+            info.prev_last = count.last_height;
+            ++count.blocks;
+            count.last_height = height;
+            m_last_curve = height;
+        }
         info.coins_before = static_cast<uint32_t>(m_coins.size());
-        if (info.curve) m_last_curve = height;
         m_info.push_back(std::move(info));
     }
     Info& cur = m_info.back(); // m_info does not grow again in this call
@@ -142,7 +163,8 @@ void LaunchYieldState::Connect(const CBlock& block, const CBlockIndex* pindex, c
         Info& d = m_info[drawn];
         const uint256 work_hash = block.auxpow ? block.auxpow->getParentBlockHash() : cur.hash;
         d.seed = launchyield::DrawSeed(params.launch_id, work_hash);
-        const launchyield::Draw draw = launchyield::ComputeDraw(d.owed, params.launch_sats_min_payment, d.seed);
+        const bool qwen = d.quote == LaunchCurve::QWEN;
+        const launchyield::Draw draw = launchyield::ComputeDraw(d.owed, qwen ? params.launch_qwen_min_payment : params.launch_sats_min_payment, d.seed);
         d.pay = draw.pay;
         d.payee = draw.payee;
         d.earning = static_cast<CAmount>(m_total);
@@ -154,9 +176,10 @@ void LaunchYieldState::Connect(const CBlock& block, const CBlockIndex* pindex, c
         }
         if (d.pay > 0) {
             if (draw.payee == Payee::DEV) {
+                // The same script on either chain (on Qwencoin's main network the same address string).
                 d.pay_script = params.launch_dev_btc_script;
             } else if (draw.payee == Payee::CREATOR) {
-                d.pay_script = params.launch_creator_btc_script;
+                d.pay_script = qwen ? params.launch_creator_qwen_script : params.launch_creator_btc_script;
             } else {
                 const uint64_t x = launchyield::CandidatePoint(d.seed, 0, arith_uint256{m_total}).GetLow64();
                 const Coin& c = m_coins[TreeFind(x)];
@@ -172,9 +195,10 @@ void LaunchYieldState::Connect(const CBlock& block, const CBlockIndex* pindex, c
         if (d.pay == 0) Release(drawn, cur); // nothing is due: its coinbase is free, and earns from here on
     }
 
-    // 2. The transactions, in order: inputs kill coins, tagged outputs relay Bitcoin headers and
-    //    settle blocks, then the transaction's own earning outputs become coins.
+    // 2. The transactions, in order: inputs kill coins, tagged outputs relay Bitcoin and Qwencoin
+    //    headers and settle blocks, then the transaction's own earning outputs become coins.
     const bool hold_coinbase = cur.curve && cur.owed > 0;
+    int qwen_budget = launchyield::QWEN_PASSES_PER_BLOCK; // work checks of Qwencoin headers this block may still cost
     for (const CTransactionRef& tx : block.vtx) {
         const bool coinbase = tx->IsCoinBase();
         if (!coinbase) {
@@ -198,9 +222,30 @@ void LaunchYieldState::Connect(const CBlock& block, const CBlockIndex* pindex, c
                         if (m_btc.Accept(h, err)) cur.btc_added.push_back(h.GetHash());
                     }
                 }
+            } else if (const auto data = launchyield::TaggedReturn(out.scriptPubKey, "HFH2")) {
+                // Qwencoin headers count in the coinbase only. Checking one costs every node a
+                // pass through the weights, and a header that fails costs whoever relays it
+                // nothing: in any transaction, eight of them a block could be bought for a fee
+                // and put ahead of a miner's own. In the coinbase they are the miner's, who found
+                // the block, and a miner relays the headers its own payments need.
+                if (!coinbase) continue;
+                if (const auto headers = launchyield::ParseBtcHeaders(*data)) {
+                    for (const CPureBlockHeader& h : *headers) {
+                        std::string err;
+                        if (m_qwen.Accept(h, err, &qwen_budget)) cur.qwen_added.push_back(h.GetHash());
+                    }
+                }
             } else if (const auto data = launchyield::TaggedReturn(out.scriptPubKey, "HFP1")) {
                 if (const auto proof = launchyield::ParsePaymentProof(*data)) {
-                    if (TrySettle(*proof, height, params)) {
+                    if (TrySettle(*proof, height, LaunchCurve::BTC, params)) {
+                        const int m = static_cast<int>(proof->mint_height);
+                        cur.settled_here.push_back(m);
+                        Release(m, cur); // paid: its coinbase earns from here on
+                    }
+                }
+            } else if (const auto data = launchyield::TaggedReturn(out.scriptPubKey, "HFP2")) {
+                if (const auto proof = launchyield::ParsePaymentProof(*data)) {
+                    if (TrySettle(*proof, height, LaunchCurve::QWEN, params)) {
                         const int m = static_cast<int>(proof->mint_height);
                         cur.settled_here.push_back(m);
                         Release(m, cur); // paid: its coinbase earns from here on
@@ -244,6 +289,7 @@ void LaunchYieldState::Pop()
     for (int m : cur.released_here) m_info[m].released = false;
     for (int m : cur.settled_here) m_info[m].settled = false;
     for (auto it = cur.btc_added.rbegin(); it != cur.btc_added.rend(); ++it) m_btc.Remove(*it);
+    for (auto it = cur.qwen_added.rbegin(); it != cur.qwen_added.rend(); ++it) m_qwen.Remove(*it);
     if (cur.drew >= 0) {
         Info& d = m_info[cur.drew];
         d.draw_known = false;
@@ -256,7 +302,12 @@ void LaunchYieldState::Pop()
         d.coin_value = 0;
         d.earning = 0;
     }
-    if (cur.curve) m_last_curve = Height() - 1; // curve blocks are 1..m_last_curve, with no gaps
+    if (cur.curve) {
+        m_last_curve = Height() - 1; // curve blocks are 1..m_last_curve, with no gaps
+        CurveCount& count = m_count[static_cast<int>(cur.quote)];
+        --count.blocks;
+        count.last_height = cur.prev_last;
+    }
     m_info.pop_back();
 }
 

@@ -39,6 +39,7 @@
 #include <versionbits.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <functional>
 #include <span>
@@ -47,6 +48,11 @@
 #include <utility>
 
 namespace node {
+
+static std::atomic<int> g_mine_curve{static_cast<int>(LaunchCurve::BTC)};
+
+LaunchCurve GetMineCurve() { return static_cast<LaunchCurve>(g_mine_curve.load()); }
+void SetMineCurve(LaunchCurve curve) { g_mine_curve = static_cast<int>(curve); }
 
 int64_t GetMinimumTime(const CBlockIndex* pindexPrev, const int64_t difficulty_adjustment_interval)
 {
@@ -153,6 +159,13 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
         pblock->SetBaseVersion(gArgs.GetIntArg("-blockversion", pblock->GetBaseVersion()), nChainId);
     }
 
+    // hashfun: before graduation a block is on one of the launch's two curves, and one bit of
+    // its version says which. The curve decides what it mints (below) and what it owes.
+    if (chainparams.GetConsensus().launch_enabled && GetMineCurve() == LaunchCurve::QWEN &&
+        !LaunchGraduatedAt(pindexPrev, chainparams.GetConsensus())) {
+        pblock->nVersion |= LAUNCH_VERSION_QWEN;
+    }
+
     pblock->nTime = TicksSinceEpoch<std::chrono::seconds>(NodeClock::now());
     m_lock_time_cutoff = pindexPrev->GetMedianTimePast();
 
@@ -187,7 +200,7 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     const bool launch_chain{chainparams.GetConsensus().launch_enabled};
     if (launch_chain) UpdateTime(pblock, chainparams.GetConsensus(), pindexPrev);
     const uint32_t next_bits{GetNextWorkRequired(pindexPrev, pblock, chainparams.GetConsensus())};
-    const CAmount block_subsidy{GetBlockSubsidyForBlock(pindexPrev, next_bits, nHeight, chainparams.GetConsensus())};
+    const CAmount block_subsidy{GetBlockSubsidyForBlock(pindexPrev, next_bits, pblock->nVersion, nHeight, chainparams.GetConsensus())};
     const CAmount creator_fee{LaunchCreatorFee(block_subsidy, chainparams.GetConsensus())};
 
     // Add an output that spends the full coinbase reward (minus the creator cut).

@@ -12,6 +12,7 @@ add_library(bitcoin_crypto STATIC EXCLUDE_FROM_ALL
   hmac_sha512.cpp
   muhash.cpp
   poly1305.cpp
+  qwork.cpp
   ripemd160.cpp
   sha1.cpp
   sha256.cpp
@@ -27,6 +28,12 @@ target_link_libraries(bitcoin_crypto
   PRIVATE
     core_interface
 )
+
+# hashfun: Qwencoin's work function (the QWEN leg checks Qwencoin headers with it). Its dot
+# products need the vectorizer whatever the build type, as in Qwencoin's own build.
+if(NOT MSVC)
+  set_property(SOURCE qwork.cpp PROPERTY COMPILE_OPTIONS -O3)
+endif()
 
 if(HAVE_SSE41)
   target_compile_definitions(bitcoin_crypto PRIVATE ENABLE_SSE41)

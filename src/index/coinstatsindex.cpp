@@ -109,10 +109,10 @@ bool CoinStatsIndex::CustomAppend(const interfaces::BlockInfo& block)
 {
     CAmount block_subsidy{GetBlockSubsidy(block.height, Params().GetConsensus())};
     if (Params().GetConsensus().launch_enabled) {
-        // hashfun: subsidy depends on the parent's chainwork and this block's bits.
+        // hashfun: subsidy depends on the parent's work per curve, this block's bits and its curve (version).
         LOCK(::cs_main);
         const CBlockIndex* pindex{m_chainstate->m_blockman.LookupBlockIndex(block.hash)};
-        block_subsidy = (pindex && pindex->pprev) ? GetBlockSubsidyForBlock(pindex->pprev, pindex->nBits, block.height, Params().GetConsensus()) : 0;
+        block_subsidy = (pindex && pindex->pprev) ? GetBlockSubsidyForBlock(pindex->pprev, pindex->nBits, pindex->nVersion, block.height, Params().GetConsensus()) : 0;
     }
     m_total_subsidy += block_subsidy;
 

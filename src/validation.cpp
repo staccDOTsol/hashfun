@@ -1913,11 +1913,11 @@ CAmount GetBlockSubsidy(int nHeight, const Consensus::Params& consensusParams)
     return nSubsidy;
 }
 
-CAmount GetBlockSubsidyForBlock(const CBlockIndex* pindexPrev, uint32_t nBits, int nHeight, const Consensus::Params& consensusParams)
+CAmount GetBlockSubsidyForBlock(const CBlockIndex* pindexPrev, uint32_t nBits, int32_t nVersion, int nHeight, const Consensus::Params& consensusParams)
 {
     if (consensusParams.launch_enabled) {
         if (pindexPrev == nullptr) return 0; // genesis: no subsidy on launch chains
-        return LaunchSubsidy(pindexPrev, nBits, nHeight, consensusParams);
+        return LaunchSubsidy(pindexPrev, nBits, nVersion, nHeight, consensusParams);
     }
     return GetBlockSubsidy(nHeight, consensusParams);
 }
@@ -2792,7 +2792,7 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
              Ticks<SecondsDouble>(m_chainman.time_connect),
              Ticks<MillisecondsDouble>(m_chainman.time_connect) / m_chainman.num_blocks_total);
 
-    const CAmount block_subsidy{GetBlockSubsidyForBlock(pindex->pprev, block.nBits, pindex->nHeight, params.GetConsensus())};
+    const CAmount block_subsidy{GetBlockSubsidyForBlock(pindex->pprev, block.nBits, block.nVersion, pindex->nHeight, params.GetConsensus())};
     CAmount blockReward = nFees + block_subsidy;
     if (block.vtx[0]->GetValueOut() > blockReward && state.IsValid()) {
         state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-amount",
@@ -4318,6 +4318,15 @@ static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidatio
         return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER,
                              "auxpow-before-graduation",
                              "merge-mined block before the launch curve graduated");
+
+    // hashfun: a block says which of the launch's two curves it is on with one bit of its
+    // version. Only a block that mints from a curve can be on the QWEN one: after graduation
+    // (and so in every merge-mined block) the bit is clear, or two headers that differ in
+    // nothing but a meaningless bit would both be valid.
+    if (consensusParams.launch_enabled && !LaunchCurveVersionOk(block.nVersion, pindexPrev, consensusParams))
+        return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER,
+                             "bad-curve-version",
+                             "block claims the QWEN curve after the launch graduated");
 
     // Check proof of work
     if (block.nBits != GetNextWorkRequired(pindexPrev, &block, consensusParams))

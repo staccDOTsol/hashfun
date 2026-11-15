@@ -7,6 +7,7 @@
 
 #include <consensus/amount.h>
 #include <consensus/params.h>
+#include <launchcurve.h>
 #include <launchyield.h>
 #include <primitives/transaction.h>
 #include <uint256.h>
@@ -23,9 +24,9 @@ class BlockManager;
 }
 
 /**
- * Chain state of the sats leg: the relayed Bitcoin header tree, the coins that
- * earn (and which of them are live), and each curve block's obligation (owed,
- * draw, settled).
+ * Chain state of the sats leg and the QWEN leg: the relayed Bitcoin and Qwencoin header trees,
+ * the coins that earn (and which of them are live), and each curve block's obligation (which
+ * curve it is on and so which asset it owes, how much, the draw, settled).
  *
  * It is a pure function of the active chain's blocks, genesis to tip. Nothing
  * in it reads the UTXO set, the clock, or whether a block arrived live or is
@@ -50,13 +51,16 @@ public:
     struct Info {
         uint256 hash;
         bool curve{false};
-        CAmount owed{0};
+        //! The curve the block is on, and with it the chain its payment is made and proven on.
+        //! Meaningful when `curve`.
+        LaunchCurve quote{LaunchCurve::BTC};
+        CAmount owed{0}; //!< in base units of the quote's asset: sats of BTC, or of QWEN
         // The draw, made when the block DRAW_DELAY above this one is connected, and fixed from then on.
         bool draw_known{false};
         CAmount pay{0};
         launchyield::Payee payee{launchyield::Payee::HOLDER};
         uint256 seed;
-        std::vector<unsigned char> pay_script; //!< the Bitcoin script a payment for this block must pay
+        std::vector<unsigned char> pay_script; //!< the script a payment for this block must pay, on the quote's chain
         bool has_coin{false};                  //!< a holder was drawn: the coin that won
         COutPoint coin;
         CAmount coin_value{0};
@@ -70,8 +74,15 @@ public:
         std::vector<uint32_t> killed;      //!< coins its inputs spent, in order
         std::vector<int> released_here;    //!< heights whose held coins it appended
         std::vector<uint256> btc_added;
+        std::vector<uint256> qwen_added;
         std::vector<int> settled_here;
         int drew{-1};
+        int prev_last{0};                  //!< a curve block: the height of the block before it on its own curve (0: none)
+    };
+    /** What has been mined on one curve so far. */
+    struct CurveCount {
+        int blocks{0};      //!< curve blocks on it
+        int last_height{0}; //!< the latest of them (0: none)
     };
 
     static bool Enabled(const Consensus::Params& p) { return p.launch_enabled && p.launch_sats_num > 0; }
@@ -99,11 +110,16 @@ public:
     /** Value of all live coins: what the next draw is taken over. 0 once the sats leg is over. */
     CAmount Earning(const Consensus::Params& params) const { return Closed(params) ? 0 : static_cast<CAmount>(m_total); }
     size_t Coins() const { return m_coins.size(); }
-    const launchyield::BtcChain& Btc() const { return m_btc; }
+    const launchyield::HeaderChain& Btc() const { return m_btc; }
+    const launchyield::HeaderChain& Qwen() const { return m_qwen; }
+    const launchyield::HeaderChain& Relay(LaunchCurve quote) const { return quote == LaunchCurve::QWEN ? m_qwen : m_btc; }
+    /** Curve blocks mined on one curve and the height of the latest (frozen when the leg closes). */
+    const CurveCount& Count(LaunchCurve curve) const { return m_count[static_cast<int>(curve)]; }
 
 private:
     void Pop();
-    bool TrySettle(const launchyield::PaymentProof& proof, int height, const Consensus::Params& params);
+    /** `quote`: the chain the proof is about (HFP1: Bitcoin, HFP2: Qwencoin). It settles only a block on that curve. */
+    bool TrySettle(const launchyield::PaymentProof& proof, int height, LaunchCurve quote, const Consensus::Params& params);
     void Append(Coin coin);
     void Release(int mint_height, Info& cur);
     // Live value per coin in a Fenwick tree: sums and "which coin holds point x" in O(log n).
@@ -115,8 +131,10 @@ private:
     std::vector<uint64_t> m_tree;                                            //!< m_tree[i-1] = live value of coins (i - lowbit(i), i]
     std::unordered_map<COutPoint, uint32_t, SaltedOutpointHasher> m_index;   //!< live coins only; never iterated
     uint64_t m_total{0};
-    int m_last_curve{0}; //!< height of the last block on the curve (they are 1..m_last_curve); 0: none
-    launchyield::BtcChain m_btc;
+    int m_last_curve{0}; //!< height of the last block on a curve (they are 1..m_last_curve); 0: none
+    CurveCount m_count[2];
+    launchyield::HeaderChain m_btc;
+    launchyield::HeaderChain m_qwen;
 };
 
 LaunchYieldState& GetLaunchYieldState();

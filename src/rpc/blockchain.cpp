@@ -73,6 +73,7 @@
 #include <util/translation.h>
 #include <launchcurve.h>
 #include <launchyieldstate.h>
+#include <node/miner.h>
 #include <kernel/launch.h>
 #include <pow.h>
 #include <validation.h>
@@ -80,6 +81,7 @@
 #include <versionbits.h>
 
 #include <algorithm>
+#include <cmath>
 #include <array>
 #include <atomic>
 #include <cerrno>
@@ -2327,7 +2329,7 @@ static RPCMethod getblockstats()
     ret_all.pushKV("minfeerate", (minfeerate == MAX_MONEY) ? 0 : minfeerate);
     ret_all.pushKV("mintxsize", mintxsize == MAX_BLOCK_SERIALIZED_SIZE ? 0 : mintxsize);
     ret_all.pushKV("outs", outputs);
-    ret_all.pushKV("subsidy", GetBlockSubsidyForBlock(pindex.pprev, pindex.nBits, pindex.nHeight, chainman.GetParams().GetConsensus()));
+    ret_all.pushKV("subsidy", GetBlockSubsidyForBlock(pindex.pprev, pindex.nBits, pindex.nVersion, pindex.nHeight, chainman.GetParams().GetConsensus()));
     ret_all.pushKV("swtotal_size", swtotal_size);
     ret_all.pushKV("swtotal_weight", swtotal_weight);
     ret_all.pushKV("swtxs", swtxs);
@@ -3786,14 +3788,37 @@ static RPCMethod getlaunchinfo()
                 {RPCResult::Type::STR_HEX, "genesis_hash", "genesis block hash"},
                 {RPCResult::Type::NUM, "chain_id", "auxpow chain id"},
                 {RPCResult::Type::NUM, "height", "tip height"},
-                {RPCResult::Type::STR_HEX, "work", "chainwork above genesis"},
-                {RPCResult::Type::NUM, "curve_supply", "coins minted by the curve so far"},
+                {RPCResult::Type::STR_HEX, "work", "chainwork above genesis (both curves and the tail)"},
+                {RPCResult::Type::NUM, "curve_supply", "coins minted by the two curves so far"},
                 {RPCResult::Type::NUM, "tail_minted", "coins minted by the post-graduation tail"},
                 {RPCResult::Type::NUM, "supply", "curve_supply + tail_minted"},
-                {RPCResult::Type::NUM, "progress", "curve_supply / graduation_tokens"},
-                {RPCResult::Type::BOOL, "graduated", "whether merge-mining is open"},
+                {RPCResult::Type::NUM, "progress", "how far the curve that is further along has sold: its supply / graduation_tokens"},
+                {RPCResult::Type::BOOL, "graduated", "whether merge-mining is open (one of the curves has sold out)"},
                 {RPCResult::Type::NUM, "graduation_height", "height of the crossing block, -1 if not graduated"},
-                {RPCResult::Type::NUM, "hashes_per_coin", "current curve price in expected hashes per whole coin"},
+                {RPCResult::Type::STR, "graduated_by", /*optional=*/true, "the curve that sold out: \"btc\" or \"qwen\"; null if not graduated"},
+                {RPCResult::Type::NUM, "hashes_per_coin", "price on the BTC curve in expected hashes per whole coin (each curve's own price is under curves)"},
+                {RPCResult::Type::NUM, "earning", /*optional=*/true, "value of the coins that are live now: what the next holder draw is taken over"},
+                {RPCResult::Type::OBJ_DYN, "curves", "the two curves, \"btc\" and \"qwen\": a block before graduation is on one of them",
+                {
+                    {RPCResult::Type::OBJ, "curve", "",
+                    {
+                        {RPCResult::Type::STR_HEX, "work", "work of the blocks on this curve (as of the graduation block once graduated)"},
+                        {RPCResult::Type::NUM, "supply", "coins this curve has minted"},
+                        {RPCResult::Type::NUM, "progress", "supply / graduation_tokens"},
+                        {RPCResult::Type::NUM, "hashes_per_coin", "this curve's price in expected hashes per whole coin"},
+                        {RPCResult::Type::NUM, "owed_num", "a block on this curve owes (work * owed_num) >> owed_shift base units of the curve's asset"},
+                        {RPCResult::Type::NUM, "owed_shift", "see owed_num"},
+                        {RPCResult::Type::NUM, "owed_per_coin", "base units of the curve's asset owed per whole coin at the margin"},
+                        {RPCResult::Type::NUM, "min_payment", "smallest payment on the curve's chain (smaller debts are drawn up to it or down to nothing)"},
+                        {RPCResult::Type::NUM, "confs", "confirmations a payment proof needs on the curve's chain"},
+                        {RPCResult::Type::STR_HEX, "creator_script", "where the creator's share is paid on the curve's chain"},
+                        {RPCResult::Type::NUM, "blocks", "curve blocks mined on this curve"},
+                        {RPCResult::Type::NUM, "last_height", "height of the latest of them, 0 if none"},
+                        {RPCResult::Type::NUM, "next_subsidy", "what the next block would mint on this curve"},
+                        {RPCResult::Type::NUM, "next_creator_fee", "the creator's cut of that"},
+                        {RPCResult::Type::NUM, "next_owed", "what the next block would owe on this curve, in base units of its asset"},
+                    }},
+                }},
                 {RPCResult::Type::OBJ, "curve", "",
                 {
                     {RPCResult::Type::STR_HEX, "virtual_work", "V0"},
@@ -3812,6 +3837,7 @@ static RPCMethod getlaunchinfo()
                 {
                     {RPCResult::Type::STR_HEX, "bits", "compact difficulty"},
                     {RPCResult::Type::STR_HEX, "work", "expected hashes"},
+                    {RPCResult::Type::STR, "curve", "the curve this node mines (setminecurve): the two values below are for it"},
                     {RPCResult::Type::NUM, "subsidy", "subsidy"},
                     {RPCResult::Type::NUM, "creator_fee", "creator output amount"},
                     {RPCResult::Type::BOOL, "auxpow_allowed", "whether a merge-mined block is valid"},
@@ -3838,10 +3864,14 @@ static RPCMethod getlaunchinfo()
     LOCK(cs_main);
     const CBlockIndex* tip = chainman.ActiveChain().Tip();
     const arith_uint256 w = LaunchRelWork(tip, consensus);
-    const CAmount curve_supply = LaunchCurveSupply(w, consensus);
-    const bool graduated = LaunchGraduated(w, consensus);
+    const CAmount curve_supply = LaunchCurveMinted(tip, consensus);
+    const bool graduated = LaunchGraduatedAt(tip, consensus);
     const int grad_height = LaunchGraduationHeight(tip, consensus);
     const CAmount tail_minted = grad_height >= 0 ? LaunchTailMinted(grad_height + 1, tip->nHeight, consensus) : 0;
+    // The curves stand still from the graduation block on.
+    const CBlockIndex* curve_tip = grad_height >= 0 ? tip->GetAncestor(grad_height) : tip;
+    const LaunchCurve mine_curve = node::GetMineCurve();
+    const int32_t next_version = !graduated && mine_curve == LaunchCurve::QWEN ? LAUNCH_VERSION_QWEN : 0;
 
     CBlockHeader dummy;
     dummy.nTime = static_cast<uint32_t>(GetTime());
@@ -3849,7 +3879,7 @@ static RPCMethod getlaunchinfo()
     arith_uint256 next_target;
     next_target.SetCompact(next_bits);
     const arith_uint256 next_work = (~next_target / (next_target + 1)) + 1;
-    const CAmount next_subsidy = GetBlockSubsidyForBlock(tip, next_bits, tip->nHeight + 1, consensus);
+    const CAmount next_subsidy = GetBlockSubsidyForBlock(tip, next_bits, next_version, tip->nHeight + 1, consensus);
 
     UniValue ret(UniValue::VOBJ);
     ret.pushKV("launch_id", HexStr(d.id));
@@ -3863,13 +3893,51 @@ static RPCMethod getlaunchinfo()
     ret.pushKV("curve_supply", curve_supply);
     ret.pushKV("tail_minted", tail_minted);
     ret.pushKV("supply", curve_supply + tail_minted);
-    ret.pushKV("progress", static_cast<double>(curve_supply) / static_cast<double>(consensus.launch_graduation_tokens));
+    const CAmount minted_btc = LaunchCurveMinted(tip, LaunchCurve::BTC, consensus);
+    const CAmount minted_qwen = LaunchCurveMinted(tip, LaunchCurve::QWEN, consensus);
+    ret.pushKV("progress", static_cast<double>(std::max(minted_btc, minted_qwen)) / static_cast<double>(consensus.launch_graduation_tokens));
     ret.pushKV("graduated", graduated);
     ret.pushKV("graduation_height", grad_height);
-    ret.pushKV("hashes_per_coin", LaunchHashesPerCoin(w, consensus));
-    if (LaunchYieldState::Enabled(consensus)) {
+    if (const auto by = LaunchGraduatedBy(tip, consensus)) {
+        ret.pushKV("graduated_by", LaunchCurveName(*by));
+    } else {
+        ret.pushKV("graduated_by", UniValue{});
+    }
+    ret.pushKV("hashes_per_coin", LaunchHashesPerCoin(LaunchCurveWork(curve_tip, LaunchCurve::BTC, consensus), consensus));
+    const LaunchYieldState* ys = LaunchYieldState::Enabled(consensus) ? &SyncedYieldState(chainman) : nullptr;
+    if (ys) {
         // What the next holder draw is taken over: the value of the coins that are live (unspent) now.
-        ret.pushKV("earning", SyncedYieldState(chainman).Earning(consensus));
+        ret.pushKV("earning", ys->Earning(consensus));
+    }
+    {
+        UniValue curves(UniValue::VOBJ);
+        for (const LaunchCurve c : {LaunchCurve::BTC, LaunchCurve::QWEN}) {
+            const bool qwen = c == LaunchCurve::QWEN;
+            const arith_uint256 cw = LaunchCurveWork(curve_tip, c, consensus);
+            const CAmount minted = qwen ? minted_qwen : minted_btc;
+            const uint64_t num = qwen ? consensus.launch_qwen_num : consensus.launch_sats_num;
+            const uint32_t shift = qwen ? consensus.launch_qwen_shift : consensus.launch_sats_shift;
+            const double hashes_per_coin = LaunchHashesPerCoin(cw, consensus);
+            const CAmount sub = graduated ? 0 : LaunchSubsidy(tip, next_bits, qwen ? LAUNCH_VERSION_QWEN : 0, tip->nHeight + 1, consensus);
+            UniValue o(UniValue::VOBJ);
+            o.pushKV("work", ArithToUint256(cw).GetHex());
+            o.pushKV("supply", minted);
+            o.pushKV("progress", static_cast<double>(minted) / static_cast<double>(consensus.launch_graduation_tokens));
+            o.pushKV("hashes_per_coin", hashes_per_coin);
+            o.pushKV("owed_num", num);
+            o.pushKV("owed_shift", static_cast<int64_t>(shift));
+            o.pushKV("owed_per_coin", hashes_per_coin * static_cast<double>(num) / std::pow(2.0, static_cast<double>(shift)));
+            o.pushKV("min_payment", qwen ? consensus.launch_qwen_min_payment : consensus.launch_sats_min_payment);
+            o.pushKV("confs", qwen ? consensus.launch_qwen_confs : consensus.launch_btc_confs);
+            o.pushKV("creator_script", HexStr(qwen ? consensus.launch_creator_qwen_script : consensus.launch_creator_btc_script));
+            o.pushKV("blocks", ys ? ys->Count(c).blocks : 0);
+            o.pushKV("last_height", ys ? ys->Count(c).last_height : 0);
+            o.pushKV("next_subsidy", sub);
+            o.pushKV("next_creator_fee", LaunchCreatorFee(sub, consensus));
+            o.pushKV("next_owed", graduated ? 0 : launchyield::Owed(next_work, num, shift));
+            curves.pushKV(LaunchCurveName(c), std::move(o));
+        }
+        ret.pushKV("curves", std::move(curves));
     }
 
     UniValue curve(UniValue::VOBJ);
@@ -3889,6 +3957,7 @@ static RPCMethod getlaunchinfo()
     UniValue next(UniValue::VOBJ);
     next.pushKV("bits", strprintf("%08x", next_bits));
     next.pushKV("work", ArithToUint256(next_work).GetHex());
+    next.pushKV("curve", LaunchCurveName(mine_curve));
     next.pushKV("subsidy", next_subsidy);
     next.pushKV("creator_fee", LaunchCreatorFee(next_subsidy, consensus));
     next.pushKV("auxpow_allowed", graduated);
@@ -3915,6 +3984,21 @@ static LaunchYieldState& SyncedYieldState(ChainstateManager& chainman) EXCLUSIVE
     return ys;
 }
 
+static UniValue RelayInfo(ChainstateManager& chainman, LaunchCurve quote) EXCLUSIVE_LOCKS_REQUIRED(cs_main)
+{
+    const LaunchYieldState& ys = SyncedYieldState(chainman);
+    const launchyield::HeaderChain& chain = ys.Relay(quote);
+    const Consensus::Params& consensus = chainman.GetConsensus();
+    const bool qwen = quote == LaunchCurve::QWEN;
+    UniValue r(UniValue::VOBJ);
+    r.pushKV("best", chain.Best().GetHex());
+    r.pushKV("height", chain.BestHeight());
+    r.pushKV("headers", static_cast<int64_t>(chain.Size()));
+    r.pushKV("anchor_height", qwen ? consensus.launch_qwen_anchor_height : consensus.launch_btc_anchor_height);
+    r.pushKV("confirmations_required", qwen ? consensus.launch_qwen_confs : consensus.launch_btc_confs);
+    return r;
+}
+
 static RPCMethod getbtcrelay()
 {
     return RPCMethod{
@@ -3927,14 +4011,25 @@ static RPCMethod getbtcrelay()
 {
     ChainstateManager& chainman = EnsureAnyChainman(request.context);
     LOCK(cs_main);
-    const LaunchYieldState& ys = SyncedYieldState(chainman);
-    UniValue r(UniValue::VOBJ);
-    r.pushKV("best", ys.Btc().Best().GetHex());
-    r.pushKV("height", ys.Btc().BestHeight());
-    r.pushKV("headers", static_cast<int64_t>(ys.Btc().Size()));
-    r.pushKV("anchor_height", chainman.GetConsensus().launch_btc_anchor_height);
-    r.pushKV("confirmations_required", chainman.GetConsensus().launch_btc_confs);
-    return r;
+    return RelayInfo(chainman, LaunchCurve::BTC);
+},
+    };
+}
+
+static RPCMethod getqwenrelay()
+{
+    return RPCMethod{
+        "getqwenrelay",
+        "Returns the Qwencoin header chain this launch has been told about (HFH2 transactions), from the descriptor's\n"
+        "Qwencoin anchor. Same fields as getbtcrelay.\n",
+        {},
+        RPCResult{RPCResult::Type::ANY, "", ""},
+        RPCExamples{HelpExampleCli("getqwenrelay", "")},
+        [](const RPCMethod& self, const JSONRPCRequest& request) -> UniValue
+{
+    ChainstateManager& chainman = EnsureAnyChainman(request.context);
+    LOCK(cs_main);
+    return RelayInfo(chainman, LaunchCurve::QWEN);
 },
     };
 }
@@ -3943,9 +4038,10 @@ static RPCMethod getmintobligation()
 {
     return RPCMethod{
         "getmintobligation",
-        "Returns what the curve block at a height owes on Bitcoin (the sats leg): amount, the drawn payee and the\n"
-        "Bitcoin script to pay (fixed when the draw is made: for a holder, the coin that won it), the tag the\n"
-        "payment must carry, and whether it has been settled.\n",
+        "Returns what the curve block at a height owes: on Bitcoin if it is on the BTC curve (the sats leg), on\n"
+        "Qwencoin if it is on the QWEN curve (\"quote\" says which). The amount, the drawn payee and the script to\n"
+        "pay on that chain (fixed when the draw is made: for a holder, the coin that won it), the tag the payment\n"
+        "must carry, and whether it has been settled.\n",
         {{"height", RPCArg::Type::NUM, RPCArg::Optional::NO, "block height"}},
         RPCResult{RPCResult::Type::ANY, "", ""},
         RPCExamples{HelpExampleCli("getmintobligation", "12")},
@@ -3967,6 +4063,8 @@ static RPCMethod getmintobligation()
     r.pushKV("height", height);
     r.pushKV("hash", hash.GetHex());
     r.pushKV("curve", info->curve);
+    // The curve named by the block's version: for a curve block, the asset it owes and the chain it is paid on.
+    r.pushKV("quote", LaunchCurveName(LaunchCurveOf(index->nVersion)));
     r.pushKV("owed", info->owed);
     r.pushKV("draw_known", info->draw_known);
     r.pushKV("draw_height", height + launchyield::DRAW_DELAY);
@@ -3999,6 +4097,7 @@ void RegisterBlockchainRPCCommands(CRPCTable& t)
         {"blockchain", &getblockchaininfo},
         {"blockchain", &getlaunchinfo},
         {"blockchain", &getbtcrelay},
+        {"blockchain", &getqwenrelay},
         {"blockchain", &getmintobligation},
         {"blockchain", &getchaintxstats},
         {"blockchain", &getblockstats},

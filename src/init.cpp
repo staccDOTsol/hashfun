@@ -42,6 +42,8 @@
 #include <kernel/checks.h>
 #include <kernel/context.h>
 #include <kernel/notifications_interface.h>
+#include <launchcurve.h>
+#include <launchyield.h>
 #include <key.h>
 #include <logging.h>
 #include <mapport.h>
@@ -63,6 +65,7 @@
 #include <node/mempool_args.h>
 #include <node/mempool_persist.h>
 #include <node/mempool_persist_args.h>
+#include <node/miner.h>
 #include <node/mining_args.h>
 #include <node/peerman_args.h>
 #include <policy/feerate.h>
@@ -71,6 +74,7 @@
 #include <policy/fees/estimator_man.h>
 #include <policy/policy.h>
 #include <policy/settings.h>
+#include <primitives/pureheader.h>
 #include <protocol.h>
 #include <random.h>
 #include <rpc/register.h>
@@ -78,6 +82,7 @@
 #include <rpc/util.h>
 #include <scheduler.h>
 #include <script/sigcache.h>
+#include <streams.h>
 #include <sync.h>
 #include <tinyformat.h>
 #include <torcontrol.h>
@@ -518,6 +523,8 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-blocknotify=<cmd>", "Execute command when the best block changes (%s in cmd is replaced by block hash). Not run for blocks connected during initial block download or reindexing.", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
 #endif
     argsman.AddArg("-blockreconstructionextratxn=<n>", strprintf("Extra transactions to keep in memory for compact block reconstructions (default: %u)", DEFAULT_BLOCK_RECONSTRUCTION_EXTRA_TXN), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-qwork=<file>", "Qwencoin's work table (qwork.bin, 528 MB: the MLP weights of Qwen3.5-0.8B at 16-bit fixed point). Every launch has a QWEN curve, whose blocks are paid for on Qwencoin; the node checks the proof of work of the Qwencoin headers it is told about, and on Qwencoin that is a pass through this table. Required unless the launch follows a regtest Qwencoin. Get it with `hashfun qwork fetch` or from https://huggingface.co/staccs/qwencoin/resolve/main/qwork.bin. Relative paths are prefixed by the datadir location. (default: qwork.bin)", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-minecurve=<btc|qwen>", "Which of the launch's two curves this node's own blocks and block templates are on before graduation: btc (a block owes sats on Bitcoin) or qwen (it owes qwen on Qwencoin). getblocktemplate gives both under launchcurves; the setminecurve RPC changes it while running (default: btc)", ArgsManager::ALLOW_ANY, OptionsCategory::BLOCK_CREATION);
     argsman.AddArg("-minewithoutpeers", "Serve mining RPCs (getblocktemplate, createauxblock) with no peers connected. For the first node of a new launch; a miner cut off from the network would otherwise build, and pay Bitcoin for, blocks nobody sees (default: 0)", ArgsManager::ALLOW_ANY, OptionsCategory::BLOCK_CREATION);
     argsman.AddArg("-allowbtcchains", "Allow running Bitcoin chains (main/test/signet/regtest). This binary carries merge-mining consensus code and is NOT a valid Bitcoin node; use stock Bitcoin Core for BTC (default: 0)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-blocksonly", strprintf("Whether to reject transactions from network peers. Disables automatic broadcast and rebroadcast of transactions, unless the source peer has the 'forcerelay' permission. RPC transactions are not affected. (default: %u)", DEFAULT_BLOCKSONLY), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
@@ -960,6 +967,13 @@ bool AppInitParameterInteraction(const ArgsManager& args)
     // from full blocks, so a pruned node could not validate.
     if (chainparams.GetChainType() == ChainType::LAUNCH && args.GetIntArg("-prune", 0) != 0) {
         return InitError(Untranslated("Pruning is not supported on hashfun launch chains."));
+    }
+
+    // hashfun: the curve this node mines on (a miner's choice, not consensus).
+    if (const std::string curve{args.GetArg("-minecurve", "btc")}; curve == "btc" || curve == "qwen") {
+        node::SetMineCurve(curve == "qwen" ? LaunchCurve::QWEN : LaunchCurve::BTC);
+    } else {
+        return InitError(Untranslated(strprintf("-minecurve=%s: the curve is btc or qwen.", curve)));
     }
 
     // also see: InitParameterInteraction()
@@ -1538,6 +1552,36 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
 {
     const ArgsManager& args = *Assert(node.args);
     const CChainParams& chainparams = Params();
+
+    // hashfun: a launch follows Qwencoin for its QWEN curve, and on Qwencoin's main network a
+    // header's proof of work is a pass through the weights of a language model. Without that
+    // table no Qwencoin header can be checked, and what a node makes of such a header is consensus
+    // on the launch (launchyieldstate.h), so the node does not start without it.
+    if (const auto& consensus{chainparams.GetConsensus()}; consensus.launch_enabled && !consensus.launch_qwen_regtest) {
+        const fs::path table{AbsPathForConfigVal(args, args.GetPathArg("-qwork", "qwork.bin"), /*net_specific=*/false)};
+        static const std::string how{"This launch has a QWEN curve, and checking a Qwencoin header takes Qwencoin's work table (qwork.bin, 528 MB, sha256 "
+                                     "8f53884f7727e80b86f3ddf288d3c3f0f998f1c63b8cd4f0bdad182ddd3f2c03). Get it with `hashfun qwork fetch` (or from "
+                                     "https://huggingface.co/staccs/qwencoin/resolve/main/qwork.bin) and start with -qwork=<file>"};
+        if (const std::string problem{launchyield::LoadQworkTable(fs::PathToString(table))}; !problem.empty()) {
+            return InitError(Untranslated(strprintf("%s. %s.", problem, how)));
+        }
+        CPureBlockHeader anchor;
+        DataStream ss{consensus.launch_qwen_anchor_header};
+        ss >> anchor;
+        if (!launchyield::CheckQwenWork(anchor)) {
+            return InitError(Untranslated(strprintf("The launch file's Qwencoin anchor (qwen_anchor_header, block %s) does not carry the work its own difficulty bits ask for: it is not a Qwencoin header, and no Qwencoin payment could ever be proven on this launch. The launch file must be created again.",
+                                                    anchor.GetHash().GetHex())));
+        }
+        LogInfo("Qwencoin work table %s: checksum %016x; the launch's Qwencoin anchor %s at height %d has work value %s\n", fs::PathToString(table),
+                launchyield::QWORK_CHECKSUM, anchor.GetHash().GetHex(), consensus.launch_qwen_anchor_height, launchyield::QwenWorkValue(anchor).GetHex());
+        // Work values are kept across restarts: the leg's state is rebuilt from the launch's blocks
+        // at every start, and every relayed Qwencoin header would cost its pass again.
+        const fs::path values{args.GetDataDirNet() / "qwork_values.dat"};
+        fs::create_directories(values.parent_path());
+        if (const std::string problem{launchyield::KeepQworkValues(fs::PathToString(values))}; !problem.empty()) {
+            LogWarning("Qwencoin work values are not kept across restarts: %s\n", problem);
+        }
+    }
 
     auto opt_max_upload = ParseByteUnits(args.GetArg("-maxuploadtarget", DEFAULT_MAX_UPLOAD_TARGET), ByteUnit::M);
     if (!opt_max_upload) {

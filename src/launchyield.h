@@ -21,9 +21,15 @@
 #include <vector>
 
 /**
- * hashfun sats leg: pure consensus functions (no chain state, no I/O).
+ * hashfun sats leg and QWEN leg: pure consensus functions (no chain state, no I/O).
  *
- * A curve block owes real BTC on top of its hash: owed = (work * num) >> shift.
+ * A launch has two curves (launchcurve.h). A block on the BTC curve owes real BTC on top of its
+ * hash, a block on the QWEN curve owes qwen on Qwencoin: owed = (work * num) >> shift with the
+ * curve's own num and shift, in base units of its asset. Everything below is the same for both;
+ * "Bitcoin" reads "the chain of the block's curve". The two chains run the same script engine
+ * and the same transaction and merkle formats, and a Qwencoin main-network address is the same
+ * string as the Bitcoin address of the same key, so a payee's script means the same on both.
+ *
  * Six launch blocks later that block's hash seeds a draw:
  *   - payment size: owed if owed >= min, else min with probability owed/min
  *     (so every Bitcoin output is worth sending; expectation is preserved);
@@ -98,18 +104,73 @@ std::optional<PaymentProof> ParsePaymentProof(std::span<const unsigned char> pay
 bool VerifyBtcPayment(const PaymentProof& proof, const uint256& merkle_root, const std::array<unsigned char, 20>& tag,
                       const std::vector<unsigned char>& recipient_script, CAmount pay, std::string& error);
 
-/** OP_RETURN "HFH1" payload: n * 80-byte Bitcoin headers. */
+/** OP_RETURN "HFH1" (Bitcoin) or "HFH2" (Qwencoin) payload: n * 80-byte headers. */
 std::optional<std::vector<CPureBlockHeader>> ParseBtcHeaders(std::span<const unsigned char> payload);
 
 /**
- * Bitcoin header tree rooted at the descriptor's anchor, fed by headers relayed
- * inside launch blocks. Fully validating (PoW, difficulty schedule, median
- * time), so the launch chain's view of Bitcoin is a pure function of its own
- * blocks. Best tip = most work, ties to the numerically lowest hash.
+ * Qwencoin's proof of work (https://github.com/staccDOTsol/qwencoin, src/pow.h there). A header's
+ * work value is not its hash:
+ *
+ *     value = SHA256( fold(net(seed, nNonce)) XOR seed ),   seed = SHA256d(header with nNonce = 0)
+ *
+ * where net is a pass through the gate, up and down projections of all 24 layers of Qwen3.5-0.8B
+ * at 16-bit fixed point with sign activations (crypto/qwork.h, Qwencoin's own kernel). The value
+ * is compared with the target exactly as Bitcoin compares a block hash; the header's identity
+ * stays its SHA256d hash. The pass runs over a table of the model's weights (qwork.bin, 528 MB),
+ * mapped once per process.
  */
-class BtcChain
+inline constexpr uint64_t QWORK_CHECKSUM = 0x33a548a33925d201ULL; //!< qwork_fnv64 of the table; its sha256 is 8f53884f7727e80b86f3ddf288d3c3f0f998f1c63b8cd4f0bdad182ddd3f2c03
+inline constexpr int QWORK_LAYERS = 24, QWORK_N = 1024, QWORK_M = 3584;
+/** Map the table and check that it is the chain's. Returns an empty string, or what is wrong. */
+std::string LoadQworkTable(const std::string& path);
+void UnloadQworkTable();
+bool QworkLoaded();
+/**
+ * Keep work values in this file from now on: read the ones it has, append each new one. Every
+ * start replays the launch's blocks, and without the file every relayed Qwencoin header costs its
+ * pass again. Returns an empty string, or why the file cannot be written (the node then goes on
+ * with what it keeps in memory). A record is believed only with its check, so a damaged file
+ * costs passes, never a wrong value.
+ */
+std::string KeepQworkValues(const std::string& path);
+/** The work value of a Qwencoin header. The table must be loaded. */
+uint256 QwenWorkValue(const CPureBlockHeader& header);
+/** How many passes through the weights this process has made (a value that was kept costs none). */
+uint64_t QwenPasses();
+/**
+ * For tests only: a stand-in for the pass through the weights (nullptr: none again). With one
+ * set, a Qwencoin main-network header's work value is what the function returns and no table is
+ * needed, so the tree's own rules (the limit, the retarget, the timestamp rules at the edges of a
+ * period) can be tested on chains made for the purpose. The node never calls this.
+ */
+void SetQwenWorkForTests(uint256 (*fn)(const CPureBlockHeader&));
+/** Whether a Qwencoin main-network header meets the target its own bits name (bits no easier than Qwencoin's limit). */
+bool CheckQwenWork(const CPureBlockHeader& header);
+
+/** How many Qwencoin headers one launch block may have its nodes check the work of (see HeaderChain::Accept). */
+inline constexpr int QWEN_PASSES_PER_BLOCK = 8;
+
+/**
+ * Header tree of another chain (Bitcoin, Qwencoin), rooted at the descriptor's anchor and fed by
+ * headers relayed inside launch blocks. Fully validating (PoW, difficulty schedule, median
+ * time), so the launch chain's view of that chain is a pure function of its own blocks. Best
+ * tip = most work, ties to the numerically lowest hash.
+ *
+ * Rules, by chain:
+ *   Bitcoin    work = the header's hash; limit 0x1d00ffff; retarget every 2016 blocks
+ *   Qwencoin   work = QwenWorkValue(header); limit 0x2000ffff; the same retarget
+ *              and its two timestamp rules at the edges of a period: the first block of a
+ *              period not more than 600 s before its parent, the last not before the first
+ *   regtest    (either chain) bits 0x207fffff, work = the header's hash, no retarget:
+ *              Bitcoin's regtest rules, which qwencoind -regtest keeps
+ * The retarget is Bitcoin's, target * timespan / two weeks with the timespan clamped to a factor
+ * of four, computed as q * num + (r * num) / den with target = q * den + r: the same number, and
+ * near Qwencoin's limit the product itself would not fit in 256 bits (Qwencoin's MulDiv).
+ */
+class HeaderChain
 {
 public:
+    enum class Rules { BITCOIN, QWENCOIN };
     struct Node {
         uint256 prev;
         uint256 merkle_root;
@@ -120,10 +181,22 @@ public:
         uint32_t period_time{0}; //!< time of the first block of this block's difficulty period
     };
 
-    void Init(const CPureBlockHeader& anchor, int anchor_height, uint32_t anchor_period_time, bool regtest);
+    void Init(const CPureBlockHeader& anchor, int anchor_height, uint32_t anchor_period_time, Rules rules, bool regtest);
     bool Initialized() const { return !m_nodes.empty(); }
-    /** Add a header. false + error if invalid, unconnected or already known. */
-    bool Accept(const CPureBlockHeader& header, std::string& error);
+    /**
+     * Add a header. false + error if invalid, unconnected or already known. The checks run in
+     * this order: already known, does not connect, wrong bits, work, median time, and on
+     * Qwencoin's main network the two timestamp rules at the edges of a difficulty period.
+     *
+     * `budget`, when given, is how many more headers may have their work checked. A Qwencoin
+     * pass costs a node a twentieth of a second where a Bitcoin hash costs nothing, and a header
+     * that fails costs whoever relays it nothing at all, so a launch block may make its nodes
+     * check only QWEN_PASSES_PER_BLOCK of them: a header that gets as far as the work check
+     * takes one from the budget, and with none left it is refused unchecked, as if it were not
+     * there. What counts is how far a header gets, never whether its value was already known,
+     * so the answer is the same on every node.
+     */
+    bool Accept(const CPureBlockHeader& header, std::string& error, int* budget = nullptr);
     /** Undo an Accept (the header must have no children). */
     void Remove(const uint256& hash);
     const Node* Find(const uint256& hash) const;
@@ -152,8 +225,12 @@ private:
     uint256 m_anchor;
     uint256 m_best;
     int m_anchor_height{0};
+    Rules m_rules{Rules::BITCOIN};
     bool m_regtest{false};
 };
+
+/** The Bitcoin header tree, by the name it had while a launch followed one chain. */
+using BtcChain = HeaderChain;
 
 } // namespace launchyield
 

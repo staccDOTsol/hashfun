@@ -17,8 +17,10 @@
 //! set the launch runs under, so a file made for one rule set is never read under another:
 //! 1 = the pre-release rules: the first sats leg, whose holder draw has been replaced, read by
 //!     a parser that took anchors, payout scripts and time limits it should have refused;
-//! 2 = the sats leg drawn over live coins, and the stricter parser below.
-inline constexpr uint32_t LAUNCH_DESCRIPTOR_VERSION = 2;
+//! 2 = the sats leg drawn over live coins, and the stricter parser below: one curve, quoted in
+//!     BTC only;
+//! 3 = two curves per launch, one quoted in BTC and one in QWEN (contrib/hashfun/TWIN.md).
+inline constexpr uint32_t LAUNCH_DESCRIPTOR_VERSION = 3;
 
 //! The future-time limit (ftl: how far past a node's clock a block may be stamped) of a launch
 //! that is not a test launch must be at least LAUNCH_MIN_FTL seconds and less than
@@ -92,6 +94,31 @@ struct LaunchDescriptor {
     //! Which Bitcoin the sats leg follows: mainnet rules (false) or regtest (true, for
     //! test fleets). Independent of `test`, which only relaxes mining RPC checks.
     bool btc_regtest{false};
+    //! The QWEN leg: the second curve, whose blocks owe qwen on Qwencoin
+    //! (https://github.com/staccDOTsol/qwencoin) instead of sats on Bitcoin. Both curves have the
+    //! shape virtual_work / virtual_tokens / graduation_tokens describe. The anchor is a Qwencoin
+    //! header, with the same meaning as the Bitcoin anchor: the checkpoint the in-chain Qwencoin
+    //! header relay starts from. Unless qwen_regtest the parser requires what it can check without
+    //! the chain and without the work table: the bits are a target no easier than Qwencoin's
+    //! limit, the period start is set, is not later than the anchor allows, and is the anchor's
+    //! own time when the anchor opens a period. Whether the header carries the work its bits ask
+    //! for takes a pass through Qwencoin's weights: the node checks that at start (init.cpp).
+    //! Whether it is the block at that height is for a Qwencoin node to say
+    //! (hashfun/descriptor.py check_anchor). height < 2^31.
+    uint32_t qwen_anchor_height{0};
+    std::array<unsigned char, 80> qwen_anchor_header{};
+    uint32_t qwen_anchor_period_time{0};
+    //! A QWEN-curve block owes (work * qwen_num) >> qwen_shift base units of qwen. Mandatory (> 0).
+    uint64_t qwen_num{0};
+    uint32_t qwen_shift{0};
+    int64_t qwen_min_payment{10000};
+    uint32_t qwen_confs{6};
+    //! Where the creator's share is paid on Qwencoin (same script forms as creator_btc_script).
+    std::vector<unsigned char> creator_qwen_script;
+    //! Which Qwencoin the QWEN leg follows: the main network (false: work is a pass through the
+    //! weights, the node needs the work table) or a regtest one (true: Bitcoin's regtest rules,
+    //! which qwencoind -regtest keeps).
+    bool qwen_regtest{false};
     //! SHA256 of the launch's metadata (image, description, links; see hashfun/meta.py). The
     //! bytes themselves ride in the launch file under "metadata" and are not read by the node.
     //! All zero = none. Appended to the canonical bytes only when set, so a launch without

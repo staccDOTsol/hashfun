@@ -104,10 +104,11 @@ extern const std::vector<std::string> CHECKLEVEL_DOC;
 
 CAmount GetBlockSubsidy(int nHeight, const Consensus::Params& consensusParams);
 /**
- * Subsidy for a block whose parent is pindexPrev and whose difficulty is nBits.
- * On launch chains this follows the work curve; otherwise GetBlockSubsidy.
+ * Subsidy for a block whose parent is pindexPrev, whose difficulty is nBits and whose header
+ * version is nVersion. On launch chains this follows the work curve the block is on (the
+ * version says which of the two, launchcurve.h); otherwise GetBlockSubsidy.
  */
-CAmount GetBlockSubsidyForBlock(const CBlockIndex* pindexPrev, uint32_t nBits, int nHeight, const Consensus::Params& consensusParams);
+CAmount GetBlockSubsidyForBlock(const CBlockIndex* pindexPrev, uint32_t nBits, int32_t nVersion, int nHeight, const Consensus::Params& consensusParams);
 
 bool FatalError(kernel::Notifications& notifications, BlockValidationState& state, const bilingual_str& message);
 

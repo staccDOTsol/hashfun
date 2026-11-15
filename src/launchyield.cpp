@@ -5,13 +5,21 @@
 #include <launchyield.h>
 
 #include <crypto/common.h>
+#include <crypto/qwork.h>
 #include <crypto/sha256.h>
 #include <hash.h>
 #include <script/script.h>
 #include <streams.h>
+#include <tinyformat.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cassert>
+#include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <mutex>
+#include <unordered_map>
 
 namespace launchyield {
 namespace {
@@ -41,11 +49,172 @@ arith_uint256 TargetFromBits(uint32_t bits, bool& ok)
 }
 
 const uint32_t BTC_POW_LIMIT_BITS = 0x1d00ffff;
-const uint32_t BTC_REGTEST_BITS = 0x207fffff;
-const int64_t BTC_TIMESPAN = 14 * 24 * 60 * 60;
-const int BTC_INTERVAL = 2016;
+const uint32_t QWEN_POW_LIMIT_BITS = 0x2000ffff; //!< 256 expected passes through the weights per block
+const uint32_t BTC_REGTEST_BITS = 0x207fffff;    //!< also qwencoind -regtest
+const int64_t BTC_TIMESPAN = 14 * 24 * 60 * 60;  //!< also Qwencoin's
+const int BTC_INTERVAL = 2016;                   //!< also Qwencoin's
+const int64_t QWEN_MAX_TIMEWARP = 600;          //!< Qwencoin: how far before its parent the first block of a period may be stamped
+
+/** floor(a * num / den), exactly, without forming a * num (see HeaderChain; Qwencoin's pow.cpp MulDiv). */
+arith_uint256 MulDiv(const arith_uint256& a, int64_t num, int64_t den)
+{
+    const arith_uint256 bn_num{static_cast<uint64_t>(num)};
+    const arith_uint256 bn_den{static_cast<uint64_t>(den)};
+    const arith_uint256 q{a / bn_den};
+    const arith_uint256 r{a - q * bn_den};
+    return q * bn_num + (r * bn_num) / bn_den;
+}
+
+// ---- Qwencoin's work table ---------------------------------------------------------------------
+
+qwork_table g_qwork{};
+std::atomic<bool> g_qwork_loaded{false};
+std::atomic<uint64_t> g_qwork_passes{0};
+std::atomic<uint256 (*)(const CPureBlockHeader&)> g_qwen_work_for_tests{nullptr};
+
+/**
+ * The value of every header this node has evaluated, by header hash. A launch's state is rewound
+ * and replayed around reorganisations, when a block template is tested and from the first block
+ * at every start, and a pass is worth doing once: with KeepQworkValues the values are also kept
+ * in a file, so that a start costs no pass for a header seen before (a relayed header that failed
+ * its work check included: anyone can have one put in a block). Consensus never depends on what
+ * is in here: a value is a function of the header alone.
+ */
+struct QworkValues {
+    static constexpr size_t RECORD{72}; //!< in the file: 32 bytes of header hash, 32 of value, 8 of check
+    struct HashKey {
+        size_t operator()(const uint256& h) const { return ReadLE64(h.begin()); }
+    };
+    std::mutex mutex;
+    std::unordered_map<uint256, uint256, HashKey> map;
+    FILE* file{nullptr}; //!< new values are appended here; none: they are kept in memory only
+};
+QworkValues& Values()
+{
+    static QworkValues values;
+    return values;
+}
+
+/** What closes a record of the values file: a record cut short or damaged on disk is not believed. */
+uint64_t RecordCheck(const uint256& hash, const uint256& value)
+{
+    unsigned char out[CSHA256::OUTPUT_SIZE];
+    CSHA256().Write(hash.begin(), 32).Write(value.begin(), 32).Write(reinterpret_cast<const unsigned char*>("qwv1"), 4).Finalize(out);
+    return ReadLE64(out);
+}
 
 } // namespace
+
+std::string LoadQworkTable(const std::string& path)
+{
+    UnloadQworkTable();
+    qwork_table t;
+    const int rc{qwork_open(path.c_str(), &t)};
+    if (rc == -1) return strprintf("The work table %s cannot be opened", path);
+    if (rc != 0) return strprintf("%s is not a work table (QWRK1, %d layers of %d x %d)", path, QWORK_LAYERS, QWORK_M, QWORK_N);
+    if (t.layers != QWORK_LAYERS || t.n != QWORK_N || t.m != QWORK_M) {
+        const std::string found{strprintf("%d layers of %d x %d", t.layers, t.m, t.n)};
+        qwork_close(&t);
+        return strprintf("%s holds %s, Qwencoin's work table is %d layers of %d x %d", path, found, QWORK_LAYERS, QWORK_M, QWORK_N);
+    }
+    if (t.fnv != QWORK_CHECKSUM) {
+        const uint64_t got{t.fnv};
+        qwork_close(&t);
+        return strprintf("The work table %s has checksum %016x, Qwencoin's is %016x", path, got, QWORK_CHECKSUM);
+    }
+    g_qwork = t;
+    g_qwork_loaded = true;
+    return {};
+}
+
+void UnloadQworkTable()
+{
+    if (g_qwork_loaded.exchange(false)) qwork_close(&g_qwork);
+    QworkValues& values{Values()};
+    std::lock_guard lock{values.mutex};
+    if (values.file != nullptr) std::fclose(values.file);
+    values.file = nullptr;
+    values.map.clear();
+}
+
+std::string KeepQworkValues(const std::string& path)
+{
+    QworkValues& values{Values()};
+    std::lock_guard lock{values.mutex};
+    if (values.file != nullptr) std::fclose(values.file);
+    values.file = nullptr;
+    size_t whole{0};
+    if (FILE* f = std::fopen(path.c_str(), "rb")) {
+        unsigned char rec[QworkValues::RECORD];
+        while (std::fread(rec, 1, sizeof rec, f) == sizeof rec) {
+            uint256 hash, value;
+            std::memcpy(hash.begin(), rec, 32);
+            std::memcpy(value.begin(), rec + 32, 32);
+            if (ReadLE64(rec + 64) == RecordCheck(hash, value)) values.map.emplace(hash, value);
+            ++whole;
+        }
+        std::fclose(f);
+        // A record cut short when the node was killed: drop it, so that the ones appended from now
+        // on start where a record starts.
+        std::error_code ec;
+        if (std::filesystem::file_size(path, ec) > whole * QworkValues::RECORD && !ec) std::filesystem::resize_file(path, whole * QworkValues::RECORD, ec);
+    }
+    values.file = std::fopen(path.c_str(), "ab");
+    if (values.file == nullptr) return strprintf("%s cannot be written", path);
+    return {};
+}
+
+bool QworkLoaded() { return g_qwork_loaded || g_qwen_work_for_tests.load() != nullptr; }
+uint64_t QwenPasses() { return g_qwork_passes; }
+void SetQwenWorkForTests(uint256 (*fn)(const CPureBlockHeader&)) { g_qwen_work_for_tests = fn; }
+
+uint256 QwenWorkValue(const CPureBlockHeader& header)
+{
+    if (const auto fn = g_qwen_work_for_tests.load()) return fn(header);
+    assert(g_qwork_loaded);
+    const uint256 hash{header.GetHash()};
+    QworkValues& values{Values()};
+    {
+        std::lock_guard lock{values.mutex};
+        if (const auto it = values.map.find(hash); it != values.map.end()) return it->second;
+    }
+    // The header's 80 bytes with the nonce zeroed, hashed twice: the seed, shared by every nonce of
+    // one block template.
+    unsigned char bytes[80];
+    WriteLE32(bytes, static_cast<uint32_t>(header.nVersion));
+    std::memcpy(bytes + 4, header.hashPrevBlock.begin(), 32);
+    std::memcpy(bytes + 36, header.hashMerkleRoot.begin(), 32);
+    WriteLE32(bytes + 68, header.nTime);
+    WriteLE32(bytes + 72, header.nBits);
+    WriteLE32(bytes + 76, 0);
+    const uint256 seed{Sha256Of({{bytes, 80}}, /*twice=*/true)};
+    unsigned char out[32];
+    qwork_eval(&g_qwork, seed.begin(), header.nNonce, out);
+    ++g_qwork_passes;
+    for (int i = 0; i < 32; ++i) out[i] ^= seed.begin()[i];
+    const uint256 value{Sha256Of({{out, 32}}, /*twice=*/false)};
+    {
+        std::lock_guard lock{values.mutex};
+        if (values.map.emplace(hash, value).second && values.file != nullptr) {
+            unsigned char rec[QworkValues::RECORD];
+            std::memcpy(rec, hash.begin(), 32);
+            std::memcpy(rec + 32, value.begin(), 32);
+            WriteLE64(rec + 64, RecordCheck(hash, value));
+            // Best effort: a value that did not reach the disk is evaluated again at the next start.
+            if (std::fwrite(rec, 1, sizeof rec, values.file) == sizeof rec) std::fflush(values.file);
+        }
+    }
+    return value;
+}
+
+bool CheckQwenWork(const CPureBlockHeader& header)
+{
+    bool ok;
+    const arith_uint256 target = TargetFromBits(header.nBits, ok);
+    const arith_uint256 limit = TargetFromBits(QWEN_POW_LIMIT_BITS, ok);
+    if (target == 0 || target > limit || !QworkLoaded()) return false;
+    return UintToArith256(QwenWorkValue(header)) <= target;
+}
 
 CAmount Owed(const arith_uint256& work, uint64_t num, uint32_t shift)
 {
@@ -233,11 +402,12 @@ std::optional<std::vector<CPureBlockHeader>> ParseBtcHeaders(std::span<const uns
     return out;
 }
 
-void BtcChain::Init(const CPureBlockHeader& anchor, int anchor_height, uint32_t anchor_period_time, bool regtest)
+void HeaderChain::Init(const CPureBlockHeader& anchor, int anchor_height, uint32_t anchor_period_time, Rules rules, bool regtest)
 {
     m_nodes.clear();
     m_children.clear();
     m_order.clear();
+    m_rules = rules;
     m_regtest = regtest;
     m_anchor_height = anchor_height;
     m_anchor = anchor.GetHash();
@@ -257,19 +427,19 @@ void BtcChain::Init(const CPureBlockHeader& anchor, int anchor_height, uint32_t 
     m_main.assign(1, m_anchor);
 }
 
-const BtcChain::Node* BtcChain::Find(const uint256& hash) const
+const HeaderChain::Node* HeaderChain::Find(const uint256& hash) const
 {
     const auto it = m_nodes.find(hash);
     return it == m_nodes.end() ? nullptr : &it->second;
 }
 
-int BtcChain::BestHeight() const
+int HeaderChain::BestHeight() const
 {
     const Node* n = Find(m_best);
     return n ? n->height : -1;
 }
 
-uint32_t BtcChain::ExpectedBits(const Node& prev) const
+uint32_t HeaderChain::ExpectedBits(const Node& prev) const
 {
     if (m_regtest) return BTC_REGTEST_BITS;
     const int height = prev.height + 1;
@@ -280,15 +450,13 @@ uint32_t BtcChain::ExpectedBits(const Node& prev) const
     int64_t timespan = int64_t{prev.time} - first_time;
     timespan = std::clamp<int64_t>(timespan, BTC_TIMESPAN / 4, BTC_TIMESPAN * 4);
     bool ok;
-    const arith_uint256 limit = TargetFromBits(BTC_POW_LIMIT_BITS, ok);
-    arith_uint256 target = TargetFromBits(prev.bits, ok);
-    target *= static_cast<uint32_t>(timespan);
-    target /= static_cast<uint32_t>(BTC_TIMESPAN);
+    const arith_uint256 limit = TargetFromBits(m_rules == Rules::QWENCOIN ? QWEN_POW_LIMIT_BITS : BTC_POW_LIMIT_BITS, ok);
+    arith_uint256 target = MulDiv(TargetFromBits(prev.bits, ok), timespan, BTC_TIMESPAN);
     if (target > limit) target = limit;
     return target.GetCompact();
 }
 
-void BtcChain::UpdateMain()
+void HeaderChain::UpdateMain()
 {
     // Walk down from the best tip until the old best chain is met, and rewrite only what is above.
     std::vector<uint256> path;
@@ -306,26 +474,48 @@ void BtcChain::UpdateMain()
     m_main.insert(m_main.end(), path.rbegin(), path.rend());
 }
 
-bool BtcChain::Accept(const CPureBlockHeader& header, std::string& error)
+bool HeaderChain::Accept(const CPureBlockHeader& header, std::string& error, int* budget)
 {
+    const char* const chain = m_rules == Rules::QWENCOIN ? "qwen" : "btc";
     const uint256 hash = header.GetHash();
     if (m_nodes.count(hash)) {
-        error = "btc header already known";
+        error = strprintf("%s header already known", chain);
         return false;
     }
     const Node* prev = Find(header.hashPrevBlock);
     if (!prev) {
-        error = "btc header does not connect";
+        error = strprintf("%s header does not connect", chain);
         return false;
     }
     if (header.nBits != ExpectedBits(*prev)) {
-        error = "btc header has wrong difficulty";
+        error = strprintf("%s header has wrong difficulty", chain);
         return false;
     }
     bool ok;
     const arith_uint256 target = TargetFromBits(header.nBits, ok);
-    if (!ok || UintToArith256(hash) > target) {
-        error = "btc header lacks proof of work";
+    if (!ok) {
+        error = strprintf("%s header lacks proof of work", chain);
+        return false;
+    }
+    // From here on the header costs its work check (see Accept in the header).
+    if (budget != nullptr) {
+        if (*budget <= 0) {
+            error = strprintf("%s header not looked at: this block has had its share of work checks", chain);
+            return false;
+        }
+        --*budget;
+    }
+    // The work value: the header's hash, or on Qwencoin's main network a pass through the weights.
+    uint256 value{hash};
+    if (m_rules == Rules::QWENCOIN && !m_regtest) {
+        if (!QworkLoaded()) {
+            error = strprintf("%s header cannot be checked: Qwencoin's work table is not loaded", chain);
+            return false;
+        }
+        value = QwenWorkValue(header);
+    }
+    if (UintToArith256(value) > target) {
+        error = strprintf("%s header lacks proof of work", chain);
         return false;
     }
     // Median of the last 11 timestamps. Within 11 blocks of the anchor the true median is
@@ -335,8 +525,24 @@ bool BtcChain::Accept(const CPureBlockHeader& header, std::string& error)
     for (const Node* n = prev; n && times.size() < 11; n = Find(n->prev)) times.push_back(n->time);
     std::sort(times.begin(), times.end());
     if (times.size() == 11 && header.nTime <= times[5]) {
-        error = "btc header time is not past the median";
+        error = strprintf("%s header time is not past the median", chain);
         return false;
+    }
+    // Qwencoin's two rules at the edges of a difficulty period (Bitcoin Inquisition's consensus
+    // cleanup, active there from the first block, with BIP94's limit): the first block of a
+    // period is not stamped more than ten minutes before its parent, and the last one is not
+    // stamped before the period's first. Bitcoin has neither, and qwencoind -regtest is not
+    // followed this closely (see the header).
+    if (m_rules == Rules::QWENCOIN && !m_regtest) {
+        const int height = prev->height + 1;
+        if (height % BTC_INTERVAL == 0 && int64_t{header.nTime} < int64_t{prev->time} - QWEN_MAX_TIMEWARP) {
+            error = strprintf("%s header opens a difficulty period too long before its parent's time", chain);
+            return false;
+        }
+        if (height % BTC_INTERVAL == BTC_INTERVAL - 1 && header.nTime < prev->period_time) {
+            error = strprintf("%s header closes a difficulty period before the time the period opened", chain);
+            return false;
+        }
     }
     Node n;
     n.prev = header.hashPrevBlock;
@@ -356,7 +562,7 @@ bool BtcChain::Accept(const CPureBlockHeader& header, std::string& error)
     return true;
 }
 
-void BtcChain::Remove(const uint256& hash)
+void HeaderChain::Remove(const uint256& hash)
 {
     const auto it = m_nodes.find(hash);
     if (it == m_nodes.end() || hash == m_anchor || m_children.count(hash)) return;
@@ -370,7 +576,7 @@ void BtcChain::Remove(const uint256& hash)
     }
 }
 
-int BtcChain::Confirmations(const uint256& hash) const
+int HeaderChain::Confirmations(const uint256& hash) const
 {
     const Node* n = Find(hash);
     if (!n) return 0;
